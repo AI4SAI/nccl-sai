@@ -37,11 +37,14 @@ Explicit overrides:
 
 This draft describes a source-level public candidate. Public binary packages
 should be published only after clean rebuild, architecture coverage, and
-sanitized validation evidence are available.
+sanitized validation evidence are available. Build and packaging expectations
+are documented in `docs/sai/BUILD_AND_PACKAGING.md`.
 
 Minimum public gates:
 
 - clean source build;
+- CUDA SASS/PTX coverage and portable host ISA target evidence for the advertised
+  package;
 - single-node, same-domain, cross-domain, and multi-domain alltoall;
 - KB, MB, and GB message-size coverage;
 - allreduce, reduce-scatter, allgather, broadcast, and P2P non-regression;

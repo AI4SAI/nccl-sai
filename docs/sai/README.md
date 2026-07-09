@@ -81,6 +81,10 @@ candidate, validate at least:
   correctness and non-regression;
 - fallback behavior when `NCCL_SAI_FABRIC_PROFILE` is unset or disabled.
 
+See `docs/sai/BUILD_AND_PACKAGING.md` for the public binary-package build
+matrix, including CUDA architecture coverage and portable x86-64-v3/v4 host ISA
+targets.
+
 Public performance summaries should report only sanitized scale classes,
 message sizes, NCCL/CUDA versions, and topology classes. Keep private job IDs,
 node names, switch labels, raw logs, internal paths, and operational incident
