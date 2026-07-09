@@ -55,6 +55,11 @@ upstream NCCL behavior.
   bulk copy fast path when ranks are globally contiguous by island.
 - `NCCL_SAI_LOCAL_P2P_SYS_TRACE`: emit initialization diagnostics when the local
   path-relaxation guard accepts a candidate path.
+- `NCCL_SAI_P2P_FABRIC_GROUP_SCHEDULE`: enable the advanced P2P schedule that
+  groups peer steps by local fabric-domain size. This is disabled by default and
+  should be treated as an expert-only tuning knob until validated for a site.
+- `NCCL_SAI_P2P_FABRIC_NODES`: node count in one local fabric-domain group for
+  `NCCL_SAI_P2P_FABRIC_GROUP_SCHEDULE`.
 
 These defaults are implementation policy, not a promise that one setting is
 optimal for every SAI system. Site packages may ship conservative defaults and

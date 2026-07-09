@@ -32,6 +32,11 @@ Explicit overrides:
 - `NCCL_SAI_A2A_ENABLE=0`: disable the alltoall SAI path.
 - `NCCL_SAI_LOCAL_P2P_SYS_ENABLE=1`: enable the selected local P2P path guard.
 - `NCCL_SAI_LOCAL_P2P_SYS_ENABLE=0`: disable that local path guard.
+- `NCCL_SAI_P2P_FABRIC_GROUP_SCHEDULE=1`: enable an advanced P2P schedule for
+  locally grouped fabric domains. It is disabled by default and should not be
+  enabled in public packages without site validation.
+- `NCCL_SAI_P2P_FABRIC_NODES=<N>`: local fabric-domain node count for that
+  advanced schedule.
 
 ## Release Scope
 
