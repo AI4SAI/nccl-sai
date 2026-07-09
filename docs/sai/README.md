@@ -15,20 +15,26 @@ deployment.
 Public source must not hard-code a private cluster, hostname pattern, scheduler
 partition, or filesystem path. NCCL-SAI uses generic opt-in controls:
 
+- `NCCL_SAI_A2A_ENABLE=1` explicitly enables the alltoall SAI path.
+- `NCCL_SAI_A2A_ENABLE=0` explicitly disables the alltoall SAI path.
+- When `NCCL_SAI_A2A_ENABLE` is unset, the alltoall SAI path follows
+  `NCCL_SAI_FABRIC_PROFILE`.
 - `NCCL_SAI_FABRIC_PROFILE=<name>` enables default SAI behavior for a site
   profile. Recommended public names are product-family names such as
   `ultrapod` or `slimpod`.
 - Disabled profile values are `0`, `false`, `off`, `none`, `native`, and
   `upstream`.
-- `NCCL_SAI_A2A_ENABLE=1` explicitly enables the alltoall SAI path.
-- `NCCL_SAI_A2A_ENABLE=0` explicitly disables the alltoall SAI path.
 - `NCCL_SAI_LOCAL_P2P_SYS_ENABLE=1` explicitly enables the local PCIe
   path-relaxation guard used for selected single-node layouts.
 - `NCCL_SAI_LOCAL_P2P_SYS_ENABLE=0` disables that local path-relaxation guard.
+- When `NCCL_SAI_LOCAL_P2P_SYS_ENABLE` is unset, the local path-relaxation
+  guard follows `NCCL_SAI_FABRIC_PROFILE`.
 
 Site-specific modulefiles, prologs, or container entrypoints may set these
 variables privately. Public code and docs should only describe the generic
-profile mechanism.
+profile mechanism. When both the explicit enable variables and
+`NCCL_SAI_FABRIC_PROFILE` are unset or disabled, NCCL-SAI falls back to
+upstream NCCL behavior.
 
 ## Current Tunables
 
@@ -36,14 +42,29 @@ profile mechanism.
 - `NCCL_SAI_A2A_LANES`: number of logical lanes used by the lane path.
 - `NCCL_SAI_A2A_GROUP_NODES`: node count in one local aggregation domain.
 - `NCCL_SAI_A2A_MIN_PEER_BYTES`: lower per-peer size bound for the lane path.
+- `NCCL_SAI_A2A_MIN_RANKS`: minimum communicator size for the lane path.
+- `NCCL_SAI_A2A_LANE_TRACE`: emit rank-zero eligibility diagnostics for the
+  alltoall SAI paths.
 - `NCCL_SAI_A2A_ISLAND_ENABLE`: enable or disable the small-message island path.
 - `NCCL_SAI_A2A_ISLAND_SIZE`: rank count in one local island.
 - `NCCL_SAI_A2A_ISLAND_MAX_PEER_BYTES`: upper per-peer size bound for the
   island path.
+- `NCCL_SAI_A2A_ISLAND_MIN_RANKS`: minimum communicator size for the island
+  path.
+- `NCCL_SAI_A2A_ISLAND_BULK_LOCAL_ENABLE`: enable or disable the island-local
+  bulk copy fast path when ranks are globally contiguous by island.
+- `NCCL_SAI_LOCAL_P2P_SYS_TRACE`: emit initialization diagnostics when the local
+  path-relaxation guard accepts a candidate path.
 
 These defaults are implementation policy, not a promise that one setting is
 optimal for every SAI system. Site packages may ship conservative defaults and
 leave expert overrides available.
+
+The local P2P path-relaxation guard is intentionally narrow. It is eligible
+only for a single-host 8-rank communicator that forms exactly two local
+4-rank GPU islands, and only for cross-island paths whose topology distance is
+outside the normal NVB class but still within SYS. It is not a general override
+for multi-node P2P behavior or arbitrary single-node layouts.
 
 ## Public Validation Standard
 
