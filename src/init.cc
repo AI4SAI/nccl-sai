@@ -764,6 +764,8 @@ static ncclResult_t initNvlDomainInfo(struct ncclComm* comm) {
 }
 
 NCCL_PARAM(GroupSize, "P2P_SCHEDULE_GROUP_SIZE", NCCL_MAX_DEV_WORK_P2P_PER_BATCH);
+NCCL_PARAM(SaiP2pFabricGroupSchedule, "SAI_P2P_FABRIC_GROUP_SCHEDULE", 0);
+NCCL_PARAM(SaiP2pFabricNodes, "SAI_P2P_FABRIC_NODES", 4);
 
 static ncclResult_t ncclP2pSchedule(struct ncclComm* comm) {
   struct ncclNodeRanks* nodeRanks = comm->nodeRanks;
@@ -803,29 +805,74 @@ static ncclResult_t ncclP2pSchedule(struct ncclComm* comm) {
   }
   INFO(NCCL_GRAPH,"%s: group size used is %d",__func__,groupSize);
 
-  uint32_t groupRound = 0, groupDelta = 0;
   int round = 0;
+
+  int saiFabricNodes = ncclParamSaiP2pFabricNodes();
+  bool saiSchedule = ncclParamSaiP2pFabricGroupSchedule() != 0;
+  if (saiSchedule && saiFabricNodes > 0 && comm->nNodes % saiFabricNodes == 0) {
+    int groupsPerNode = nodeRanks[0].localRanks / groupSize;
+    bool uniformLocalRanks = groupsPerNode > 0;
+    for (int n = 0; n < comm->nNodes; n++) {
+      uniformLocalRanks &= nodeRanks[n].localRanks == nodeRanks[0].localRanks;
+    }
+    int groupsPerFabric = saiFabricNodes * groupsPerNode;
+    if (uniformLocalRanks && groupsPerFabric > 0 && nGroups % groupsPerFabric == 0) {
+      int nFabricGroups = nGroups / groupsPerFabric;
+      int nFabricGroupsPow2 = pow2Up(nFabricGroups);
+      INFO(NCCL_GRAPH, "%s: using SAI fabric group schedule, fabricNodes %d, groupsPerFabric %d, fabricGroups %d",
+           __func__, saiFabricNodes, groupsPerFabric, nFabricGroups);
+      for (int delta = 0; delta < groupSize; delta++) {
+        for (int groupSkew = 0; groupSkew < groupsPerFabric; groupSkew++) {
+          uint32_t fabricRound = 0, fabricDelta = 0;
+          do {
+            if (fabricDelta < nFabricGroups) {
+              int groupDelta = fabricDelta * groupsPerFabric + groupSkew;
+              int sendGroup = (group + groupDelta) % nGroups;
+              int recvGroup = (group - groupDelta + nGroups) % nGroups;
+              int sendNode = groupToNode[sendGroup];
+              int recvNode = groupToNode[recvGroup];
+              int sendLocal = groupToLocal[sendGroup] + (local + delta) % groupSize;
+              int recvLocal = groupToLocal[recvGroup] + (local - delta + groupSize) % groupSize;
+              comm->p2pSchedule[round].sendRank = nodeRanks[sendNode].localRankToRank[sendLocal];
+              comm->p2pSchedule[round].recvRank = nodeRanks[recvNode].localRankToRank[recvLocal];
+              round += 1;
+            }
+            fabricRound += 1;
+            fabricDelta = (fabricDelta + fabricRound) & (nFabricGroupsPow2 - 1);
+          } while (fabricRound != nFabricGroupsPow2);
+        }
+      }
+    } else {
+      INFO(NCCL_GRAPH, "%s: SAI fabric group schedule disabled, localRanks/group layout is not uniform", __func__);
+    }
+  } else if (saiSchedule) {
+    INFO(NCCL_GRAPH, "%s: SAI fabric group schedule disabled, nNodes %d is not divisible by fabricNodes %d",
+         __func__, comm->nNodes, saiFabricNodes);
+  }
+  if (round == 0) {
+    uint32_t groupRound = 0, groupDelta = 0;
   // When enumerating peer deltas we use the quadratic formula (x*x+x)/2 mod N.
   // Since that formula only produces valid permutations when N is a pow of 2,
   // we let N = pow2Up(n) and filter out results greater-eq to n.
   // Example sequence for 16 ranks: 0, 1, 3, 6, 10, 15, 5, 12, 4, 13, 7, 2, 14, 11, 9, 8
-  do {
-    if (groupDelta < nGroups) { // Filter nonsensical group deltas
-      int sendGroup = (group + groupDelta) % nGroups;
-      int recvGroup = (group - groupDelta + nGroups) % nGroups;
-      int sendNode = groupToNode[sendGroup];
-      int recvNode = groupToNode[recvGroup];
-      for (int delta = 0; delta < groupSize; delta++) {
-        int sendLocal = groupToLocal[sendGroup] + (local + delta) % groupSize;
-        int recvLocal = groupToLocal[recvGroup] + (local - delta + groupSize) % groupSize;
-        comm->p2pSchedule[round].sendRank = nodeRanks[sendNode].localRankToRank[sendLocal];
-        comm->p2pSchedule[round].recvRank = nodeRanks[recvNode].localRankToRank[recvLocal];
-        round += 1;
+    do {
+      if (groupDelta < nGroups) { // Filter nonsensical group deltas
+        int sendGroup = (group + groupDelta) % nGroups;
+        int recvGroup = (group - groupDelta + nGroups) % nGroups;
+        int sendNode = groupToNode[sendGroup];
+        int recvNode = groupToNode[recvGroup];
+        for (int delta = 0; delta < groupSize; delta++) {
+          int sendLocal = groupToLocal[sendGroup] + (local + delta) % groupSize;
+          int recvLocal = groupToLocal[recvGroup] + (local - delta + groupSize) % groupSize;
+          comm->p2pSchedule[round].sendRank = nodeRanks[sendNode].localRankToRank[sendLocal];
+          comm->p2pSchedule[round].recvRank = nodeRanks[recvNode].localRankToRank[recvLocal];
+          round += 1;
+        }
       }
-    }
-    groupRound += 1;
-    groupDelta = (groupDelta + groupRound) & (nGroupsPow2 - 1); // Quadratic update
-  } while (groupRound != nGroupsPow2);
+      groupRound += 1;
+      groupDelta = (groupDelta + groupRound) & (nGroupsPow2 - 1); // Quadratic update
+    } while (groupRound != nGroupsPow2);
+  }
 
   free(groupToNode);
   free(groupToLocal);

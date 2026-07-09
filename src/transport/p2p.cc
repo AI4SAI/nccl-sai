@@ -136,8 +136,12 @@ ncclResult_t p2pCanConnect(int* ret, struct ncclComm* comm, struct ncclTopoGraph
   int useNet = 0;
   NCCLCHECK(ncclTopoCheckNet(comm->topo, info1->rank, info2->rank, &useNet));
   if (useNet) {
-    *ret = 0;
-    return ncclSuccess;
+    int saiLocalP2pSys = 0;
+    NCCLCHECK(ncclTopoSaiLocalP2pSysEligible(comm, comm->topo, info1->rank, info2->rank, &saiLocalP2pSys));
+    if (!saiLocalP2pSys) {
+      *ret = 0;
+      return ncclSuccess;
+    }
   }
 
   if (info1->hostHash != comm->peerInfo[comm->rank].hostHash ||
