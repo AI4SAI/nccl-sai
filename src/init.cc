@@ -20,6 +20,7 @@
 #include "ras.h"
 #include "profiler.h"
 #include "mnnvl.h"
+#include <limits.h>
 #include <fcntl.h>
 #include <string.h>
 #include <errno.h>
@@ -807,9 +808,11 @@ static ncclResult_t ncclP2pSchedule(struct ncclComm* comm) {
 
   int round = 0;
 
-  int saiFabricNodes = ncclParamSaiP2pFabricNodes();
+  int64_t saiFabricNodesParam = ncclParamSaiP2pFabricNodes();
+  bool validSaiFabricNodes = saiFabricNodesParam > 0 && saiFabricNodesParam <= INT_MAX;
+  int saiFabricNodes = validSaiFabricNodes ? (int)saiFabricNodesParam : 0;
   bool saiSchedule = ncclParamSaiP2pFabricGroupSchedule() != 0;
-  if (saiSchedule && saiFabricNodes > 0 && comm->nNodes % saiFabricNodes == 0) {
+  if (saiSchedule && validSaiFabricNodes && comm->nNodes % saiFabricNodes == 0) {
     int groupsPerNode = nodeRanks[0].localRanks / groupSize;
     bool uniformLocalRanks = groupsPerNode > 0;
     for (int n = 0; n < comm->nNodes; n++) {
@@ -846,8 +849,13 @@ static ncclResult_t ncclP2pSchedule(struct ncclComm* comm) {
       INFO(NCCL_GRAPH, "%s: SAI fabric group schedule disabled, localRanks/group layout is not uniform", __func__);
     }
   } else if (saiSchedule) {
-    INFO(NCCL_GRAPH, "%s: SAI fabric group schedule disabled, nNodes %d is not divisible by fabricNodes %d",
-         __func__, comm->nNodes, saiFabricNodes);
+    if (!validSaiFabricNodes) {
+      INFO(NCCL_GRAPH, "%s: SAI fabric group schedule disabled, invalid fabricNodes %ld",
+           __func__, (long)saiFabricNodesParam);
+    } else {
+      INFO(NCCL_GRAPH, "%s: SAI fabric group schedule disabled, nNodes %d is not divisible by fabricNodes %d",
+           __func__, comm->nNodes, saiFabricNodes);
+    }
   }
   if (round == 0) {
     uint32_t groupRound = 0, groupDelta = 0;

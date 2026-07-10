@@ -12,6 +12,7 @@
 #include "nvtx_payload_schemas.h"
 #include "param.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -165,9 +166,14 @@ static bool saiA2aLaneEligible(struct ncclComm* comm, size_t peerBytes, int* lan
   if (minPeerBytes < 0) minPeerBytes = 0;
   if (peerBytes < (size_t)minPeerBytes) { saiA2aSetReason(reasonOut, "small_peer_bytes"); return false; }
 
-  int lanes = (int)ncclParamSaiA2aLanes();
-  int groupNodes = (int)ncclParamSaiA2aGroupNodes();
-  if (lanes < 2 || groupNodes <= 0) { saiA2aSetReason(reasonOut, "bad_lane_config"); return false; }
+  int64_t lanesParam = ncclParamSaiA2aLanes();
+  int64_t groupNodesParam = ncclParamSaiA2aGroupNodes();
+  if (lanesParam < 2 || lanesParam > INT_MAX || groupNodesParam <= 0 || groupNodesParam > INT_MAX) {
+    saiA2aSetReason(reasonOut, "bad_lane_config");
+    return false;
+  }
+  int lanes = (int)lanesParam;
+  int groupNodes = (int)groupNodesParam;
   if (comm->nNodes % groupNodes != 0) { saiA2aSetReason(reasonOut, "nonmultiple_group_nodes"); return false; }
   if (!saiA2aUniformLocalRanks(comm)) { saiA2aSetReason(reasonOut, "nonuniform_local_ranks"); return false; }
   if (comm->rankToNode == nullptr || comm->rankToLocalRank == nullptr) { saiA2aSetReason(reasonOut, "missing_rank_maps"); return false; }
@@ -175,6 +181,7 @@ static bool saiA2aLaneEligible(struct ncclComm* comm, size_t peerBytes, int* lan
   int groupRanks = groupNodes * comm->localRanks;
   if (groupRanks <= 0) { saiA2aSetReason(reasonOut, "bad_group_ranks"); return false; }
   if (lanes > groupRanks) lanes = groupRanks;
+  if (lanes < 2) { saiA2aSetReason(reasonOut, "bad_lane_config"); return false; }
   *lanesOut = lanes;
   *groupNodesOut = groupNodes;
   saiA2aSetReason(reasonOut, "eligible");
@@ -229,8 +236,13 @@ static bool saiA2aIslandEligible(struct ncclComm* comm, const void* sendbuff, co
   int64_t maxPeerBytes = ncclParamSaiA2aIslandMaxPeerBytes();
   if (maxPeerBytes < 0) maxPeerBytes = 0;
   if (maxPeerBytes > 0 && peerBytes > (size_t)maxPeerBytes) { saiA2aSetReason(reasonOut, "island_large_peer_bytes"); return false; }
-  int islandSize = (int)ncclParamSaiA2aIslandSize();
-  if (islandSize < 2 || comm->localRanks < islandSize || (comm->localRanks % islandSize) != 0) {
+  int64_t islandSizeParam = ncclParamSaiA2aIslandSize();
+  if (islandSizeParam < 2 || islandSizeParam > INT_MAX) {
+    saiA2aSetReason(reasonOut, "island_bad_size");
+    return false;
+  }
+  int islandSize = (int)islandSizeParam;
+  if (comm->localRanks < islandSize || (comm->localRanks % islandSize) != 0) {
     saiA2aSetReason(reasonOut, "island_bad_size");
     return false;
   }
@@ -532,14 +544,15 @@ ncclResult_t ncclAlltoAll(const void* sendbuff, void* recvbuff, size_t count,
     return ncclNativeAlltoAll(sendbuff, recvbuff, count, datatype, comm, stream);
   }
 
-  size_t typeBytes = ncclTypeSize(datatype);
+  int typeSize = ncclTypeSize(datatype);
+  size_t typeBytes = typeSize > 0 ? (size_t)typeSize : 0;
   size_t peerBytes = 0;
   size_t totalBytes = 0;
   int lanes = 0;
   int groupNodes = 0;
   const char* reason = nullptr;
   bool inPlace = sendbuff == recvbuff;
-  if (sendbuff == nullptr || recvbuff == nullptr || typeBytes == 0 ||
+  if (sendbuff == nullptr || recvbuff == nullptr || typeSize <= 0 ||
       !saiA2aMulSize(count, typeBytes, &peerBytes) ||
       !saiA2aMulSize(peerBytes, (size_t)comm->nRanks, &totalBytes)) {
     reason = "bad_buffer_type_or_size";

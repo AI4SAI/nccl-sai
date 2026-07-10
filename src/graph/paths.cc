@@ -306,6 +306,7 @@ static bool ncclSaiLocalP2pSysEnabled() {
 }
 
 ncclResult_t ncclTopoSaiLocalP2pSysEligible(struct ncclComm* comm, struct ncclTopoSystem* system, int rank1, int rank2, int* eligible) {
+  if (eligible == NULL) return ncclInvalidArgument;
   *eligible = 0;
   if (!ncclSaiLocalP2pSysEnabled()) return ncclSuccess;
   if (comm == NULL || system == NULL) return ncclSuccess;
@@ -423,7 +424,8 @@ ncclResult_t ncclTopoCheckP2p(struct ncclComm* comm, struct ncclTopoSystem* syst
 
   // User override
   NCCLCHECK(ncclGetUserP2pLevel(&p2pLevel));
-  if (p2pLevel >= PATH_NVL && p2pLevel < PATH_SYS) {
+  // Standard NCCL user controls take precedence over the profile default.
+  if (ncclTopoUserP2pLevel == -2 && p2pLevel < PATH_SYS) {
     int saiLocalP2pSys = 0;
     NCCLCHECK(ncclTopoSaiLocalP2pSysEligible(comm, system, rank1, rank2, &saiLocalP2pSys));
     if (saiLocalP2pSys) p2pLevel = PATH_SYS;
