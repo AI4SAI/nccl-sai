@@ -40,7 +40,10 @@ upstream NCCL behavior.
 
 - `NCCL_SAI_A2A_LANE_ENABLE`: enable or disable the large-message lane path.
 - `NCCL_SAI_A2A_LANES`: number of logical lanes used by the lane path.
-- `NCCL_SAI_A2A_GROUP_NODES`: node count in one local aggregation domain.
+- `NCCL_SAI_A2A_GROUP_NODES`: NCCL topology-node count in one lane-local
+  aggregation unit. A topology node is not necessarily a physical host; sites
+  that split one host into multiple locality domains must set this from the
+  communicator view reported by NCCL.
 - `NCCL_SAI_A2A_MIN_PEER_BYTES`: lower per-peer size bound for the lane path.
 - `NCCL_SAI_A2A_MIN_RANKS`: minimum communicator size for the lane path.
 - `NCCL_SAI_A2A_LANE_TRACE`: emit rank-zero eligibility diagnostics for the
@@ -58,12 +61,21 @@ upstream NCCL behavior.
 - `NCCL_SAI_P2P_FABRIC_GROUP_SCHEDULE`: enable the advanced P2P schedule that
   groups peer steps by local fabric-domain size. This is disabled by default and
   should be treated as an expert-only tuning knob until validated for a site.
-- `NCCL_SAI_P2P_FABRIC_NODES`: node count in one local fabric-domain group for
-  `NCCL_SAI_P2P_FABRIC_GROUP_SCHEDULE`.
+- `NCCL_SAI_P2P_FABRIC_NODES`: topology-node count in one local fabric-domain
+  group for `NCCL_SAI_P2P_FABRIC_GROUP_SCHEDULE`. This is also expressed in
+  NCCL topology nodes, not scheduler host count.
 
 These defaults are implementation policy, not a promise that one setting is
 optimal for every SAI system. Site packages may ship conservative defaults and
 leave expert overrides available.
+
+The optimized paths currently require a blocking communicator and a top-level
+`ncclAlltoAll()` call. Calls made inside an outer `ncclGroupStart()` /
+`ncclGroupEnd()` region, nonblocking communicators, nonuniform rank layouts, and
+layouts that fail the configured topology guards fall back to upstream NCCL.
+Lane and fabric grouping also assume that topology-node numbering is contiguous
+inside each configured unit; site validation must confirm that communicator
+view before enabling a profile by default.
 
 The local P2P path-relaxation guard is intentionally narrow. It is eligible
 only for a single-host 8-rank communicator that forms exactly two local
@@ -94,6 +106,25 @@ Public performance summaries should report only sanitized scale classes,
 message sizes, NCCL/CUDA versions, and topology classes. Keep private job IDs,
 node names, switch labels, raw logs, internal paths, and operational incident
 notes outside the public repository.
+
+## Offline Algorithm Checks
+
+`tools/sai/verify_a2a_algorithms.py` mirrors the SAI schedule formulas without
+requiring CUDA devices. It verifies:
+
+- every P2P schedule rank has complete, duplicate-free send and receive peer
+  coverage, with matching peers in every round;
+- the lane formula assigns both directions of a rank pair to the same phase and
+  balances each modeled fabric edge across phases;
+- island-bulk pack, exchange, and unpack indexing reproduces exact alltoall
+  placement for both distinct and aliased input/output buffers;
+- 20- and 21-domain scale-class schedule shapes remain structurally valid.
+
+Run the full model before publishing source changes that touch these paths:
+
+```bash
+python3 tools/sai/verify_a2a_algorithms.py --full-scale
+```
 
 ## Supported Fabric Families
 
