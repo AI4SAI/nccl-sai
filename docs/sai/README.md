@@ -135,7 +135,8 @@ requiring CUDA devices. It verifies:
   placement for both distinct and defensively modeled aliased buffers. The
   alias model is not a public in-place support claim; dispatch sends aliased
   calls to upstream NCCL;
-- 20- and 21-domain scale-class schedule shapes remain structurally valid.
+- large power-of-two and non-power-of-two fabric-group schedule shapes remain
+  structurally valid without encoding a private deployment size.
 
 Run the full model before publishing source changes that touch these paths:
 

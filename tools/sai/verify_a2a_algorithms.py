@@ -303,7 +303,10 @@ def verify_island_bulk(n_islands: int, island_size: int, in_place: bool) -> dict
 def layouts(full_scale: bool) -> Iterable[ScheduleLayout]:
     topology_nodes = [8, 16, 32, 64]
     if full_scale:
-        topology_nodes.extend([320, 336])
+        # Keep public stress shapes representative rather than mirroring a
+        # particular deployed system. Cover both power-of-two and
+        # non-power-of-two fabric-group counts at large communicator sizes.
+        topology_nodes.extend([256, 272])
     return (ScheduleLayout(topology_nodes=count) for count in topology_nodes)
 
 
@@ -324,7 +327,7 @@ def main() -> int:
     parser.add_argument(
         "--full-scale",
         action="store_true",
-        help="also model 20- and 21-fabric-group communicator shapes",
+        help="also model large power-of-two and non-power-of-two communicator shapes",
     )
     args = parser.parse_args()
     results = run(full_scale=args.full_scale)
