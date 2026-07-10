@@ -5,9 +5,11 @@ UltraPOD and SlimPOD GPU fabrics. The current public branch focuses on
 application-transparent communication behavior: users should be able to load a
 site-provided NCCL-SAI runtime without modifying application source code.
 
-The first optimized API is `ncclAlltoAll()`. Other collectives, including
-allreduce, reduce-scatter, allgather, broadcast, and point-to-point operations,
-must remain correct and pass non-regression gates before any broad default
+The first optimized API is `ncclAlltoAll()`. NCCL-SAI also has a narrowly
+guarded local P2P transport-selection path for one eligible single-host layout;
+that transport choice can affect allreduce and other operations even though
+their collective algorithms are unchanged. All communication families must
+remain correct and pass non-regression gates before any broad default
 deployment.
 
 ## Activation Model
@@ -29,6 +31,8 @@ partition, or filesystem path. NCCL-SAI uses generic opt-in controls:
 - `NCCL_SAI_LOCAL_P2P_SYS_ENABLE=0` disables that local path-relaxation guard.
 - When `NCCL_SAI_LOCAL_P2P_SYS_ENABLE` is unset, the local path-relaxation
   guard follows `NCCL_SAI_FABRIC_PROFILE`.
+- Explicit `NCCL_P2P_DISABLE` and `NCCL_P2P_LEVEL` settings take precedence
+  over the profile-driven local path relaxation.
 
 Site-specific modulefiles, prologs, or container entrypoints may set these
 variables privately. Public code and docs should only describe the generic
@@ -62,8 +66,8 @@ upstream NCCL behavior.
   groups peer steps by local fabric-domain size. This is disabled by default and
   should be treated as an expert-only tuning knob until validated for a site.
 - `NCCL_SAI_P2P_FABRIC_NODES`: topology-node count in one local fabric-domain
-  group for `NCCL_SAI_P2P_FABRIC_GROUP_SCHEDULE`. This is also expressed in
-  NCCL topology nodes, not scheduler host count.
+  group for `NCCL_SAI_P2P_FABRIC_GROUP_SCHEDULE`. This is expressed in the
+  communicator's NCCL topology nodes, not scheduler host count.
 
 These defaults are implementation policy, not a promise that one setting is
 optimal for every SAI system. Site packages may ship conservative defaults and

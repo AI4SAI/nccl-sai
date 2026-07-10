@@ -5,8 +5,10 @@ Optimized primitives for inter-GPU communication.
 ## NCCL-SAI Branch
 
 This branch carries AI4SAI changes for SAI UltraPOD and SlimPOD GPU fabrics.
-The first optimized path is `ncclAlltoAll()`; other NCCL collectives remain on
-upstream behavior unless explicitly changed and validated. See
+The first optimized API is `ncclAlltoAll()`. NCCL-SAI also has a narrowly
+guarded local P2P transport-selection path that can affect any operation on an
+eligible single-host communicator; other collective algorithms remain
+unchanged unless explicitly documented and validated. See
 `docs/sai/README.md` and `docs/sai/COMMUNICATION_TUNING_MATRIX.md` for scope,
 rollback knobs, and validation requirements.
 

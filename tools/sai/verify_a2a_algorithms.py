@@ -70,6 +70,8 @@ class ScheduleLayout:
         require(self.lanes >= 2, "lanes must be at least two")
 
     def validate_fabric_schedule(self) -> None:
+        require(self.fabric_nodes > 0, "fabric_nodes must be positive")
+        require(self.p2p_group_size > 0, "p2p_group_size must be positive")
         require(self.topology_nodes % self.fabric_nodes == 0, "incomplete fabric group")
         require(self.local_ranks % self.p2p_group_size == 0, "incomplete P2P rank group")
 

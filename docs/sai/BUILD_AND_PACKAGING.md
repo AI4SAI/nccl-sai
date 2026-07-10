@@ -33,15 +33,22 @@ SASS for these CUDA architectures unless a narrower package is clearly labeled:
 sm_70 sm_75 sm_80 sm_86 sm_89 sm_90
 ```
 
-Include PTX for the highest supported virtual architecture so newer compatible
-drivers have a forward-compatibility path. A typical release build can use:
+The broad SAI package should include PTX for every advertised architecture, in
+addition to SASS. This keeps each supported generation independently
+inspectable and preserves a virtual-architecture image for compatible JIT
+paths. A typical release build can use:
 
 ```bash
 NVCC_GENCODE="-gencode=arch=compute_70,code=sm_70 \
+-gencode=arch=compute_70,code=compute_70 \
 -gencode=arch=compute_75,code=sm_75 \
+-gencode=arch=compute_75,code=compute_75 \
 -gencode=arch=compute_80,code=sm_80 \
+-gencode=arch=compute_80,code=compute_80 \
 -gencode=arch=compute_86,code=sm_86 \
+-gencode=arch=compute_86,code=compute_86 \
 -gencode=arch=compute_89,code=sm_89 \
+-gencode=arch=compute_89,code=compute_89 \
 -gencode=arch=compute_90,code=sm_90 \
 -gencode=arch=compute_90,code=compute_90"
 ```

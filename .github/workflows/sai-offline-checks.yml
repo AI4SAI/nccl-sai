@@ -4,13 +4,17 @@ on:
   push:
     paths:
       - "src/collectives.cc"
+      - "src/graph/paths.cc"
       - "src/init.cc"
+      - "src/transport/p2p.cc"
       - "tools/sai/**"
       - ".github/workflows/sai-offline-checks.yml"
   pull_request:
     paths:
       - "src/collectives.cc"
+      - "src/graph/paths.cc"
       - "src/init.cc"
+      - "src/transport/p2p.cc"
       - "tools/sai/**"
       - ".github/workflows/sai-offline-checks.yml"
 
