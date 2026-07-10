@@ -13,6 +13,7 @@
 #include "param.h"
 
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -114,6 +115,18 @@ static bool saiA2aUniformLocalRanks(struct ncclComm* comm) {
 
 static void saiA2aSetReason(const char** reasonOut, const char* reason) {
   if (reasonOut != nullptr) *reasonOut = reason;
+}
+
+static bool saiA2aMulSize(size_t a, size_t b, size_t* result) {
+  if (result == nullptr || (a != 0 && b > SIZE_MAX / a)) return false;
+  *result = a * b;
+  return true;
+}
+
+static bool saiA2aAddSize(size_t a, size_t b, size_t* result) {
+  if (result == nullptr || b > SIZE_MAX - a) return false;
+  *result = a + b;
+  return true;
 }
 
 static bool saiA2aProfileDisabledValue(const char* value) {
@@ -309,12 +322,10 @@ static ncclResult_t saiA2aIslandAlltoAll(const void* sendbuff, void* recvbuff, s
   int myNodeIsland = comm->localRank / islandSize;
   int myIslandLocal = comm->localRank % islandSize;
   int myIsland = comm->node * islandsPerNode + myNodeIsland;
-  size_t blockCount = count * (size_t)islandSize;
-  size_t blockBytes = peerBytes * (size_t)islandSize;
-  size_t stageBytes = blockBytes * (size_t)nIslands;
-  if (count != 0 && blockCount / count != (size_t)islandSize) return ncclInvalidArgument;
-  if (peerBytes != 0 && blockBytes / peerBytes != (size_t)islandSize) return ncclInvalidArgument;
-  if (blockBytes != 0 && stageBytes / blockBytes != (size_t)nIslands) return ncclInvalidArgument;
+  size_t blockCount, blockBytes, stageBytes;
+  if (!saiA2aMulSize(count, (size_t)islandSize, &blockCount) ||
+      !saiA2aMulSize(peerBytes, (size_t)islandSize, &blockBytes) ||
+      !saiA2aMulSize(blockBytes, (size_t)nIslands, &stageBytes)) return ncclInvalidArgument;
   char* stage = nullptr;
   cudaError_t err = cudaMallocAsync((void**)&stage, stageBytes, stream);
   if (err != cudaSuccess) return ncclUnhandledCudaError;
@@ -396,19 +407,14 @@ static ncclResult_t saiA2aIslandBulkLocalAlltoAll(const void* sendbuff, void* re
   int myNodeIsland = comm->localRank / islandSize;
   int myIslandLocal = comm->localRank % islandSize;
   int myIsland = comm->node * islandsPerNode + myNodeIsland;
-  size_t blockCount = count * (size_t)islandSize;
-  size_t blockBytes = peerBytes * (size_t)islandSize;
-  size_t stageBytes = blockBytes * (size_t)nIslands;
-  size_t localBulkBytes = peerBytes * (size_t)nIslands;
-  size_t localBufBytes = localBulkBytes * (size_t)(islandSize - 1);
-  if (count != 0 && blockCount / count != (size_t)islandSize) return ncclInvalidArgument;
-  if (peerBytes != 0 && blockBytes / peerBytes != (size_t)islandSize) return ncclInvalidArgument;
-  if (blockBytes != 0 && stageBytes / blockBytes != (size_t)nIslands) return ncclInvalidArgument;
-  if (peerBytes != 0 && localBulkBytes / peerBytes != (size_t)nIslands) return ncclInvalidArgument;
-  if (localBulkBytes != 0 && localBufBytes / localBulkBytes != (size_t)(islandSize - 1)) return ncclInvalidArgument;
-  if (stageBytes > (size_t)-1 - localBufBytes || stageBytes + localBufBytes > (size_t)-1 - localBufBytes) return ncclInvalidArgument;
-
-  size_t scratchBytes = stageBytes + 2 * localBufBytes;
+  size_t blockCount, blockBytes, stageBytes, localBulkBytes, localBufBytes, scratchBytes;
+  if (!saiA2aMulSize(count, (size_t)islandSize, &blockCount) ||
+      !saiA2aMulSize(peerBytes, (size_t)islandSize, &blockBytes) ||
+      !saiA2aMulSize(blockBytes, (size_t)nIslands, &stageBytes) ||
+      !saiA2aMulSize(peerBytes, (size_t)nIslands, &localBulkBytes) ||
+      !saiA2aMulSize(localBulkBytes, (size_t)(islandSize - 1), &localBufBytes) ||
+      !saiA2aAddSize(stageBytes, localBufBytes, &scratchBytes) ||
+      !saiA2aAddSize(scratchBytes, localBufBytes, &scratchBytes)) return ncclInvalidArgument;
   char* scratch = nullptr;
   cudaError_t err = comm->memPool != nullptr ?
     cudaMallocFromPoolAsync((void**)&scratch, scratchBytes, comm->memPool, stream) :
@@ -527,16 +533,20 @@ ncclResult_t ncclAlltoAll(const void* sendbuff, void* recvbuff, size_t count,
   }
 
   size_t typeBytes = ncclTypeSize(datatype);
-  size_t peerBytes = count * typeBytes;
+  size_t peerBytes = 0;
+  size_t totalBytes = 0;
   int lanes = 0;
   int groupNodes = 0;
   const char* reason = nullptr;
   bool inPlace = sendbuff == recvbuff;
-  if (sendbuff == nullptr || recvbuff == nullptr || typeBytes == 0) {
-    if (sendbuff == nullptr || recvbuff == nullptr || typeBytes == 0) reason = "bad_buffer_or_type";
+  if (sendbuff == nullptr || recvbuff == nullptr || typeBytes == 0 ||
+      !saiA2aMulSize(count, typeBytes, &peerBytes) ||
+      !saiA2aMulSize(peerBytes, (size_t)comm->nRanks, &totalBytes)) {
+    reason = "bad_buffer_type_or_size";
     saiA2aTrace(comm, "native", reason, peerBytes, lanes, groupNodes);
     return ncclNativeAlltoAll(sendbuff, recvbuff, count, datatype, comm, stream);
   }
+  (void)totalBytes;
   if (!saiA2aFabricEnabled(&reason)) {
     saiA2aTrace(comm, "native", reason, peerBytes, lanes, groupNodes);
     return ncclNativeAlltoAll(sendbuff, recvbuff, count, datatype, comm, stream);
