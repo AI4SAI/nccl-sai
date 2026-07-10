@@ -12,6 +12,10 @@ are retained in `LICENSE.txt`; see `docs/sai/NOTICE.md`.
 
 - `ncclAlltoAll()` on eligible SAI fabric profiles.
 
+The optimized AlltoAll paths require distinct send and receive buffers.
+Aliased buffers use the upstream path; this release does not claim an in-place
+AlltoAll contract.
+
 NCCL-SAI also includes a narrowly guarded local P2P transport-selection path
 for an eligible single-host 8-rank, two-island communicator. That path can
 affect any operation using local P2P transport, while the allreduce, allgather,

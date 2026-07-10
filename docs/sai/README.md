@@ -60,7 +60,8 @@ upstream NCCL behavior.
 - `NCCL_SAI_A2A_ISLAND_MIN_RANKS`: minimum communicator size for the island
   path.
 - `NCCL_SAI_A2A_ISLAND_BULK_LOCAL_ENABLE`: enable or disable the island-local
-  bulk copy fast path when ranks are globally contiguous by island.
+  bulk copy fast path when ranks are globally contiguous by island. Disabling
+  it, or failing its rank-layout guard, falls back to upstream AlltoAll.
 - `NCCL_SAI_LOCAL_P2P_SYS_TRACE`: emit initialization diagnostics when the local
   path-relaxation guard accepts a candidate path.
 - `NCCL_SAI_P2P_FABRIC_GROUP_SCHEDULE`: enable the advanced P2P schedule that
@@ -74,19 +75,28 @@ These defaults are implementation policy, not a promise that one setting is
 optimal for every SAI system. Site packages may ship conservative defaults and
 leave expert overrides available.
 
-The optimized paths currently require a blocking communicator and a top-level
-`ncclAlltoAll()` call. Calls made inside an outer `ncclGroupStart()` /
-`ncclGroupEnd()` region, nonblocking communicators, nonuniform rank layouts, and
-layouts that fail the configured topology guards fall back to upstream NCCL.
-Lane and fabric grouping also assume that topology-node numbering is contiguous
-inside each configured unit; site validation must confirm that communicator
-view before enabling a profile by default.
+The optimized paths currently require distinct send and receive buffers, a
+blocking communicator, and a top-level `ncclAlltoAll()` call. Aliased buffers
+fall back to upstream NCCL; NCCL does not document an in-place AlltoAll
+contract. Calls made inside an outer `ncclGroupStart()` / `ncclGroupEnd()`
+region, nonblocking communicators, nonuniform rank layouts, and layouts that
+fail the configured topology guards also fall back upstream. Lane and fabric
+grouping assume that topology-node numbering is contiguous inside each
+configured unit; site validation must confirm that communicator view before
+enabling a profile by default.
 
 The local P2P path-relaxation guard is intentionally narrow. It is eligible
 only for a single-host 8-rank communicator that forms exactly two local
 4-rank GPU islands, and only for cross-island paths whose topology distance is
 outside the normal NVB class but still within SYS. It is not a general override
 for multi-node P2P behavior or arbitrary single-node layouts.
+
+The island-bulk path uses stream-ordered temporary device memory. For `N`
+islands of size `I`, its scratch bound is
+`peerBytes * N * I + 2 * peerBytes * N * (I - 1)`. Site validation must leave
+that headroom on every rank. A scratch allocation failure is returned as a CUDA
+error; NCCL-SAI does not let one rank silently switch to the upstream schedule
+after other ranks selected island-bulk.
 
 ## Public Validation Standard
 
@@ -122,7 +132,9 @@ requiring CUDA devices. It verifies:
 - the lane formula assigns both directions of a rank pair to the same phase and
   balances each modeled fabric edge across phases;
 - island-bulk pack, exchange, and unpack indexing reproduces exact alltoall
-  placement for both distinct and aliased input/output buffers;
+  placement for both distinct and defensively modeled aliased buffers. The
+  alias model is not a public in-place support claim; dispatch sends aliased
+  calls to upstream NCCL;
 - 20- and 21-domain scale-class schedule shapes remain structurally valid.
 
 Run the full model before publishing source changes that touch these paths:

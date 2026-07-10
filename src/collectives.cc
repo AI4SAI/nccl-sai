@@ -105,6 +105,29 @@ static ncclResult_t ncclNativeAlltoAll(const void* sendbuff, void* recvbuff, siz
   return ncclEnqueueCheck(&info);
 }
 
+static ncclResult_t saiA2aPreflight(const void* sendbuff, void* recvbuff, size_t count,
+    ncclDataType_t datatype, ncclComm* comm, cudaStream_t stream) {
+  struct ncclInfo info = { ncclFuncAlltoAll, "AlltoAll",
+    sendbuff, recvbuff, count, datatype, ncclSum, 0, comm, stream, /* Args */
+    ALLTOALL_CHUNKSTEPS, ALLTOALL_SLICESTEPS };
+  ncclResult_t ret = ncclSuccess;
+  int devOld = -1;
+
+  NCCLCHECKGOTO(ncclCommEnsureReady(comm), ret, exit);
+  if (comm->checkPointers) {
+    CUDACHECKGOTO(cudaGetDevice(&devOld), ret, exit);
+    CUDACHECKGOTO(cudaSetDevice(comm->cudaDev), ret, exit);
+  }
+  NCCLCHECKGOTO(ArgsCheck(&info), ret, exit);
+
+exit:
+  if (devOld != -1) {
+    cudaError_t err = cudaSetDevice(devOld);
+    if (ret == ncclSuccess && err != cudaSuccess) ret = ncclUnhandledCudaError;
+  }
+  return ncclGroupErrCheck(ret);
+}
+
 static bool saiA2aUniformLocalRanks(struct ncclComm* comm) {
   if (comm == nullptr || comm->nodeRanks == nullptr || comm->localRanks <= 0 || comm->nNodes <= 0) return false;
   for (int n = 0; n < comm->nNodes; n++) {
@@ -209,10 +232,7 @@ static bool saiA2aIslandGlobalContiguous(struct ncclComm* comm, int islandSize) 
   return true;
 }
 
-static bool saiA2aIslandEligible(struct ncclComm* comm, const void* sendbuff, const void* recvbuff,
-    size_t peerBytes, int* islandSizeOut, const char** reasonOut) {
-  (void)sendbuff;
-  (void)recvbuff;
+static bool saiA2aIslandEligible(struct ncclComm* comm, size_t peerBytes, int* islandSizeOut, const char** reasonOut) {
   if (comm == nullptr || islandSizeOut == nullptr) { saiA2aSetReason(reasonOut, "bad_args"); return false; }
   if (ncclParamSaiA2aIslandEnable() == 0) { saiA2aSetReason(reasonOut, "island_disabled"); return false; }
   if (ncclGroupDepth != 0) { saiA2aSetReason(reasonOut, "inside_group"); return false; }
@@ -313,87 +333,6 @@ static ncclResult_t saiA2aLaneAlltoAll(const void* sendbuff, void* recvbuff, siz
   return ncclSuccess;
 }
 
-static ncclResult_t saiA2aIslandAlltoAll(const void* sendbuff, void* recvbuff, size_t count,
-    ncclDataType_t datatype, ncclComm* comm, cudaStream_t stream, size_t peerBytes, int islandSize) {
-  int islandsPerNode = comm->localRanks / islandSize;
-  int nIslands = comm->nNodes * islandsPerNode;
-  int myNodeIsland = comm->localRank / islandSize;
-  int myIslandLocal = comm->localRank % islandSize;
-  int myIsland = comm->node * islandsPerNode + myNodeIsland;
-  size_t blockCount, blockBytes, stageBytes;
-  if (!saiA2aMulSize(count, (size_t)islandSize, &blockCount) ||
-      !saiA2aMulSize(peerBytes, (size_t)islandSize, &blockBytes) ||
-      !saiA2aMulSize(blockBytes, (size_t)nIslands, &stageBytes)) return ncclInvalidArgument;
-  char* stage = nullptr;
-  cudaError_t err = cudaMallocAsync((void**)&stage, stageBytes, stream);
-  if (err != cudaSuccess) return ncclUnhandledCudaError;
-
-  ncclResult_t ret = ncclSuccess;
-  ncclResult_t phaseRet = ncclGroupStartInternal();
-  if (phaseRet != ncclSuccess) { ret = phaseRet; goto fail; }
-  for (int island = 0; island < nIslands; island++) {
-    if (island == myIsland) continue;
-    int peerRank = saiA2aIslandRank(comm, island, myIslandLocal, islandSize);
-    int firstRank = saiA2aIslandRank(comm, island, 0, islandSize);
-    const char* sendPtr = (const char*)sendbuff + (size_t)firstRank * peerBytes;
-    char* recvPtr = stage + (size_t)island * blockBytes;
-    ret = ncclSend(sendPtr, blockCount, datatype, peerRank, comm, stream);
-    if (ret != ncclSuccess && ret != ncclInProgress) { phaseRet = ret; break; }
-    ret = ncclRecv(recvPtr, blockCount, datatype, peerRank, comm, stream);
-    if (ret != ncclSuccess && ret != ncclInProgress) { phaseRet = ret; break; }
-  }
-  ret = ncclGroupEndInternal();
-  if (phaseRet != ncclSuccess && phaseRet != ncclInProgress) { ret = phaseRet; goto fail; }
-  if (ret != ncclSuccess && ret != ncclInProgress) goto fail;
-
-  for (int island = 0; island < nIslands; island++) {
-    int srcRank = saiA2aIslandRank(comm, island, myIslandLocal, islandSize);
-    const char* src = nullptr;
-    if (island == myIsland) src = (const char*)sendbuff + (size_t)comm->rank * peerBytes;
-    else src = stage + (size_t)island * blockBytes + (size_t)myIslandLocal * peerBytes;
-    char* dst = (char*)recvbuff + (size_t)srcRank * peerBytes;
-    err = cudaMemcpyAsync(dst, src, peerBytes, cudaMemcpyDeviceToDevice, stream);
-    if (err != cudaSuccess) { ret = ncclUnhandledCudaError; goto fail; }
-  }
-
-  phaseRet = ncclGroupStartInternal();
-  if (phaseRet != ncclSuccess) { ret = phaseRet; goto fail; }
-  for (int dstLocal = 0; dstLocal < islandSize; dstLocal++) {
-    if (dstLocal == myIslandLocal) continue;
-    int dstRank = saiA2aIslandRank(comm, myIsland, dstLocal, islandSize);
-    for (int srcIsland = 0; srcIsland < nIslands; srcIsland++) {
-      const char* sendPtr = nullptr;
-      if (srcIsland == myIsland) sendPtr = (const char*)sendbuff + (size_t)dstRank * peerBytes;
-      else sendPtr = stage + (size_t)srcIsland * blockBytes + (size_t)dstLocal * peerBytes;
-      ret = ncclSend(sendPtr, count, datatype, dstRank, comm, stream);
-      if (ret != ncclSuccess && ret != ncclInProgress) { phaseRet = ret; break; }
-    }
-    if (phaseRet != ncclSuccess && phaseRet != ncclInProgress) break;
-  }
-  if (phaseRet == ncclSuccess || phaseRet == ncclInProgress) {
-    for (int srcLocal = 0; srcLocal < islandSize; srcLocal++) {
-      if (srcLocal == myIslandLocal) continue;
-      int srcPeer = saiA2aIslandRank(comm, myIsland, srcLocal, islandSize);
-      for (int srcIsland = 0; srcIsland < nIslands; srcIsland++) {
-        int srcRank = saiA2aIslandRank(comm, srcIsland, srcLocal, islandSize);
-        char* recvPtr = (char*)recvbuff + (size_t)srcRank * peerBytes;
-        ret = ncclRecv(recvPtr, count, datatype, srcPeer, comm, stream);
-        if (ret != ncclSuccess && ret != ncclInProgress) { phaseRet = ret; break; }
-      }
-      if (phaseRet != ncclSuccess && phaseRet != ncclInProgress) break;
-    }
-  }
-  ret = ncclGroupEndInternal();
-  if (phaseRet != ncclSuccess && phaseRet != ncclInProgress) { ret = phaseRet; goto fail; }
-  if (ret != ncclSuccess && ret != ncclInProgress) goto fail;
-  if (ret == ncclInProgress) ret = ncclSuccess;
-
-fail:
-  err = cudaFreeAsync(stage, stream);
-  if (ret == ncclSuccess && err != cudaSuccess) ret = ncclUnhandledCudaError;
-  return ret;
-}
-
 static int saiA2aIslandPeerSlot(int local, int myLocal) {
   return local < myLocal ? local : local - 1;
 }
@@ -417,6 +356,8 @@ static ncclResult_t saiA2aIslandBulkLocalAlltoAll(const void* sendbuff, void* re
   cudaError_t err = comm->memPool != nullptr ?
     cudaMallocFromPoolAsync((void**)&scratch, scratchBytes, comm->memPool, stream) :
     cudaMallocAsync((void**)&scratch, scratchBytes, stream);
+  // Never fall back to a different schedule after a rank-local allocation
+  // failure; all ranks in the collective must select the same path.
   if (err != cudaSuccess) return ncclUnhandledCudaError;
   char* stage = scratch;
   char* localSend = stage + stageBytes;
@@ -521,13 +462,10 @@ ncclResult_t ncclAlltoAll(const void* sendbuff, void* recvbuff, size_t count,
     NVTX3_PAYLOAD(comm ? comm->commHash : 0, count * ncclTypeSize(datatype)));
 
   ncclResult_t ret = CommCheck(comm, "AlltoAll", "comm");
-  if (ret != ncclSuccess) {
-    saiA2aTrace(comm, "native", "comm_check_failed", 0, 0, 0);
-    return ncclNativeAlltoAll(sendbuff, recvbuff, count, datatype, comm, stream);
-  }
+  if (ret != ncclSuccess) return ncclGroupErrCheck(ret);
   if (comm->revokedFlag) {
-    saiA2aTrace(comm, "native", "revoked", 0, 0, 0);
-    return ncclNativeAlltoAll(sendbuff, recvbuff, count, datatype, comm, stream);
+    WARN("AlltoAll: communicator was revoked");
+    return ncclGroupErrCheck(ncclInvalidUsage);
   }
 
   int typeSize = ncclTypeSize(datatype);
@@ -537,19 +475,28 @@ ncclResult_t ncclAlltoAll(const void* sendbuff, void* recvbuff, size_t count,
   int lanes = 0;
   int groupNodes = 0;
   const char* reason = nullptr;
-  bool inPlace = sendbuff == recvbuff;
   if (sendbuff == nullptr || recvbuff == nullptr || typeSize <= 0 ||
-      !saiA2aMulSize(count, typeBytes, &peerBytes) ||
-      !saiA2aMulSize(peerBytes, (size_t)comm->nRanks, &totalBytes)) {
+      !saiA2aMulSize(count, typeBytes, &peerBytes)) {
     reason = "bad_buffer_type_or_size";
     saiA2aTrace(comm, "native", reason, peerBytes, lanes, groupNodes);
     return ncclNativeAlltoAll(sendbuff, recvbuff, count, datatype, comm, stream);
   }
-  (void)totalBytes;
   if (!saiA2aFabricEnabled(&reason)) {
     saiA2aTrace(comm, "native", reason, peerBytes, lanes, groupNodes);
     return ncclNativeAlltoAll(sendbuff, recvbuff, count, datatype, comm, stream);
   }
+  if (sendbuff == recvbuff) {
+    saiA2aTrace(comm, "native", "aliased_buffers_unsupported", peerBytes, lanes, groupNodes);
+    return ncclNativeAlltoAll(sendbuff, recvbuff, count, datatype, comm, stream);
+  }
+
+  ret = saiA2aPreflight(sendbuff, recvbuff, count, datatype, comm, stream);
+  if (ret != ncclSuccess) return ret;
+  if (!saiA2aMulSize(peerBytes, (size_t)comm->nRanks, &totalBytes)) {
+    saiA2aTrace(comm, "native", "bad_total_size", peerBytes, lanes, groupNodes);
+    return ncclNativeAlltoAll(sendbuff, recvbuff, count, datatype, comm, stream);
+  }
+  (void)totalBytes;
 
   if (saiA2aLaneEligible(comm, peerBytes, &lanes, &groupNodes, &reason)) {
     saiA2aTrace(comm, "lane", reason, peerBytes, lanes, groupNodes);
@@ -558,18 +505,14 @@ ncclResult_t ncclAlltoAll(const void* sendbuff, void* recvbuff, size_t count,
 
   int islandSize = 0;
   const char* islandReason = nullptr;
-  if (saiA2aIslandEligible(comm, sendbuff, recvbuff, peerBytes, &islandSize, &islandReason)) {
+  if (saiA2aIslandEligible(comm, peerBytes, &islandSize, &islandReason)) {
     const char* bulkReason = nullptr;
     if (saiA2aIslandBulkEligible(comm, islandSize, &bulkReason)) {
-      saiA2aTrace(comm, "island_bulk", inPlace ? "eligible_in_place" : bulkReason, peerBytes, 0, islandSize);
+      saiA2aTrace(comm, "island_bulk", bulkReason, peerBytes, 0, islandSize);
       return saiA2aIslandBulkLocalAlltoAll(sendbuff, recvbuff, count, datatype, comm, stream, peerBytes, islandSize);
     }
-    if (inPlace) {
-      saiA2aTrace(comm, "native", "island_in_place_no_bulk", peerBytes, 0, islandSize);
-      return ncclNativeAlltoAll(sendbuff, recvbuff, count, datatype, comm, stream);
-    }
-    saiA2aTrace(comm, "island", islandReason, peerBytes, 0, islandSize);
-    return saiA2aIslandAlltoAll(sendbuff, recvbuff, count, datatype, comm, stream, peerBytes, islandSize);
+    saiA2aTrace(comm, "native", bulkReason, peerBytes, 0, islandSize);
+    return ncclNativeAlltoAll(sendbuff, recvbuff, count, datatype, comm, stream);
   }
 
   saiA2aTrace(comm, "native", reason == nullptr ? islandReason : reason, peerBytes, lanes, groupNodes);
