@@ -12,6 +12,10 @@
 #include "channel.h"
 #include "transport.h"
 #include "device.h"
+#include "sai_profile.h"
+
+#include <stdlib.h>
+#include <string.h>
 
 // Pre-compute GPU->NIC, GPU->GPU and NIC->GPU paths
 
@@ -253,6 +257,8 @@ ncclResult_t ncclGetLevel(int* level, const char* disableEnv, const char* levelE
 }
 
 NCCL_PARAM(IgnoreDisabledP2p, "IGNORE_DISABLED_P2P", 0);
+NCCL_PARAM(SaiLocalP2pSysEnable, "SAI_LOCAL_P2P_SYS_ENABLE", -1);
+NCCL_PARAM(SaiLocalP2pSysTrace, "SAI_LOCAL_P2P_SYS_TRACE", 0);
 
 static int ncclTopoUserP2pLevel = -1; // Initially "uninitialized".  When initialized but unset, changes to -2.
 
@@ -263,6 +269,85 @@ ncclResult_t ncclGetUserP2pLevel(int* level) {
     NCCLCHECK(ncclGetLevel(&ncclTopoUserP2pLevel, "NCCL_P2P_DISABLE", "NCCL_P2P_LEVEL"));
   if (ncclTopoUserP2pLevel != -2)
     *level = ncclTopoUserP2pLevel;
+  return ncclSuccess;
+}
+
+static int ncclSaiFindParent(int* parent, int x) {
+  while (parent[x] != x) {
+    parent[x] = parent[parent[x]];
+    x = parent[x];
+  }
+  return x;
+}
+
+static void ncclSaiUnionParent(int* parent, int a, int b) {
+  int pa = ncclSaiFindParent(parent, a);
+  int pb = ncclSaiFindParent(parent, b);
+  if (pa != pb) parent[pb] = pa;
+}
+
+static bool ncclSaiLocalP2pSysEnabled() {
+  int64_t enabled = ncclParamSaiLocalP2pSysEnable();
+  if (enabled == 0) return false;
+  if (enabled > 0) return true;
+  return ncclSaiFabricProfileEnabled();
+}
+
+ncclResult_t ncclTopoSaiLocalP2pSysEligible(struct ncclComm* comm, struct ncclTopoSystem* system, int rank1, int rank2, int* eligible) {
+  if (eligible == NULL) return ncclInvalidArgument;
+  *eligible = 0;
+  if (!ncclSaiLocalP2pSysEnabled()) return ncclSuccess;
+  if (comm == NULL || system == NULL) return ncclSuccess;
+  if (comm->nRanks != 8 || comm->peerInfo == NULL) return ncclSuccess;
+  if (rank1 < 0 || rank1 >= comm->nRanks || rank2 < 0 || rank2 >= comm->nRanks) return ncclSuccess;
+
+  uint64_t hostHash = comm->peerInfo[rank1].hostHash;
+  for (int r = 0; r < comm->nRanks; r++) {
+    if (comm->peerInfo[r].hostHash != hostHash) return ncclSuccess;
+  }
+
+  int gpuIndex[8];
+  for (int r = 0; r < comm->nRanks; r++) {
+    ncclResult_t ret = ncclTopoRankToIndex(system, r, gpuIndex+r, /*showWarn=*/false);
+    if (ret == ncclInternalError) return ncclSuccess;
+    NCCLCHECK(ret);
+  }
+
+  int parent[8];
+  for (int i = 0; i < comm->nRanks; i++) parent[i] = i;
+  for (int i = 0; i < comm->nRanks; i++) {
+    struct ncclTopoNode* gpu = system->nodes[GPU].nodes+gpuIndex[i];
+    for (int j = i+1; j < comm->nRanks; j++) {
+      int type = gpu->paths[GPU][gpuIndex[j]].type;
+      if (type <= PATH_NVB) ncclSaiUnionParent(parent, i, j);
+    }
+  }
+
+  int compCount[8] = { 0 };
+  int nComps = 0;
+  for (int i = 0; i < comm->nRanks; i++) {
+    int root = ncclSaiFindParent(parent, i);
+    if (compCount[root] == 0) nComps++;
+    compCount[root]++;
+  }
+  if (nComps != 2) return ncclSuccess;
+  for (int i = 0; i < comm->nRanks; i++) {
+    if (compCount[i] != 0 && compCount[i] != 4) return ncclSuccess;
+  }
+
+  int root1 = ncclSaiFindParent(parent, rank1);
+  int root2 = ncclSaiFindParent(parent, rank2);
+  if (root1 == root2) return ncclSuccess;
+
+  struct ncclTopoNode* gpu1 = system->nodes[GPU].nodes+gpuIndex[rank1];
+  int crossType = gpu1->paths[GPU][gpuIndex[rank2]].type;
+  if (crossType > PATH_NVB && crossType <= PATH_SYS) {
+    *eligible = 1;
+    if (ncclParamSaiLocalP2pSysTrace() && comm->rank == 0) {
+      INFO(NCCL_INIT|NCCL_P2P, "SAI local P2P SYS enabled for single-host two-island communicator: rank %d <-> rank %d path %s",
+           rank1, rank2, topoPathTypeStr[crossType]);
+    }
+  }
   return ncclSuccess;
 }
 
@@ -291,7 +376,9 @@ ncclResult_t ncclTopoCheckP2p(struct ncclComm* comm, struct ncclTopoSystem* syst
         return ncclSuccess;
       }
     } else if (info1->shmDev != info2->shmDev) {
-      return ncclSuccess;
+      int saiLocalP2pSys = 0;
+      NCCLCHECK(ncclTopoSaiLocalP2pSysEligible(comm, system, rank1, rank2, &saiLocalP2pSys));
+      if (!saiLocalP2pSys) return ncclSuccess;
     }
   }
 
@@ -325,6 +412,12 @@ ncclResult_t ncclTopoCheckP2p(struct ncclComm* comm, struct ncclTopoSystem* syst
 
   // User override
   NCCLCHECK(ncclGetUserP2pLevel(&p2pLevel));
+  // Standard NCCL user controls take precedence over the profile default.
+  if (ncclTopoUserP2pLevel == -2 && p2pLevel < PATH_SYS) {
+    int saiLocalP2pSys = 0;
+    NCCLCHECK(ncclTopoSaiLocalP2pSysEligible(comm, system, rank1, rank2, &saiLocalP2pSys));
+    if (saiLocalP2pSys) p2pLevel = PATH_SYS;
+  }
 
   // Compute the PCI distance and compare with the p2pLevel.
   if (path->type <= p2pLevel) *p2p = 1;

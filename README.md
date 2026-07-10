@@ -2,6 +2,30 @@
 
 Optimized primitives for inter-GPU communication.
 
+## NCCL-SAI Branch
+
+This branch carries AI4SAI changes for SAI UltraPOD and SlimPOD GPU fabrics.
+The first optimized API is `ncclAlltoAll()`. NCCL-SAI also has a narrowly
+guarded local P2P transport-selection path that can affect any operation on an
+eligible single-host communicator; other collective algorithms remain
+unchanged unless explicitly documented and validated. See
+`docs/sai/README.md` and `docs/sai/COMMUNICATION_TUNING_MATRIX.md` for scope,
+rollback knobs, and validation requirements.
+
+NCCL-SAI modifications are maintained by AI4SAI/SAI contributors. This project
+is derived from NVIDIA NCCL and is not endorsed by NVIDIA. Original NVIDIA NCCL
+copyright and license notices are retained; see `LICENSE.txt` and
+`docs/sai/NOTICE.md`.
+
+For SAI users, the intended runtime mode is drop-in replacement: put the
+NCCL-SAI build's `lib/` directory before the system NCCL in `LD_LIBRARY_PATH`.
+SAI site modules or prologs can enable transparent SAI behavior by setting
+`NCCL_SAI_FABRIC_PROFILE` to a recognized product-family name such as
+`ultrapod` or `slimpod`; a nonempty `-<variant>` suffix is also accepted.
+Unknown profile names, unsupported layouts, and non-SAI clusters fall back to
+upstream NCCL behavior unless explicitly opted in with
+`NCCL_SAI_A2A_ENABLE=1`.
+
 ## Introduction
 
 NCCL (pronounced "Nickel") is a stand-alone library of standard communication routines for GPUs, implementing all-reduce, all-gather, reduce, broadcast, reduce-scatter, as well as any send/receive based communication pattern. It has been optimized to achieve high bandwidth on platforms using PCIe, NVLink, NVswitch, as well as networking using InfiniBand Verbs or TCP/IP sockets. NCCL supports an arbitrary number of GPUs installed in a single node or across multiple nodes, and can be used in either single- or multi-process (e.g., MPI) applications.
