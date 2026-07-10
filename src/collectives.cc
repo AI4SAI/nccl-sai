@@ -11,12 +11,11 @@
 #include "nccl.h"
 #include "nvtx_payload_schemas.h"
 #include "param.h"
+#include "sai_profile.h"
 
 #include <limits.h>
 #include <stdio.h>
 #include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
 
 NCCL_PARAM(SaiA2aEnable, "SAI_A2A_ENABLE", -1);
 NCCL_PARAM(SaiA2aLaneEnable, "SAI_A2A_LANE_ENABLE", 1);
@@ -130,24 +129,11 @@ static bool saiA2aAddSize(size_t a, size_t b, size_t* result) {
   return true;
 }
 
-static bool saiA2aProfileDisabledValue(const char* value) {
-  if (value == nullptr || value[0] == '\0') return true;
-  return strcmp(value, "0") == 0 || strcmp(value, "false") == 0 || strcmp(value, "FALSE") == 0 ||
-      strcmp(value, "off") == 0 || strcmp(value, "OFF") == 0 ||
-      strcmp(value, "none") == 0 || strcmp(value, "NONE") == 0 ||
-      strcmp(value, "native") == 0 || strcmp(value, "NATIVE") == 0 ||
-      strcmp(value, "upstream") == 0 || strcmp(value, "UPSTREAM") == 0;
-}
-
-static bool saiA2aFabricProfileEnabled() {
-  return !saiA2aProfileDisabledValue(getenv("NCCL_SAI_FABRIC_PROFILE"));
-}
-
 static bool saiA2aFabricEnabled(const char** reasonOut) {
   int64_t enabled = ncclParamSaiA2aEnable();
   if (enabled == 0) { saiA2aSetReason(reasonOut, "sai_a2a_disabled"); return false; }
   if (enabled > 0) { saiA2aSetReason(reasonOut, "sai_a2a_explicit"); return true; }
-  if (saiA2aFabricProfileEnabled()) {
+  if (ncclSaiFabricProfileEnabled()) {
     saiA2aSetReason(reasonOut, "sai_fabric_profile");
     return true;
   }

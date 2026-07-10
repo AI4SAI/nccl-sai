@@ -12,6 +12,7 @@
 #include "channel.h"
 #include "transport.h"
 #include "device.h"
+#include "sai_profile.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -283,19 +284,6 @@ static void ncclSaiUnionParent(int* parent, int a, int b) {
   int pa = ncclSaiFindParent(parent, a);
   int pb = ncclSaiFindParent(parent, b);
   if (pa != pb) parent[pb] = pa;
-}
-
-static bool ncclSaiProfileDisabledValue(const char* value) {
-  if (value == NULL || value[0] == '\0') return true;
-  return strcmp(value, "0") == 0 || strcmp(value, "false") == 0 || strcmp(value, "FALSE") == 0 ||
-      strcmp(value, "off") == 0 || strcmp(value, "OFF") == 0 ||
-      strcmp(value, "none") == 0 || strcmp(value, "NONE") == 0 ||
-      strcmp(value, "native") == 0 || strcmp(value, "NATIVE") == 0 ||
-      strcmp(value, "upstream") == 0 || strcmp(value, "UPSTREAM") == 0;
-}
-
-static bool ncclSaiFabricProfileEnabled() {
-  return !ncclSaiProfileDisabledValue(getenv("NCCL_SAI_FABRIC_PROFILE"));
 }
 
 static bool ncclSaiLocalP2pSysEnabled() {

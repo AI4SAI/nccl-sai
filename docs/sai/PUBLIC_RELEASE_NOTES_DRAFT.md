@@ -25,8 +25,10 @@ SAI sites can enable default NCCL-SAI behavior by setting:
 export NCCL_SAI_FABRIC_PROFILE=ultrapod
 ```
 
-or another site-selected public profile name. Disabled profile values are `0`,
-`false`, `off`, `none`, `native`, and `upstream`.
+The recognized public families are `ultrapod` and `slimpod`; a nonempty
+`-<variant>` suffix is accepted for site packaging. Empty, unknown, or
+disabled-style values such as `0`, `false`, `off`, `none`, `native`, and
+`upstream` fail closed to upstream behavior.
 
 Explicit overrides:
 
@@ -58,7 +60,7 @@ Minimum public gates:
 - single-node, same-domain, cross-domain, and multi-domain alltoall;
 - KB, MB, and GB message-size coverage;
 - allreduce, reduce-scatter, allgather, broadcast, and P2P non-regression;
-- fallback behavior when `NCCL_SAI_FABRIC_PROFILE` is unset or disabled.
+- fallback behavior when `NCCL_SAI_FABRIC_PROFILE` is unset or unrecognized.
 
 ## Not Claimed
 

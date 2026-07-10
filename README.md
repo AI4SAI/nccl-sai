@@ -20,9 +20,11 @@ copyright and license notices are retained; see `LICENSE.txt` and
 For SAI users, the intended runtime mode is drop-in replacement: put the
 NCCL-SAI build's `lib/` directory before the system NCCL in `LD_LIBRARY_PATH`.
 SAI site modules or prologs can enable transparent SAI behavior by setting
-`NCCL_SAI_FABRIC_PROFILE` to a non-disabled profile name such as `ultrapod` or
-`slimpod`. Unsupported layouts and non-SAI clusters fall back to upstream NCCL
-behavior unless explicitly opted in with `NCCL_SAI_A2A_ENABLE=1`.
+`NCCL_SAI_FABRIC_PROFILE` to a recognized product-family name such as
+`ultrapod` or `slimpod`; a nonempty `-<variant>` suffix is also accepted.
+Unknown profile names, unsupported layouts, and non-SAI clusters fall back to
+upstream NCCL behavior unless explicitly opted in with
+`NCCL_SAI_A2A_ENABLE=1`.
 
 ## Introduction
 

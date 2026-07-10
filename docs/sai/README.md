@@ -21,11 +21,12 @@ partition, or filesystem path. NCCL-SAI uses generic opt-in controls:
 - `NCCL_SAI_A2A_ENABLE=0` explicitly disables the alltoall SAI path.
 - When `NCCL_SAI_A2A_ENABLE` is unset, the alltoall SAI path follows
   `NCCL_SAI_FABRIC_PROFILE`.
-- `NCCL_SAI_FABRIC_PROFILE=<name>` enables default SAI behavior for a site
-  profile. Recommended public names are product-family names such as
-  `ultrapod` or `slimpod`.
-- Disabled profile values are `0`, `false`, `off`, `none`, `native`, and
-  `upstream`.
+- `NCCL_SAI_FABRIC_PROFILE=<family>[-<variant>]` enables default SAI behavior
+  only for recognized product families. The current public families are
+  `ultrapod` and `slimpod`; matching is case-insensitive and the optional
+  variant suffix must be nonempty.
+- Empty, unknown, or disabled-style values such as `0`, `false`, `off`,
+  `none`, `native`, and `upstream` fail closed to upstream behavior.
 - `NCCL_SAI_LOCAL_P2P_SYS_ENABLE=1` explicitly enables the local PCIe
   path-relaxation guard used for selected single-node layouts.
 - `NCCL_SAI_LOCAL_P2P_SYS_ENABLE=0` disables that local path-relaxation guard.
@@ -36,8 +37,8 @@ partition, or filesystem path. NCCL-SAI uses generic opt-in controls:
 
 Site-specific modulefiles, prologs, or container entrypoints may set these
 variables privately. Public code and docs should only describe the generic
-profile mechanism. When both the explicit enable variables and
-`NCCL_SAI_FABRIC_PROFILE` are unset or disabled, NCCL-SAI falls back to
+profile mechanism. When both explicit enable variables are unset and
+`NCCL_SAI_FABRIC_PROFILE` is unset or unrecognized, NCCL-SAI falls back to
 upstream NCCL behavior.
 
 ## Current Tunables
@@ -100,7 +101,7 @@ candidate, validate at least:
 - multi-domain alltoall at sustained runtime, not only a short smoke test;
 - allreduce, reduce-scatter, allgather, broadcast, and common P2P paths for
   correctness and non-regression;
-- fallback behavior when `NCCL_SAI_FABRIC_PROFILE` is unset or disabled.
+- fallback behavior when `NCCL_SAI_FABRIC_PROFILE` is unset or unrecognized.
 
 See `docs/sai/BUILD_AND_PACKAGING.md` for the public binary-package build
 matrix, including CUDA architecture coverage and portable x86-64-v3/v4 host ISA
@@ -129,6 +130,9 @@ Run the full model before publishing source changes that touch these paths:
 ```bash
 python3 tools/sai/verify_a2a_algorithms.py --full-scale
 ```
+
+The CI workflow also compiles and runs
+`tools/sai/test_profile_activation.cc` to keep profile recognition fail-closed.
 
 ## Supported Fabric Families
 
