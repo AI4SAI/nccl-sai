@@ -240,6 +240,10 @@ struct ncclTaskP2p {
   ncclDataType_t datatype;
   int root;
   size_t bytes;
+  // Non-zero only for P2P tasks expanded from one planned ncclAlltoAll call.
+  uint64_t saiA2aSeq;
+  uint64_t saiA2aOrdinaryOrdinal;
+  int saiA2aChannelRound;
 
   // Profiler plugin
   int eActivationMask;
@@ -247,6 +251,22 @@ struct ncclTaskP2p {
   void* p2pApiEventHandle;
   void* eventHandle;
   uint8_t nChannels;
+};
+
+struct ncclSaiA2aPlanRound {
+  struct ncclTaskP2p* send;
+  struct ncclTaskP2p* recv;
+  int channelRound;
+};
+
+struct ncclSaiA2aPlanOp {
+  struct ncclSaiA2aPlanOp* next;
+  uint64_t seq;
+  uint64_t ordinaryCutoff;
+  int roundWindow;
+  int nRounds;
+  int nextRound;
+  struct ncclSaiA2aPlanRound* rounds;
 };
 
 struct ncclKernelPlan {
@@ -379,6 +399,8 @@ struct ncclKernelPlanner {
   struct Peer* peers/*[nRanks]*/;
   int nTasksColl, nTasksP2p;
   int nTasksP2pSend, nTasksP2pRecv;
+  uint64_t saiA2aNextOrdinaryOrdinal;
+  struct ncclIntruQueue<struct ncclSaiA2aPlanOp, &ncclSaiA2aPlanOp::next> saiA2aOpQueue;
   bool persistent;
   // The list of user streams aggregated over all tasks present.
   struct ncclCudaStreamList* streams;
@@ -437,6 +459,16 @@ typedef enum ncclGroupTaskType {
 } ncclGroupTaskType_t;
 
 struct ncclCommSymTeams;
+
+struct ncclSaiA2aState {
+  struct ncclSaiA2aConfig config;
+  bool configConsistent;
+  bool fabricMetadataValid;
+  bool fabricGroupsComplete;
+  int nFabricGroups;
+  int* nodeToFabricGroup;
+  uint64_t nextSeq;
+};
 
 struct ncclComm {
   uint64_t startMagic;
@@ -615,6 +647,9 @@ struct ncclComm {
   struct P2pSchedulePair { int sendRank; int recvRank; } *p2pSchedule;
 
   struct ncclKernelPlanner planner;
+
+  // Rank-consistent SAI AlltoAll planner configuration and sequence state.
+  struct ncclSaiA2aState saiA2a;
 
   cudaMemPool_t memPool;
   // Queue of events and associated callbacks for cleaning up asynchronous work.

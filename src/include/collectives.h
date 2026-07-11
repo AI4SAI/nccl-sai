@@ -39,6 +39,36 @@ const char* ncclDatatypeToString(ncclDataType_t type);
 const char* ncclAlgoToString(int algo);
 const char* ncclProtoToString(int proto);
 
+struct ncclComm;
+enum ncclSaiA2aConfigField {
+  ncclSaiA2aConfigVersion = 0,
+  ncclSaiA2aConfigEnabled,
+  ncclSaiA2aConfigPlannerEnable,
+  ncclSaiA2aConfigPlannerRounds,
+  ncclSaiA2aConfigGroupNodes,
+  ncclSaiA2aConfigMultigroupEnable,
+  ncclSaiA2aConfigMinPeerBytes,
+  ncclSaiA2aConfigMinRanks,
+  ncclSaiA2aConfigP2pFabricSchedule,
+  ncclSaiA2aConfigP2pFabricNodes,
+  ncclSaiA2aConfigProfileMinNchannels,
+  ncclSaiA2aConfigFieldCount,
+};
+struct ncclSaiA2aConfig {
+  int64_t field[ncclSaiA2aConfigFieldCount];
+};
+enum ncclSaiFabricGroupIdState {
+  ncclSaiFabricGroupIdAbsent = 0,
+  ncclSaiFabricGroupIdValid = 1,
+  ncclSaiFabricGroupIdInvalid = 2,
+};
+struct ncclSaiFabricGroupInfo {
+  uint64_t id;
+  int state;
+};
+void ncclSaiA2aGetConfig(struct ncclComm* comm, struct ncclSaiA2aConfig* config);
+void ncclSaiA2aGetFabricGroupInfo(struct ncclSaiFabricGroupInfo* info);
+
 inline int ncclTypeSize(ncclDataType_t type) {
   switch (type) {
   case ncclInt8:

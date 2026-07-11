@@ -302,8 +302,9 @@ ncclResult_t ncclTopoSaiLocalP2pSysEligible(struct ncclComm* comm, struct ncclTo
   if (rank1 < 0 || rank1 >= comm->nRanks || rank2 < 0 || rank2 >= comm->nRanks) return ncclSuccess;
 
   uint64_t hostHash = comm->peerInfo[rank1].hostHash;
+  dev_t shmDev = comm->peerInfo[rank1].shmDev;
   for (int r = 0; r < comm->nRanks; r++) {
-    if (comm->peerInfo[r].hostHash != hostHash) return ncclSuccess;
+    if (comm->peerInfo[r].hostHash != hostHash || comm->peerInfo[r].shmDev != shmDev) return ncclSuccess;
   }
 
   int gpuIndex[8];
@@ -375,11 +376,7 @@ ncclResult_t ncclTopoCheckP2p(struct ncclComm* comm, struct ncclTopoSystem* syst
       } else {
         return ncclSuccess;
       }
-    } else if (info1->shmDev != info2->shmDev) {
-      int saiLocalP2pSys = 0;
-      NCCLCHECK(ncclTopoSaiLocalP2pSysEligible(comm, system, rank1, rank2, &saiLocalP2pSys));
-      if (!saiLocalP2pSys) return ncclSuccess;
-    }
+    } else if (info1->shmDev != info2->shmDev) return ncclSuccess;
   }
 
   // Get GPUs from topology

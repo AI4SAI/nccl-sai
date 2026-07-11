@@ -17,10 +17,12 @@
 #include "ce_coll.h"
 #include "nvtx.h"
 #include "scheduler.h"
+#include "sai_profile.h"
 
 #include <cstring> // std::memcpy
 #include <cinttypes> // PRIx64
 #include <cassert>
+#include <cstdio>
 
 NCCL_PARAM(L1SharedMemoryCarveout, "L1_SHARED_MEMORY_CARVEOUT", 0);
 
@@ -778,6 +780,7 @@ static ncclResult_t scheduleCollTasksToPlan(
 
 NCCL_PARAM(P2pLLThreshold, "P2P_LL_THRESHOLD", 16384);
 NCCL_PARAM(ChunkSize, "CHUNK_SIZE", 0);
+NCCL_PARAM(SaiA2aPlanTrace, "SAI_A2A_PLAN_TRACE", 0);
 
 // Put p2p op in plan assuming there is sizeof(ncclDevWorkBatch) in batch budget
 // and sizeof(ncclDevWorkP2p) in work budget. "sendRank" and "recvRank" must
@@ -1036,11 +1039,129 @@ static int calcP2pChannelCount(size_t totalSize, int minChannels, int maxChannel
   return nChannels;
 }
 
+static bool ncclSaiA2aOrdinaryTaskAllowed(
+    struct ncclTaskP2p* task, uint64_t ordinaryCutoff) {
+  return task != nullptr && task->saiA2aSeq == 0 &&
+      task->saiA2aOrdinaryOrdinal <= ordinaryCutoff;
+}
+
+static ncclResult_t scheduleSaiA2aOpToPlan(struct ncclComm* comm,
+    struct ncclKernelPlan* plan, struct ncclKernelPlanBudget* budget,
+    int nChannelsMin, int nChannelsMax) {
+  struct ncclKernelPlanner* planner = &comm->planner;
+  struct ncclKernelPlanner::Peer* peers = planner->peers;
+  struct ncclSaiA2aPlanOp* op = ncclIntruQueueHead(&planner->saiA2aOpQueue);
+  if (op == nullptr || op->nextRound < 0 || op->nextRound >= op->nRounds) {
+    WARN("NCCL-SAI AlltoAll planner state is invalid");
+    return ncclInternalError;
+  }
+
+  int roundBegin = op->nextRound;
+  int roundEnd = op->roundWindow > 0 ?
+      std::min(op->nRounds, roundBegin + op->roundWindow) : op->nRounds;
+
+  int planTotalTasks[2] = {0, 0};
+  for (int i = roundBegin; i < roundEnd; i++) {
+    planTotalTasks[0] += op->rounds[i].recv != nullptr ? 1 : 0;
+    planTotalTasks[1] += op->rounds[i].send != nullptr ? 1 : 0;
+  }
+
+  if (ncclParamSaiA2aPlanTrace() != 0 && comm->rank == 0) {
+    fprintf(stderr,
+      "SAI_A2A_PLAN_TRACE path=phased_phase seq=%" PRIu64 " roundBegin=%d roundEnd=%d\n",
+      op->seq, roundBegin, roundEnd);
+  }
+
+  for (int i = roundBegin; i < roundEnd; i++) {
+    struct ncclSaiA2aPlanRound* opRound = &op->rounds[i];
+    int channelRound = opRound->channelRound;
+    if (channelRound < 0 || channelRound >= comm->nRanks) {
+      WARN("NCCL-SAI AlltoAll channel round is invalid");
+      return ncclInternalError;
+    }
+    int sendRank = comm->p2pSchedule[channelRound].sendRank;
+    int recvRank = comm->p2pSchedule[channelRound].recvRank;
+    struct ncclTaskP2p* send = opRound->send;
+    struct ncclTaskP2p* recv = opRound->recv;
+    if ((send != nullptr && (send->saiA2aSeq != op->seq || send->root != sendRank ||
+          ncclIntruQueueHead(&peers[sendRank].sendQueue) != send)) ||
+        (recv != nullptr && (recv->saiA2aSeq != op->seq || recv->root != recvRank ||
+          ncclIntruQueueHead(&peers[recvRank].recvQueue) != recv))) {
+      WARN("NCCL-SAI AlltoAll sequence %lu is incomplete at planned round %d",
+        (unsigned long)op->seq, i);
+      return ncclInvalidUsage;
+    }
+    if (send == nullptr && recv == nullptr) {
+      WARN("NCCL-SAI AlltoAll planned round is empty");
+      return ncclInternalError;
+    }
+
+    bool selfCopy = sendRank == comm->rank;
+    if (selfCopy && (send == nullptr || recv == nullptr)) {
+      WARN("NCCL-SAI AlltoAll self round is incomplete");
+      return ncclInvalidUsage;
+    }
+    if (selfCopy && send->buff == recv->buff) {
+      ncclIntruQueueDequeue(&peers[sendRank].sendQueue);
+      ncclIntruQueueDequeue(&peers[recvRank].recvQueue);
+      ncclMemoryPoolFree(&comm->memPool_ncclTaskP2p, send);
+      ncclMemoryPoolFree(&comm->memPool_ncclTaskP2p, recv);
+      planner->nTasksP2p -= 2;
+      planner->nTasksP2pSend -= 1;
+      planner->nTasksP2pRecv -= 1;
+    } else {
+      if (!testBudget(budget, plan->nWorkBatches+nChannelsMax,
+          plan->workBytes + sizeof(struct ncclDevWorkP2p))) {
+        if (i == roundBegin && plan->workBytes == 0) {
+          WARN("NCCL-SAI AlltoAll phase does not fit an empty kernel plan");
+          return ncclInternalError;
+        }
+        op->nextRound = i;
+        return ncclSuccess;
+      }
+      ssize_t sendBytes = send != nullptr ? send->bytes : -1;
+      ssize_t recvBytes = recv != nullptr ? recv->bytes : -1;
+      void* sendBuff = send != nullptr ? send->buff : nullptr;
+      void* recvBuff = recv != nullptr ? recv->buff : nullptr;
+      struct ncclTaskP2p* p2pTasks[2] = {recv, send};
+      NCCLCHECK(addP2pToPlan(comm, plan, nChannelsMin, nChannelsMax, channelRound,
+        sendRank, sendBuff, sendBytes, recvRank, recvBuff, recvBytes,
+        planTotalTasks, p2pTasks));
+      if (send != nullptr) {
+        ncclIntruQueueDequeue(&peers[sendRank].sendQueue);
+        plan->groupApiEventHandle = send->groupApiEventHandle;
+        ncclIntruQueueEnqueue(&plan->p2pTaskQueue, send);
+        planner->nTasksP2p -= 1;
+        planner->nTasksP2pSend -= 1;
+      }
+      if (recv != nullptr) {
+        ncclIntruQueueDequeue(&peers[recvRank].recvQueue);
+        if (send == nullptr) plan->groupApiEventHandle = recv->groupApiEventHandle;
+        ncclIntruQueueEnqueue(&plan->p2pTaskQueue, recv);
+        planner->nTasksP2p -= 1;
+        planner->nTasksP2pRecv -= 1;
+      }
+    }
+    op->nextRound = i + 1;
+  }
+
+  if (op->nextRound == op->nRounds) {
+    (void)ncclIntruQueueDequeue(&planner->saiA2aOpQueue);
+  }
+  return ncclSuccess;
+}
+
 static ncclResult_t scheduleP2pTasksToPlan(
     struct ncclComm* comm, struct ncclKernelPlan* plan, struct ncclKernelPlanBudget* budget
   ) {
   int nRanks = comm->nRanks;
-  struct ncclKernelPlanner::Peer* peers = comm->planner.peers;
+  struct ncclKernelPlanner* planner = &comm->planner;
+  struct ncclKernelPlanner::Peer* peers = planner->peers;
+  struct ncclSaiA2aPlanOp* saiOp = ncclIntruQueueHead(&planner->saiA2aOpQueue);
+  uint64_t ordinaryCutoff = saiOp != nullptr ? saiOp->ordinaryCutoff : UINT64_MAX;
+
+  // Keep a planned AlltoAll out of a plan that already contains collective work.
+  if (saiOp != nullptr && plan->workBytes != 0) return ncclSuccess;
 
   plan->threadPerBlock = std::max(plan->threadPerBlock, NCCL_MAX_NTHREADS);
   if (!plan->kernelSpecialized) {
@@ -1048,21 +1169,20 @@ static ncclResult_t scheduleP2pTasksToPlan(
     plan->kernelSpecialized = ncclDevKernelForFuncIsSpecialized[ncclDevFuncId_P2p()];
   }
 
-  // Compute how much to split operations
-  // Try to use all channels
   int nChannelsMax = comm->p2pnChannelsPerPeer;
   int nChannelsMin = nChannelsMax;
-  // Try to use all channels, but one channel per operation.
   while (nChannelsMin*nRanks > comm->p2pnChannels && nChannelsMin > 1) nChannelsMin /= 2;
 
-  // Save the total count of send/recv tasks in the plan
-  int planTotalTasks[2] = {comm->planner.nTasksP2pRecv, comm->planner.nTasksP2pSend};
-  while (comm->planner.nTasksP2p != 0) {
+  int planTotalTasks[2] = {planner->nTasksP2pRecv, planner->nTasksP2pSend};
+  while (planner->nTasksP2p != 0) {
+    bool progressed = false;
     for (int round=0; round < nRanks; round++) {
       int sendRank = comm->p2pSchedule[round].sendRank;
       int recvRank = comm->p2pSchedule[round].recvRank;
-      struct ncclTaskP2p* send = ncclIntruQueueHead(&peers[sendRank].sendQueue);
-      struct ncclTaskP2p* recv = ncclIntruQueueHead(&peers[recvRank].recvQueue);
+      struct ncclTaskP2p* sendHead = ncclIntruQueueHead(&peers[sendRank].sendQueue);
+      struct ncclTaskP2p* recvHead = ncclIntruQueueHead(&peers[recvRank].recvQueue);
+      struct ncclTaskP2p* send = ncclSaiA2aOrdinaryTaskAllowed(sendHead, ordinaryCutoff) ? sendHead : nullptr;
+      struct ncclTaskP2p* recv = ncclSaiA2aOrdinaryTaskAllowed(recvHead, ordinaryCutoff) ? recvHead : nullptr;
       if (send == nullptr && recv == nullptr) continue;
 
       if (sendRank == comm->rank) {
@@ -1081,39 +1201,43 @@ static ncclResult_t scheduleP2pTasksToPlan(
       void* recvBuff = recv ? recv->buff : nullptr;
 
       if (sendRank == comm->rank && send->buff == recv->buff) {
-        // Skip send to self in-place (we don't need to support this).
         ncclIntruQueueDequeue(&peers[sendRank].sendQueue);
         ncclIntruQueueDequeue(&peers[recvRank].recvQueue);
         ncclMemoryPoolFree(&comm->memPool_ncclTaskP2p, send);
         ncclMemoryPoolFree(&comm->memPool_ncclTaskP2p, recv);
-        comm->planner.nTasksP2p -= 2;
-        comm->planner.nTasksP2pSend -= 1;
-        comm->planner.nTasksP2pRecv -= 1;
+        planner->nTasksP2p -= 2;
+        planner->nTasksP2pSend -= 1;
+        planner->nTasksP2pRecv -= 1;
       } else {
-        // Ensure room for worst case of one new batch per channel.
-        if (!testBudget(budget, plan->nWorkBatches+nChannelsMax, plan->workBytes + sizeof(struct ncclDevWorkP2p))) {
-          return ncclSuccess;
-        }
+        if (!testBudget(budget, plan->nWorkBatches+nChannelsMax,
+            plan->workBytes + sizeof(struct ncclDevWorkP2p))) return ncclSuccess;
         struct ncclTaskP2p* p2pTasks[2] = { recv, send };
-        NCCLCHECK(addP2pToPlan(comm, plan, nChannelsMin, nChannelsMax, round, sendRank, sendBuff, sendBytes, recvRank, recvBuff, recvBytes, planTotalTasks, p2pTasks));
+        NCCLCHECK(addP2pToPlan(comm, plan, nChannelsMin, nChannelsMax, round,
+          sendRank, sendBuff, sendBytes, recvRank, recvBuff, recvBytes, planTotalTasks, p2pTasks));
         if (send != nullptr) {
           ncclIntruQueueDequeue(&peers[sendRank].sendQueue);
-          // Profiler - We can overwrite groupAPI event handles here since all operations here belong to the same group
           plan->groupApiEventHandle = send->groupApiEventHandle;
           ncclIntruQueueEnqueue(&plan->p2pTaskQueue, send);
-          comm->planner.nTasksP2p -= 1;
-          comm->planner.nTasksP2pSend -= 1;
+          planner->nTasksP2p -= 1;
+          planner->nTasksP2pSend -= 1;
         }
         if (recv != nullptr) {
           ncclIntruQueueDequeue(&peers[recvRank].recvQueue);
-          // Profiler - We can overwrite groupAPI event handles here since all operations here belong to the same group
           plan->groupApiEventHandle = recv->groupApiEventHandle;
           ncclIntruQueueEnqueue(&plan->p2pTaskQueue, recv);
-          comm->planner.nTasksP2p -= 1;
-          comm->planner.nTasksP2pRecv -= 1;
+          planner->nTasksP2p -= 1;
+          planner->nTasksP2pRecv -= 1;
         }
       }
+      progressed = true;
     }
+
+    if (saiOp != nullptr) {
+      if (progressed || plan->workBytes != 0) return ncclSuccess;
+      return scheduleSaiA2aOpToPlan(
+          comm, plan, budget, nChannelsMin, nChannelsMax);
+    }
+    if (!progressed) return ncclInternalError;
   }
   return ncclSuccess;
 }
@@ -1475,8 +1599,10 @@ ncclResult_t ncclLaunchPrepare(struct ncclComm* comm) {
           }
         }
 
-        finishPlan(comm, plan);
-        if (plan->workBytes != 0) {
+        if (plan->workBytes == 0) {
+          ncclMemoryPoolFree(&comm->memPool_ncclKernelPlan, plan);
+        } else {
+          finishPlan(comm, plan);
           ncclIntruQueueEnqueue(&planner->planQueue, plan);
           nPlans += 1;
         }
@@ -2374,7 +2500,11 @@ static ncclResult_t p2pTaskAppend(
     void* buff,
     size_t count,
     ncclDataType_t datatype,
-    int peer) {
+    int peer,
+    uint64_t saiA2aSeq,
+    uint64_t saiA2aOrdinaryOrdinal,
+    int saiA2aChannelRound,
+    struct ncclTaskP2p** taskOut) {
   struct ncclKernelPlanner *planner = &comm->planner;
 
   // Determine peer and basic parameters.
@@ -2400,6 +2530,9 @@ static ncclResult_t p2pTaskAppend(
   p2p->datatype = datatype;
   p2p->root = peer;
   p2p->bytes = nBytes;
+  p2p->saiA2aSeq = saiA2aSeq;
+  p2p->saiA2aOrdinaryOrdinal = saiA2aOrdinaryOrdinal;
+  p2p->saiA2aChannelRound = saiA2aChannelRound;
   p2p->eActivationMask = ncclProfilerApiState.eActivationMask;
   p2p->groupApiEventHandle = ncclProfilerApiState.groupApiEventHandle;
   p2p->p2pApiEventHandle = ncclProfilerApiState.p2pApiEventHandle;
@@ -2417,10 +2550,16 @@ static ncclResult_t p2pTaskAppend(
     if (!(isSendNotRecv ? planner->peers[peer].sendSeen : planner->peers[peer].recvSeen)) {
       // planner->peers[peer].send/recvSeen is private to each comm, so we need to set it anyway.
       (isSendNotRecv ? planner->peers[peer].sendSeen : planner->peers[peer].recvSeen) = true;
-      int round = 0;
-      while (peer != (isSendNotRecv ? comm->p2pSchedule[round].sendRank
-                                    : comm->p2pSchedule[round].recvRank)) {
-        round += 1;
+      int round = saiA2aChannelRound;
+      if (round < 0) {
+        round = 0;
+        while (peer != (isSendNotRecv ? comm->p2pSchedule[round].sendRank
+                                      : comm->p2pSchedule[round].recvRank)) round += 1;
+      } else if (round >= comm->nRanks ||
+          peer != (isSendNotRecv ? comm->p2pSchedule[round].sendRank
+                                 : comm->p2pSchedule[round].recvRank)) {
+        WARN("NCCL-SAI AlltoAll channel round does not match peer");
+        return ncclInternalError;
       }
       uint8_t base = ncclP2pChannelBaseForRound(comm, round);
       for (int c=0; c < comm->p2pnChannelsPerPeer; c++) {
@@ -2446,6 +2585,7 @@ static ncclResult_t p2pTaskAppend(
       }
     }
   }
+  if (taskOut != nullptr) *taskOut = p2p;
   ncclProfilerStopP2pApiEvent();
   return ncclSuccess;
 }
@@ -2542,6 +2682,99 @@ static ncclResult_t ceCollTaskAppend(
   return ncclSuccess;
 }
 
+static bool ncclSaiA2aPlannerEligible(struct ncclComm* comm, struct ncclInfo* info,
+    size_t* peerBytesOut, const char** reasonOut) {
+  const struct ncclSaiA2aConfig* config = &comm->saiA2a.config;
+  const char* reason = "eligible";
+  size_t peerBytes = 0;
+  int typeSize = ncclTypeSize(info->datatype);
+  bool validSize = typeSize > 0 &&
+      (info->count == 0 || (size_t)typeSize <= SIZE_MAX / info->count);
+  if (validSize) peerBytes = info->count * (size_t)typeSize;
+  if (!comm->saiA2a.configConsistent || config->field[ncclSaiA2aConfigEnabled] == 0) {
+    reason = "profile_disabled";
+  } else if (config->field[ncclSaiA2aConfigPlannerEnable] == 0) {
+    reason = "planner_disabled";
+  } else if (!validSize) {
+    reason = "invalid_size";
+  } else if (info->sendbuff == info->recvbuff) {
+    reason = "aliased_buffers";
+  } else {
+    int64_t groupNodes = config->field[ncclSaiA2aConfigGroupNodes];
+    int64_t configuredRounds = config->field[ncclSaiA2aConfigPlannerRounds];
+    if (comm->nRanks < config->field[ncclSaiA2aConfigMinRanks]) {
+      reason = "too_few_ranks";
+    } else if (groupNodes <= 0 || groupNodes > INT_MAX) {
+      reason = "invalid_fabric_group";
+    } else if (!ncclSaiA2aPlannerGroupsComplete(comm->nNodes, (int)groupNodes)) {
+      reason = "incomplete_fabric_groups";
+    } else if (comm->nNodes != groupNodes && !ncclSaiA2aMultigroupAllowed(
+        config->field[ncclSaiA2aConfigMultigroupEnable], comm->saiA2a.fabricGroupsComplete)) {
+      reason = config->field[ncclSaiA2aConfigMultigroupEnable] == 0 ?
+          "multigroup_disabled" : "fabric_group_metadata_unavailable";
+    } else if (peerBytes < (size_t)config->field[ncclSaiA2aConfigMinPeerBytes]) {
+      reason = "small_peer_bytes";
+    } else if (configuredRounds != -1 && configuredRounds <= 0) {
+      reason = "invalid_round_window";
+    }
+  }
+  if (peerBytesOut != nullptr) *peerBytesOut = peerBytes;
+  if (reasonOut != nullptr) *reasonOut = reason;
+  return strcmp(reason, "eligible") == 0;
+}
+
+static uint64_t ncclSaiA2aNextSeq(struct ncclComm* comm) {
+  uint64_t seq = __atomic_add_fetch(&comm->saiA2a.nextSeq, 1, __ATOMIC_RELAXED);
+  if (seq == 0) seq = __atomic_add_fetch(&comm->saiA2a.nextSeq, 1, __ATOMIC_RELAXED);
+  return seq;
+}
+
+static uint64_t ncclSaiA2aNextOrdinaryOrdinal(struct ncclKernelPlanner* planner) {
+  uint64_t ordinal = ++planner->saiA2aNextOrdinaryOrdinal;
+  if (ordinal == 0) ordinal = ++planner->saiA2aNextOrdinaryOrdinal;
+  return ordinal;
+}
+
+static ncclResult_t ncclSaiA2aAppendPlanOp(struct ncclComm* comm, uint64_t seq,
+    uint64_t ordinaryCutoff, int roundWindow,
+    struct ncclSaiA2aPlanRound* rounds, int nRounds) {
+  if (rounds == nullptr || nRounds <= 0) return ncclInternalError;
+  struct ncclSaiA2aPlanOp* op =
+      ncclMemoryStackAlloc<struct ncclSaiA2aPlanOp>(&comm->memScoped);
+  op->seq = seq;
+  op->ordinaryCutoff = ordinaryCutoff;
+  op->roundWindow = roundWindow;
+  op->nRounds = nRounds;
+  op->nextRound = 0;
+  op->rounds = rounds;
+  ncclIntruQueueEnqueue(&comm->planner.saiA2aOpQueue, op);
+  return ncclSuccess;
+}
+
+static ncclResult_t ncclSaiA2aAppendPhased(struct ncclComm* comm,
+    struct ncclInfo* info, ncclFunc_t collAPI, uint64_t seq, int roundWindow) {
+  struct ncclKernelPlanner* planner = &comm->planner;
+  uint64_t ordinaryCutoff = planner->saiA2aNextOrdinaryOrdinal;
+  ncclGroupCommJoin(comm, ncclGroupTaskTypeCollective);
+  struct ncclSaiA2aPlanRound* rounds =
+      ncclMemoryStackAlloc<struct ncclSaiA2aPlanRound>(&comm->memScoped, comm->nRanks);
+  int typeSize = ncclTypeSize(info->datatype);
+
+  for (int round = 0; round < comm->nRanks; round++) {
+    int sendRank = comm->p2pSchedule[round].sendRank;
+    int recvRank = comm->p2pSchedule[round].recvRank;
+    void* sendBuff = (void*)((char*)info->sendbuff + (size_t)sendRank * info->count * typeSize);
+    void* recvBuff = (void*)((char*)info->recvbuff + (size_t)recvRank * info->count * typeSize);
+    NCCLCHECK(p2pTaskAppend(comm, info, ncclFuncSend, collAPI, sendBuff,
+      info->count, info->datatype, sendRank, seq, 0, round, &rounds[round].send));
+    NCCLCHECK(p2pTaskAppend(comm, info, ncclFuncRecv, collAPI, recvBuff,
+      info->count, info->datatype, recvRank, seq, 0, round, &rounds[round].recv));
+    rounds[round].channelRound = round;
+  }
+  return ncclSaiA2aAppendPlanOp(
+      comm, seq, ordinaryCutoff, roundWindow, rounds, comm->nRanks);
+}
+
 // Converts `info` to a task and adds it to `comm->planner`. The exception is with
 // single rank communicators, collectives are issued as `ncclMemcpyAsync`s and
 // thus don't need a task.
@@ -2549,7 +2782,12 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
   ncclFunc_t collAPI = info->coll;
 
   if (info->coll == ncclFuncSend || info->coll == ncclFuncRecv) {
-    NCCLCHECK(p2pTaskAppend(comm, info, info->coll, collAPI, (void*)info->recvbuff, info->count, info->datatype, info->root));
+    // Join before assigning the ordinal because the first join resets planner state.
+    ncclGroupCommJoin(comm, ncclGroupTaskTypeCollective);
+    uint64_t ordinal = ncclSaiA2aNextOrdinaryOrdinal(&comm->planner);
+    NCCLCHECK(p2pTaskAppend(comm, info, info->coll, collAPI,
+      (void*)info->recvbuff, info->count, info->datatype, info->root,
+      0, ordinal, -1, nullptr));
   } else {
     // Empty collectives can be discarded.
     if (info->count == 0) return ncclSuccess;
@@ -2583,17 +2821,57 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
       // Append kernel-based collective
       else {
         if (info->coll == ncclFuncAlltoAll) {
-          for (int r=0; r<comm->nRanks; r++) {
-            NCCLCHECK(p2pTaskAppend(comm, info, ncclFuncSend, collAPI, (void*)((char*)info->sendbuff+r*info->count*ncclTypeSize(info->datatype)), info->count, info->datatype, r));
-            NCCLCHECK(p2pTaskAppend(comm, info, ncclFuncRecv, collAPI, (void*)((char*)info->recvbuff+r*info->count*ncclTypeSize(info->datatype)), info->count, info->datatype, r));
+          uint64_t apiSeq = ncclSaiA2aNextSeq(comm);
+          size_t peerBytes = 0;
+          const char* plannerReason = "invalid_size";
+          int typeSize = ncclTypeSize(info->datatype);
+          bool plannerEligible =
+              ncclSaiA2aPlannerEligible(comm, info, &peerBytes, &plannerReason);
+          if (ncclParamSaiA2aPlanTrace() != 0 && comm->rank == 0) {
+            int rounds = ncclSaiA2aPlannerRoundWindow(
+                comm->saiA2a.config.field[ncclSaiA2aConfigPlannerRounds], comm->nNodes,
+                (int)comm->saiA2a.config.field[ncclSaiA2aConfigP2pFabricNodes]);
+            fprintf(stderr,
+              "SAI_A2A_PLAN_TRACE path=%s reason=%s seq=%" PRIu64 " nranks=%d nnodes=%d peerBytes=%zu groupNodes=%ld fabricNodes=%ld multigroup=%ld fabricMetadata=%d fabricGroupsComplete=%d fabricGroups=%d configuredRounds=%ld rounds=%d\n",
+              plannerEligible ? "phased" : "native", plannerReason,
+              apiSeq, comm->nRanks, comm->nNodes,
+              peerBytes, (long)comm->saiA2a.config.field[ncclSaiA2aConfigGroupNodes],
+              (long)comm->saiA2a.config.field[ncclSaiA2aConfigP2pFabricNodes],
+              (long)comm->saiA2a.config.field[ncclSaiA2aConfigMultigroupEnable],
+              comm->saiA2a.fabricMetadataValid ? 1 : 0,
+              comm->saiA2a.fabricGroupsComplete ? 1 : 0, comm->saiA2a.nFabricGroups,
+              (long)comm->saiA2a.config.field[ncclSaiA2aConfigPlannerRounds], rounds);
+          }
+          if (plannerEligible) {
+            int roundWindow = ncclSaiA2aPlannerRoundWindow(
+                comm->saiA2a.config.field[ncclSaiA2aConfigPlannerRounds], comm->nNodes,
+                (int)comm->saiA2a.config.field[ncclSaiA2aConfigP2pFabricNodes]);
+            NCCLCHECK(ncclSaiA2aAppendPhased(
+              comm, info, collAPI, apiSeq, roundWindow));
+          } else {
+            for (int r=0; r<comm->nRanks; r++) {
+              uint64_t sendOrdinal = ncclSaiA2aNextOrdinaryOrdinal(&comm->planner);
+              NCCLCHECK(p2pTaskAppend(comm, info, ncclFuncSend, collAPI,
+                (void*)((char*)info->sendbuff+r*info->count*typeSize),
+                info->count, info->datatype, r, 0, sendOrdinal, -1, nullptr));
+              uint64_t recvOrdinal = ncclSaiA2aNextOrdinaryOrdinal(&comm->planner);
+              NCCLCHECK(p2pTaskAppend(comm, info, ncclFuncRecv, collAPI,
+                (void*)((char*)info->recvbuff+r*info->count*typeSize),
+                info->count, info->datatype, r, 0, recvOrdinal, -1, nullptr));
+            }
           }
         } else if (info->coll == ncclFuncGather){
           size_t offset = 0;
-          NCCLCHECK(p2pTaskAppend(comm, info, ncclFuncSend, collAPI, (void*)info->sendbuff, info->count, info->datatype, info->root));
+          uint64_t ordinal = ncclSaiA2aNextOrdinaryOrdinal(&comm->planner);
+          NCCLCHECK(p2pTaskAppend(comm, info, ncclFuncSend, collAPI,
+            (void*)info->sendbuff, info->count, info->datatype, info->root,
+            0, ordinal, -1, nullptr));
           if (comm->rank == info->root) {
             for (int r=0; r<comm->nRanks; r++) {
               void* buff = (void*)((char*)info->recvbuff + offset);
-              NCCLCHECK(p2pTaskAppend(comm, info, ncclFuncRecv, collAPI, buff, info->count, info->datatype, r));
+              ordinal = ncclSaiA2aNextOrdinaryOrdinal(&comm->planner);
+              NCCLCHECK(p2pTaskAppend(comm, info, ncclFuncRecv, collAPI,
+                buff, info->count, info->datatype, r, 0, ordinal, -1, nullptr));
               offset += info->count * ncclTypeSize(info->datatype);
             }
           }
@@ -2602,11 +2880,16 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
           if (comm->rank == info->root) {
             for (int r = 0; r < comm->nRanks; r++) {
               void* buff = (void*)((char*)info->sendbuff + offset);
-              NCCLCHECK(p2pTaskAppend(comm, info, ncclFuncSend, collAPI, buff, info->count, info->datatype, r));
+              uint64_t ordinal = ncclSaiA2aNextOrdinaryOrdinal(&comm->planner);
+              NCCLCHECK(p2pTaskAppend(comm, info, ncclFuncSend, collAPI,
+                buff, info->count, info->datatype, r, 0, ordinal, -1, nullptr));
               offset += info->count * ncclTypeSize(info->datatype);
             }
           }
-          NCCLCHECK(p2pTaskAppend(comm, info, ncclFuncRecv, collAPI, (void*)info->recvbuff, info->count, info->datatype, info->root));
+          uint64_t ordinal = ncclSaiA2aNextOrdinaryOrdinal(&comm->planner);
+          NCCLCHECK(p2pTaskAppend(comm, info, ncclFuncRecv, collAPI,
+            (void*)info->recvbuff, info->count, info->datatype, info->root,
+            0, ordinal, -1, nullptr));
         } else {
           NCCLCHECK(collTaskAppend(comm, info, opDev));
         }

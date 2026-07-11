@@ -325,10 +325,22 @@ NCCL_PARAM(MaxNrings, "MAX_NRINGS", -2);
 NCCL_PARAM(MinNchannels, "MIN_NCHANNELS", -2);
 NCCL_PARAM(MaxNchannels, "MAX_NCHANNELS", -2);
 
-int ncclMinNchannels() {
+int ncclMaxNchannels();
+
+int ncclMinNchannels(struct ncclComm* comm) {
   int minNchannels = 0;
-  if (ncclParamMinNrings() != -2) minNchannels = ncclParamMinNrings();
-  if (ncclParamMinNchannels() != -2) minNchannels = ncclParamMinNchannels();
+  bool explicitMin = false;
+  if (ncclParamMinNrings() != -2) {
+    minNchannels = ncclParamMinNrings();
+    explicitMin = true;
+  }
+  if (ncclParamMinNchannels() != -2) {
+    minNchannels = ncclParamMinNchannels();
+    explicitMin = true;
+  }
+  if (!explicitMin && comm != nullptr && comm->saiA2a.configConsistent) {
+    minNchannels = (int)comm->saiA2a.config.field[ncclSaiA2aConfigProfileMinNchannels];
+  }
   if (minNchannels > MAXCHANNELS) {
     INFO(NCCL_GRAPH|NCCL_ENV, "User asked for a minimum of %d channels, limiting to %d", minNchannels, MAXCHANNELS);
     minNchannels = MAXCHANNELS;
@@ -485,10 +497,10 @@ ncclResult_t ncclTopoPostset(struct ncclComm* comm, int* firstRanks, int* treePa
   if (comm->sharedRes->owner != comm) {
     /* child comm #channels cannot exceed top parent #channels. */
     nChannels = comm->nChannels = std::min(std::min(std::min(ncclMaxNchannels(), nChannels), comm->config.maxCTAs), comm->sharedRes->tpNChannels);
-    nChannels = comm->nChannels = copyChannels(comm, nChannels, std::min(std::max(ncclMinNchannels(), comm->config.minCTAs), comm->sharedRes->tpNChannels), ringPrev, ringNext);
+    nChannels = comm->nChannels = copyChannels(comm, nChannels, std::min(std::max(ncclMinNchannels(comm), comm->config.minCTAs), comm->sharedRes->tpNChannels), ringPrev, ringNext);
   } else {
     nChannels = comm->nChannels = std::min(std::min(ncclMaxNchannels(), nChannels), comm->config.maxCTAs);
-    nChannels = comm->nChannels = copyChannels(comm, nChannels, std::max(ncclMinNchannels(), comm->config.minCTAs), ringPrev, ringNext);
+    nChannels = comm->nChannels = copyChannels(comm, nChannels, std::max(ncclMinNchannels(comm), comm->config.minCTAs), ringPrev, ringNext);
   }
 
   comm->collChannels = comm->nChannels;

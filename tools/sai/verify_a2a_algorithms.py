@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify NCCL-SAI AlltoAll schedule and island-bulk invariants offline."""
+"""Verify NCCL-SAI P2P schedules and phased AlltoAll planner invariants."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from typing import Iterable
 
 
 P2P_BATCH_ROUNDS = 8
+DEFAULT_PLANNER_ROUNDS = 4
 
 
 class VerificationError(RuntimeError):
@@ -49,9 +50,7 @@ def quadratic_permutation(limit: int) -> list[int]:
 class ScheduleLayout:
     topology_nodes: int
     local_ranks: int = 4
-    lane_group_nodes: int = 4
-    fabric_nodes: int = 16
-    lanes: int = 8
+    fabric_nodes: int = 4
     p2p_group_size: int = 4
 
     @property
@@ -62,14 +61,9 @@ class ScheduleLayout:
     def fabric_groups(self) -> int:
         return self.topology_nodes // self.fabric_nodes
 
-    def validate_lane(self) -> None:
+    def validate_fabric_schedule(self) -> None:
         require(self.topology_nodes > 0, "topology_nodes must be positive")
         require(self.local_ranks > 0, "local_ranks must be positive")
-        require(self.lane_group_nodes > 0, "lane_group_nodes must be positive")
-        require(self.topology_nodes % self.lane_group_nodes == 0, "incomplete lane group")
-        require(self.lanes >= 2, "lanes must be at least two")
-
-    def validate_fabric_schedule(self) -> None:
         require(self.fabric_nodes > 0, "fabric_nodes must be positive")
         require(self.p2p_group_size > 0, "p2p_group_size must be positive")
         require(self.topology_nodes % self.fabric_nodes == 0, "incomplete fabric group")
@@ -127,6 +121,15 @@ def fabric_group(layout: ScheduleLayout, rank: int) -> int:
     return node // layout.fabric_nodes
 
 
+def planner_round_window(layout: ScheduleLayout, configured_rounds: int = -1) -> int:
+    layout.validate_fabric_schedule()
+    if configured_rounds > 0:
+        return configured_rounds
+    require(configured_rounds == -1, "configured planner rounds must be -1 or positive")
+    complete_cycles = (DEFAULT_PLANNER_ROUNDS + layout.fabric_groups - 1) // layout.fabric_groups
+    return layout.fabric_groups * complete_cycles
+
+
 def verify_fabric_schedule(layout: ScheduleLayout) -> dict[str, object]:
     descriptors = fabric_rounds(layout)
     rank_count = layout.ranks
@@ -147,6 +150,7 @@ def verify_fabric_schedule(layout: ScheduleLayout) -> dict[str, object]:
     cross_edges = layout.fabric_groups * (layout.fabric_groups - 1)
     cumulative_edges: set[tuple[int, int]] = set()
     first_full_undirected_batch = 0
+    required_undirected_edges = layout.fabric_groups * (layout.fabric_groups - 1) // 2
     batch_load_spread: list[dict[str, int]] = []
     total_load: Counter[tuple[int, int]] = Counter()
     for batch_start in range(0, rank_count, P2P_BATCH_ROUNDS):
@@ -173,8 +177,10 @@ def verify_fabric_schedule(layout: ScheduleLayout) -> dict[str, object]:
                 }
             )
         if (
+            required_undirected_edges > 0
+            and
             first_full_undirected_batch == 0
-            and len(cumulative_edges) == layout.fabric_groups * (layout.fabric_groups - 1) // 2
+            and len(cumulative_edges) == required_undirected_edges
         ):
             first_full_undirected_batch = batch_start // P2P_BATCH_ROUNDS + 1
 
@@ -193,132 +199,252 @@ def verify_fabric_schedule(layout: ScheduleLayout) -> dict[str, object]:
     }
 
 
-def lane_group_local_rank(layout: ScheduleLayout, rank: int) -> int:
-    node, local_rank = divmod(rank, layout.local_ranks)
-    return (node % layout.lane_group_nodes) * layout.local_ranks + local_rank
-
-
-def lane_phase(layout: ScheduleLayout, rank: int, peer: int) -> int:
-    return (lane_group_local_rank(layout, rank) + lane_group_local_rank(layout, peer)) % layout.lanes
-
-
-def verify_lane_schedule(layout: ScheduleLayout) -> dict[str, object]:
-    layout.validate_lane()
+def verify_planner_phases(layout: ScheduleLayout, rounds_per_plan: int = DEFAULT_PLANNER_ROUNDS) -> dict[str, object]:
+    require(rounds_per_plan > 0, "rounds_per_plan must be positive")
+    descriptors = fabric_rounds(layout)
     rank_count = layout.ranks
-    rank_phase_loads: list[int] = []
-    edge_phase_load: Counter[tuple[int, int, int]] = Counter()
-    for rank in range(rank_count):
-        phase_load = [0] * layout.lanes
-        for peer in range(rank_count):
-            if peer == rank:
-                continue
-            phase = lane_phase(layout, rank, peer)
-            require(phase == lane_phase(layout, peer, rank), f"lane pair mismatch for {rank}<->{peer}")
-            phase_load[phase] += 1
-            if layout.topology_nodes >= layout.fabric_nodes:
-                source_group = fabric_group(layout, rank)
-                destination_group = fabric_group(layout, peer)
-                if source_group != destination_group:
-                    edge_phase_load[(source_group, destination_group, phase)] += 1
-        require(max(phase_load) - min(phase_load) <= 1, f"rank {rank} lane load is imbalanced")
-        rank_phase_loads.extend(phase_load)
-
-    if edge_phase_load:
-        require(len(set(edge_phase_load.values())) == 1, "lane fabric edge load is not phase-balanced")
+    covered: list[set[int]] = [set() for _ in range(rank_count)]
+    phase_sizes: list[int] = []
+    for phase_begin in range(0, rank_count, rounds_per_plan):
+        phase = descriptors[phase_begin : phase_begin + rounds_per_plan]
+        phase_sizes.append(len(phase))
+        for rank in range(rank_count):
+            for descriptor in phase:
+                send_peer, recv_peer = p2p_peers(layout, rank, descriptor)
+                require(
+                    p2p_peers(layout, send_peer, descriptor)[1] == rank,
+                    f"planner phase send/recv mismatch at rank {rank}",
+                )
+                require(
+                    p2p_peers(layout, recv_peer, descriptor)[0] == rank,
+                    f"planner phase recv/send mismatch at rank {rank}",
+                )
+                covered[rank].add(send_peer)
+    for rank, peers in enumerate(covered):
+        require(len(peers) == rank_count, f"planner phases missed peers for rank {rank}")
     return {
-        "kind": "a2a_lane_schedule",
+        "kind": "a2a_native_planner_phases",
         "layout": asdict(layout),
         "ranks": rank_count,
-        "minimum_rank_phase_peers": min(rank_phase_loads),
-        "maximum_rank_phase_peers": max(rank_phase_loads),
-        "messages_per_directed_edge_phase": next(iter(edge_phase_load.values()), 0),
+        "rounds_per_plan": rounds_per_plan,
+        "plans": len(phase_sizes),
+        "minimum_rounds_per_plan": min(phase_sizes),
+        "maximum_rounds_per_plan": max(phase_sizes),
     }
 
 
-def expected_alltoall_value(source_rank: int, destination_rank: int) -> tuple[int, int]:
-    return source_rank, destination_rank
-
-
-def verify_island_bulk(n_islands: int, island_size: int, in_place: bool) -> dict[str, object]:
-    rank_count = n_islands * island_size
-    send_buffers = [
-        [expected_alltoall_value(source, destination) for destination in range(rank_count)]
-        for source in range(rank_count)
-    ]
-    recv_buffers = send_buffers if in_place else [[None] * rank_count for _ in range(rank_count)]
-
-    # The first NCCL group completes before the implementation writes user recv buffers.
-    stage = [[[None] * island_size for _ in range(n_islands)] for _ in range(rank_count)]
-    for rank in range(rank_count):
-        destination_island, island_local = divmod(rank, island_size)
-        for source_island in range(n_islands):
-            source_rank = source_island * island_size + island_local
-            for destination_local in range(island_size):
-                destination_rank = destination_island * island_size + destination_local
-                stage[rank][source_island][destination_local] = send_buffers[source_rank][destination_rank]
-
-    local_send: list[dict[int, list[tuple[int, int]]]] = [dict() for _ in range(rank_count)]
-    for rank in range(rank_count):
-        _, island_local = divmod(rank, island_size)
-        for source_island in range(n_islands):
-            source_rank = source_island * island_size + island_local
-            recv_buffers[rank][source_rank] = stage[rank][source_island][island_local]
-        for destination_local in range(island_size):
-            if destination_local == island_local:
-                continue
-            local_send[rank][destination_local] = [
-                stage[rank][source_island][destination_local]
-                for source_island in range(n_islands)
-            ]
-
-    for rank in range(rank_count):
-        destination_island, island_local = divmod(rank, island_size)
-        for source_local in range(island_size):
-            if source_local == island_local:
-                continue
-            source_peer = destination_island * island_size + source_local
-            packed = local_send[source_peer][island_local]
-            for source_island, value in enumerate(packed):
-                source_rank = source_island * island_size + source_local
-                recv_buffers[rank][source_rank] = value
-
-    for destination_rank in range(rank_count):
-        for source_rank in range(rank_count):
-            expected = expected_alltoall_value(source_rank, destination_rank)
-            actual = recv_buffers[destination_rank][source_rank]
-            require(
-                actual == expected,
-                f"island-bulk mismatch in_place={in_place} dst={destination_rank} src={source_rank}: {actual}",
-            )
+def verify_planner_fabric_edge_phases(
+    layout: ScheduleLayout, rounds_per_plan: int
+) -> dict[str, object]:
+    require(rounds_per_plan > 0, "rounds_per_plan must be positive")
+    descriptors = fabric_rounds(layout)
+    expected_edges = layout.fabric_groups * (layout.fabric_groups - 1)
+    active_edge_counts: list[int] = []
+    messages_per_edge: list[int] = []
+    for phase_begin in range(0, layout.ranks, rounds_per_plan):
+        phase_load: Counter[tuple[int, int]] = Counter()
+        for rank in range(layout.ranks):
+            source_group = fabric_group(layout, rank)
+            for descriptor in descriptors[phase_begin : phase_begin + rounds_per_plan]:
+                send_peer, _ = p2p_peers(layout, rank, descriptor)
+                destination_group = fabric_group(layout, send_peer)
+                if source_group != destination_group:
+                    phase_load[(source_group, destination_group)] += 1
+        active_edge_counts.append(len(phase_load))
+        if expected_edges:
+            require(len(phase_load) == expected_edges, "planner phase left fabric edges idle")
+            require(len(set(phase_load.values())) == 1, "planner phase fabric load is imbalanced")
+            messages_per_edge.append(next(iter(phase_load.values())))
     return {
-        "kind": "a2a_island_bulk",
-        "islands": n_islands,
-        "island_size": island_size,
-        "ranks": rank_count,
-        "in_place": in_place,
-        "elements_checked": rank_count * rank_count,
+        "kind": "a2a_planner_fabric_edge_phases",
+        "layout": asdict(layout),
+        "rounds_per_plan": rounds_per_plan,
+        "phases": len(active_edge_counts),
+        "minimum_active_directed_edges": min(active_edge_counts),
+        "maximum_active_directed_edges": max(active_edge_counts),
+        "minimum_messages_per_edge": min(messages_per_edge, default=0),
+        "maximum_messages_per_edge": max(messages_per_edge, default=0),
+    }
+
+
+def verify_planner_queue_model(
+    layout: ScheduleLayout,
+    sequences: tuple[int, ...],
+    rounds_per_phase: int,
+    work_round_budget: int,
+    skip_self: bool,
+) -> dict[str, object]:
+    require(sequences and all(sequence > 0 for sequence in sequences), "planner sequences must be nonzero")
+    require(len(set(sequences)) == len(sequences), "planner sequences must be unique")
+    require(rounds_per_phase > 0, "rounds_per_phase must be positive")
+    require(work_round_budget > 0, "work_round_budget must be positive")
+    descriptors = fabric_rounds(layout)
+    rank = 0
+    send_queues = [list(sequences) for _ in range(layout.ranks)]
+    recv_queues = [list(sequences) for _ in range(layout.ranks)]
+    plans: list[tuple[int, tuple[int, ...]]] = []
+    empty_plans_released = 0
+    covered: dict[int, set[int]] = {sequence: set() for sequence in sequences}
+
+    for sequence in sequences:
+        heads = [queue[0] for queue in send_queues + recv_queues if queue]
+        require(heads and min(heads) == sequence, f"sequence {sequence} is not at the queue heads")
+        require(all(head == sequence for head in heads), f"sequence {sequence} heads are inconsistent")
+        next_round = 0
+        round_end = 0
+        while next_round < layout.ranks:
+            if round_end == 0:
+                round_end = min(layout.ranks, next_round + rounds_per_phase)
+            plan_rounds: list[int] = []
+            while next_round < round_end:
+                send_peer, recv_peer = p2p_peers(layout, rank, descriptors[next_round])
+                require(send_queues[send_peer][0] == sequence, "send queue sequence changed mid-phase")
+                require(recv_queues[recv_peer][0] == sequence, "recv queue sequence changed mid-phase")
+                self_noop = skip_self and send_peer == rank
+                if self_noop:
+                    require(recv_peer == rank, "self send did not have a matching self receive")
+                elif len(plan_rounds) == work_round_budget:
+                    break
+                send_queues[send_peer].pop(0)
+                recv_queues[recv_peer].pop(0)
+                covered[sequence].add(next_round)
+                if not self_noop:
+                    plan_rounds.append(next_round)
+                next_round += 1
+
+            if plan_rounds:
+                plans.append((sequence, tuple(plan_rounds)))
+            else:
+                empty_plans_released += 1
+            if next_round == round_end:
+                round_end = 0
+            else:
+                require(plan_rounds, "planner made no progress while a phase remained active")
+
+        require(
+            covered[sequence] == set(range(layout.ranks)),
+            f"sequence {sequence} did not consume every P2P round exactly once",
+        )
+
+    require(all(not queue for queue in send_queues + recv_queues), "planner left tagged tasks queued")
+    require(all(plan for _, plan in plans), "planner retained an empty kernel plan")
+    if skip_self:
+        require(empty_plans_released > 0, "self-only phase did not exercise empty-plan release")
+    return {
+        "kind": "a2a_native_planner_queue_model",
+        "layout": asdict(layout),
+        "sequences": list(sequences),
+        "rounds_per_phase": rounds_per_phase,
+        "work_round_budget": work_round_budget,
+        "skip_self": skip_self,
+        "nonempty_plans": len(plans),
+        "empty_plans_released": empty_plans_released,
+    }
+
+
+def verify_planner_head_guard() -> dict[str, object]:
+    send_heads = [1, 1, 1, 2]
+    recv_heads = [1, 1, 1, 1]
+    candidate = min(send_heads + recv_heads)
+    ready = all(head == candidate for head in send_heads + recv_heads)
+    require(not ready, "planner accepted inconsistent tagged queue heads")
+    return {
+        "kind": "a2a_native_planner_head_guard",
+        "candidate_sequence": candidate,
+        "ready": ready,
+    }
+
+
+def fabric_metadata_order(group_ids: tuple[int, ...], expected_nodes_per_group: int) -> tuple[list[int], bool]:
+    require(group_ids, "fabric metadata must contain at least one topology node")
+    require(expected_nodes_per_group > 0, "expected fabric group size must be positive")
+    dense_ids: list[int] = []
+    node_to_group: list[int] = []
+    counts: Counter[int] = Counter()
+    for group_id in group_ids:
+        if group_id not in dense_ids:
+            dense_ids.append(group_id)
+        dense_group = dense_ids.index(group_id)
+        node_to_group.append(dense_group)
+        counts[dense_group] += 1
+    order = [
+        node
+        for dense_group in range(len(dense_ids))
+        for node, node_group in enumerate(node_to_group)
+        if node_group == dense_group
+    ]
+    complete = len(group_ids) == len(dense_ids) * expected_nodes_per_group and all(
+        counts[dense_group] == expected_nodes_per_group for dense_group in range(len(dense_ids))
+    )
+    require(sorted(order) == list(range(len(group_ids))), "fabric metadata order lost a topology node")
+    return order, complete
+
+
+def verify_fabric_metadata_order() -> dict[str, object]:
+    interleaved = (90, 70, 90, 70, 90, 70, 90, 70)
+    order, complete = fabric_metadata_order(interleaved, 4)
+    require(complete, "complete interleaved fabric groups were rejected")
+    require(order == [0, 2, 4, 6, 1, 3, 5, 7], "fabric metadata order is not group-contiguous")
+    _, incomplete = fabric_metadata_order((90, 70, 90, 70, 90, 70, 90), 4)
+    require(not incomplete, "incomplete fabric groups were accepted")
+    return {
+        "kind": "fabric_group_metadata_order",
+        "topology_nodes": len(interleaved),
+        "expected_nodes_per_group": 4,
+        "ordered_nodes": order,
+        "complete": complete,
     }
 
 
 def layouts(full_scale: bool) -> Iterable[ScheduleLayout]:
-    topology_nodes = [8, 16, 32, 64]
+    topology_nodes = [4, 8, 16, 32, 64]
     if full_scale:
         # Keep public stress shapes representative rather than mirroring a
         # particular deployed system. Cover both power-of-two and
         # non-power-of-two fabric-group counts at large communicator sizes.
         topology_nodes.extend([256, 272])
-    return (ScheduleLayout(topology_nodes=count) for count in topology_nodes)
+    result = [ScheduleLayout(topology_nodes=count) for count in topology_nodes]
+    # Multi-node NCCL starts from an eight-rank P2P schedule group and reduces
+    # it with gcd() when a node has fewer local ranks. Exercise the resulting
+    # 4-, 8-, and 16-local-rank layouts without making the large model cubic in
+    # the full communicator size.
+    result.extend(
+        [
+            ScheduleLayout(topology_nodes=4, local_ranks=16, p2p_group_size=8),
+            ScheduleLayout(topology_nodes=8, local_ranks=8, p2p_group_size=8),
+            ScheduleLayout(topology_nodes=8, local_ranks=16, p2p_group_size=8),
+            ScheduleLayout(topology_nodes=16, fabric_nodes=16),
+        ]
+    )
+    if full_scale:
+        # Also exercise an explicit larger expert configuration without making
+        # it the model default used by the runtime knob.
+        result.extend(ScheduleLayout(topology_nodes=count, fabric_nodes=16) for count in (256, 272))
+    return result
 
 
 def run(full_scale: bool) -> list[dict[str, object]]:
     results: list[dict[str, object]] = []
     for layout in layouts(full_scale):
-        results.append(verify_lane_schedule(layout))
         if layout.topology_nodes % layout.fabric_nodes == 0:
             results.append(verify_fabric_schedule(layout))
-    for n_islands in (1, 2, 5, 16):
-        for in_place in (False, True):
-            results.append(verify_island_bulk(n_islands, island_size=4, in_place=in_place))
+            rounds_per_plan = planner_round_window(layout)
+            results.append(verify_planner_phases(layout, rounds_per_plan))
+            results.append(verify_planner_fabric_edge_phases(layout, rounds_per_plan))
+    queue_layout = ScheduleLayout(topology_nodes=4, fabric_nodes=4)
+    results.append(verify_planner_queue_model(queue_layout, (1, 2), 8, 3, False))
+    results.append(verify_planner_queue_model(queue_layout, (1,), 1, 1, True))
+    results.append(
+        verify_planner_queue_model(
+            ScheduleLayout(topology_nodes=5, fabric_nodes=1),
+            (7, 8),
+            3,
+            2,
+            False,
+        )
+    )
+    results.append(verify_planner_head_guard())
+    results.append(verify_fabric_metadata_order())
     return results
 
 

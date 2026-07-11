@@ -20,6 +20,7 @@
 #include "ras.h"
 #include "profiler.h"
 #include "mnnvl.h"
+#include "sai_profile.h"
 #include <limits.h>
 #include <fcntl.h>
 #include <string.h>
@@ -276,6 +277,7 @@ static ncclResult_t commFree(ncclComm_t comm) {
   }
   free(comm->rankToNode);
   free(comm->rankToLocalRank);
+  free(comm->saiA2a.nodeToFabricGroup);
   free(comm->collNetHeads);
   free(comm->clique.ranks);
 
@@ -619,6 +621,9 @@ static ncclResult_t fillInfo(struct ncclComm* comm, struct ncclPeerInfo* info, u
   info->cudaDev = comm->cudaDev;
   info->nvmlDev = comm->nvmlDev;
   NCCLCHECK(ncclGetVersion(&info->version));
+  // Reject mixed upstream builds and mismatched NCCL-SAI init schemas before
+  // exchanging the extended all-gather record below.
+  info->version = (int)ncclSaiPeerVersion((uint32_t)info->version);
   info->hostHash=getHostHash()+commHash;
   info->pidHash=getPidHash()+commHash;
   info->cuMemSupport = ncclCuMemEnable();
@@ -765,8 +770,8 @@ static ncclResult_t initNvlDomainInfo(struct ncclComm* comm) {
 }
 
 NCCL_PARAM(GroupSize, "P2P_SCHEDULE_GROUP_SIZE", NCCL_MAX_DEV_WORK_P2P_PER_BATCH);
-NCCL_PARAM(SaiP2pFabricGroupSchedule, "SAI_P2P_FABRIC_GROUP_SCHEDULE", 0);
-NCCL_PARAM(SaiP2pFabricNodes, "SAI_P2P_FABRIC_NODES", 4);
+NCCL_PARAM(SaiP2pFabricGroupSchedule, "SAI_P2P_FABRIC_GROUP_SCHEDULE", -1);
+NCCL_PARAM(SaiP2pFabricNodes, "SAI_P2P_FABRIC_NODES", -1);
 
 static ncclResult_t ncclP2pSchedule(struct ncclComm* comm) {
   struct ncclNodeRanks* nodeRanks = comm->nodeRanks;
@@ -779,40 +784,55 @@ static ncclResult_t ncclP2pSchedule(struct ncclComm* comm) {
   comm->p2pSchedGroupSize = groupSize;
 
   int local = comm->localRank % groupSize; // local id inside my group
-  int group = comm->localRank / groupSize; // id of my group, incremented when going over the previous nodes
+  int localGroup = comm->localRank / groupSize;
+  int group = -1;
   int nGroups = comm->nRanks / groupSize;
   int nGroupsPow2 = pow2Up(nGroups);
+
+  int64_t saiFabricNodesParam = comm->saiA2a.config.field[ncclSaiA2aConfigP2pFabricNodes];
+  bool validSaiFabricNodes = saiFabricNodesParam > 0 && saiFabricNodesParam <= INT_MAX;
+  int saiFabricNodes = validSaiFabricNodes ? (int)saiFabricNodesParam : 0;
+  bool saiScheduleRequested = comm->saiA2a.configConsistent &&
+      comm->saiA2a.config.field[ncclSaiA2aConfigP2pFabricSchedule] != 0;
+  bool saiMultigroup = validSaiFabricNodes && comm->nNodes > saiFabricNodes;
+  bool saiMultigroupAllowed = !saiMultigroup || ncclSaiA2aMultigroupAllowed(
+      comm->saiA2a.config.field[ncclSaiA2aConfigMultigroupEnable],
+      comm->saiA2a.fabricGroupsComplete);
+  bool saiSchedule = saiScheduleRequested && validSaiFabricNodes &&
+      comm->nNodes % saiFabricNodes == 0 && saiMultigroupAllowed;
+  bool useFabricMetadataOrder = saiSchedule && saiMultigroup &&
+      comm->saiA2a.fabricGroupsComplete && comm->saiA2a.nodeToFabricGroup != nullptr;
 
   int *groupToNode, *groupToLocal;
   NCCLCHECK(ncclCalloc(&groupToNode, nGroups));  // node hosting the group
   NCCLCHECK(ncclCalloc(&groupToLocal, nGroups)); // local offset of the group
   int groupCount = 0;
-  for (int n = 0; n < comm->nNodes; ++n) {
-    if (0 != comm->nodeRanks[n].localRanks % groupSize) {
-      WARN("nLocals = %d should be a diviser of the number of ranks in node %d = %d", groupSize, n, comm->nodeRanks[n].localRanks);
-      return ncclInternalError;
+  for (int fabricGroup = 0;
+      fabricGroup < (useFabricMetadataOrder ? comm->saiA2a.nFabricGroups : 1);
+      fabricGroup++) {
+    for (int n = 0; n < comm->nNodes; ++n) {
+      if (useFabricMetadataOrder && comm->saiA2a.nodeToFabricGroup[n] != fabricGroup) continue;
+      if (0 != comm->nodeRanks[n].localRanks % groupSize) {
+        WARN("nLocals = %d should be a diviser of the number of ranks in node %d = %d", groupSize, n, comm->nodeRanks[n].localRanks);
+        return ncclInternalError;
+      }
+      int nGroupsInNode = comm->nodeRanks[n].localRanks / groupSize;
+      for (int g = 0; g < nGroupsInNode; ++g) {
+        if (n == comm->node && g == localGroup) group = groupCount;
+        groupToLocal[groupCount] = g * groupSize;
+        groupToNode[groupCount] = n;
+        groupCount++;
+      }
     }
-    int nGroupsInNode = comm->nodeRanks[n].localRanks / groupSize;
-    for (int g = 0; g < nGroupsInNode; ++g) {
-      groupToLocal[groupCount] = g * groupSize;
-      groupToNode[groupCount] = n;
-      groupCount++;
-    }
-    if (n < comm->node) group += nGroupsInNode;
   }
-  if (groupCount != nGroups) {
-    WARN("Group creation failed: %d vs %d", groupCount, nGroups);
+  if (groupCount != nGroups || group < 0) {
+    WARN("Group creation failed: count %d vs %d localGroup %d", groupCount, nGroups, group);
     return ncclInternalError;
   }
   INFO(NCCL_GRAPH,"%s: group size used is %d",__func__,groupSize);
 
   int round = 0;
-
-  int64_t saiFabricNodesParam = ncclParamSaiP2pFabricNodes();
-  bool validSaiFabricNodes = saiFabricNodesParam > 0 && saiFabricNodesParam <= INT_MAX;
-  int saiFabricNodes = validSaiFabricNodes ? (int)saiFabricNodesParam : 0;
-  bool saiSchedule = ncclParamSaiP2pFabricGroupSchedule() != 0;
-  if (saiSchedule && validSaiFabricNodes && comm->nNodes % saiFabricNodes == 0) {
+  if (saiSchedule) {
     int groupsPerNode = nodeRanks[0].localRanks / groupSize;
     bool uniformLocalRanks = groupsPerNode > 0;
     for (int n = 0; n < comm->nNodes; n++) {
@@ -822,8 +842,8 @@ static ncclResult_t ncclP2pSchedule(struct ncclComm* comm) {
     if (uniformLocalRanks && groupsPerFabric > 0 && nGroups % groupsPerFabric == 0) {
       int nFabricGroups = nGroups / groupsPerFabric;
       int nFabricGroupsPow2 = pow2Up(nFabricGroups);
-      INFO(NCCL_GRAPH, "%s: using SAI fabric group schedule, fabricNodes %d, groupsPerFabric %d, fabricGroups %d",
-           __func__, saiFabricNodes, groupsPerFabric, nFabricGroups);
+      INFO(NCCL_GRAPH, "%s: using SAI fabric group schedule, fabricNodes %d, groupsPerFabric %d, fabricGroups %d metadataOrder %d",
+           __func__, saiFabricNodes, groupsPerFabric, nFabricGroups, useFabricMetadataOrder ? 1 : 0);
       for (int delta = 0; delta < groupSize; delta++) {
         for (int groupSkew = 0; groupSkew < groupsPerFabric; groupSkew++) {
           uint32_t fabricRound = 0, fabricDelta = 0;
@@ -848,10 +868,13 @@ static ncclResult_t ncclP2pSchedule(struct ncclComm* comm) {
     } else {
       INFO(NCCL_GRAPH, "%s: SAI fabric group schedule disabled, localRanks/group layout is not uniform", __func__);
     }
-  } else if (saiSchedule) {
+  } else if (saiScheduleRequested) {
     if (!validSaiFabricNodes) {
       INFO(NCCL_GRAPH, "%s: SAI fabric group schedule disabled, invalid fabricNodes %ld",
            __func__, (long)saiFabricNodesParam);
+    } else if (!saiMultigroupAllowed) {
+      INFO(NCCL_GRAPH, "%s: SAI fabric group schedule disabled, complete fabric-group metadata is unavailable",
+           __func__);
     } else {
       INFO(NCCL_GRAPH, "%s: SAI fabric group schedule disabled, nNodes %d is not divisible by fabricNodes %d",
            __func__, comm->nNodes, saiFabricNodes);
@@ -922,6 +945,8 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   struct allGatherInfo {
     struct graphInfo graphInfo[NCCL_NUM_ALGORITHMS];
     struct ncclTopoRanks topoRanks;
+    struct ncclSaiA2aConfig saiA2aConfig;
+    struct ncclSaiFabricGroupInfo saiFabricGroup;
     int cpuArch;
     int cpuVendor;
     int localRanks;
@@ -931,12 +956,16 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   struct allGatherInfo *allGather3Data = NULL;
   struct ncclTopoRanks** allTopoRanks = NULL;
   int *nodesFirstRank = NULL, *nodesTreePatterns = NULL;
+  uint64_t *saiNodeGroupIds = NULL, *saiGroupIds = NULL;
+  int *saiGroupCounts = NULL;
+  bool *saiNodeGroupSet = NULL;
   int *rings = NULL;
   int* nvbPeers = NULL;
   struct ncclProxyConnector proxyConn;
   int* pxnPeers = NULL;
   int *topParentLocalRanks = NULL;
   int p2pLevel = -1;
+  int saiFabricValidRanks = 0, saiFabricAbsentRanks = 0, saiFabricInvalidRanks = 0;
 
   timers[TIMER_INIT_ALLGATHER] = clockNano();
   // AllGather1 - begin
@@ -1141,11 +1170,28 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
 
   allGather3Data[rank].cpuArch = comm->cpuArch;
   allGather3Data[rank].cpuVendor = comm->cpuVendor;
+  ncclSaiA2aGetConfig(comm, &allGather3Data[rank].saiA2aConfig);
+  ncclSaiA2aGetFabricGroupInfo(&allGather3Data[rank].saiFabricGroup);
 
   comm->nChannels = std::min(treeGraph->nChannels, ringGraph->nChannels);
   NCCLCHECKGOTO(ncclTopoPreset(comm, graphs, &allGather3Data[rank].topoRanks), ret, fail);
 
   NCCLCHECKGOTO(bootstrapAllGather(comm->bootstrap, allGather3Data, sizeof(*allGather3Data)), ret, fail);
+
+  comm->saiA2a.configConsistent = true;
+  for (int r = 1; r < nranks; r++) {
+    if (memcmp(allGather3Data[0].saiA2aConfig.field, allGather3Data[r].saiA2aConfig.field,
+        sizeof(allGather3Data[0].saiA2aConfig.field)) != 0) {
+      comm->saiA2a.configConsistent = false;
+      break;
+    }
+  }
+  if (!comm->saiA2a.configConsistent) {
+    WARN("NCCL-SAI configuration differs across ranks");
+    ret = ncclInvalidUsage;
+    goto fail;
+  }
+  comm->saiA2a.config = allGather3Data[rank].saiA2aConfig;
 
   // Determine nNodes, firstRanks, ...
   NCCLCHECKGOTO(ncclCalloc(&nodesFirstRank, nranks), ret, fail);
@@ -1172,6 +1218,74 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
       comm->cpuVendor = NCCL_TOPO_CPU_VENDOR_MIXED;
     }
   }
+
+  comm->saiA2a.fabricMetadataValid = false;
+  comm->saiA2a.fabricGroupsComplete = false;
+  comm->saiA2a.nFabricGroups = 0;
+  saiFabricValidRanks = saiFabricAbsentRanks = saiFabricInvalidRanks = 0;
+  for (int r = 0; r < nranks; r++) {
+    switch (allGather3Data[r].saiFabricGroup.state) {
+    case ncclSaiFabricGroupIdValid: saiFabricValidRanks++; break;
+    case ncclSaiFabricGroupIdAbsent: saiFabricAbsentRanks++; break;
+    default: saiFabricInvalidRanks++; break;
+    }
+  }
+  if (saiFabricValidRanks == nranks) {
+    NCCLCHECKGOTO(ncclCalloc(&saiNodeGroupIds, comm->nNodes), ret, fail);
+    NCCLCHECKGOTO(ncclCalloc(&saiNodeGroupSet, comm->nNodes), ret, fail);
+    bool nodeMetadataConsistent = true;
+    for (int r = 0; r < nranks; r++) {
+      int node = comm->rankToNode[r];
+      uint64_t groupId = allGather3Data[r].saiFabricGroup.id;
+      if (!saiNodeGroupSet[node]) {
+        saiNodeGroupSet[node] = true;
+        saiNodeGroupIds[node] = groupId;
+      } else if (saiNodeGroupIds[node] != groupId) {
+        nodeMetadataConsistent = false;
+        break;
+      }
+    }
+    if (nodeMetadataConsistent) {
+      NCCLCHECKGOTO(ncclCalloc(&saiGroupIds, comm->nNodes), ret, fail);
+      NCCLCHECKGOTO(ncclCalloc(&saiGroupCounts, comm->nNodes), ret, fail);
+      NCCLCHECKGOTO(ncclCalloc(&comm->saiA2a.nodeToFabricGroup, comm->nNodes), ret, fail);
+      for (int node = 0; node < comm->nNodes; node++) {
+        int fabricGroup = 0;
+        while (fabricGroup < comm->saiA2a.nFabricGroups &&
+            saiGroupIds[fabricGroup] != saiNodeGroupIds[node]) fabricGroup++;
+        if (fabricGroup == comm->saiA2a.nFabricGroups) {
+          saiGroupIds[fabricGroup] = saiNodeGroupIds[node];
+          comm->saiA2a.nFabricGroups++;
+        }
+        comm->saiA2a.nodeToFabricGroup[node] = fabricGroup;
+        saiGroupCounts[fabricGroup]++;
+      }
+      comm->saiA2a.fabricMetadataValid = true;
+      int64_t expectedNodes = comm->saiA2a.config.field[ncclSaiA2aConfigP2pFabricNodes];
+      bool groupsComplete = expectedNodes > 0 && expectedNodes <= INT_MAX &&
+          comm->nNodes == comm->saiA2a.nFabricGroups * expectedNodes;
+      for (int group = 0; group < comm->saiA2a.nFabricGroups; group++) {
+        groupsComplete &= saiGroupCounts[group] == expectedNodes;
+      }
+      comm->saiA2a.fabricGroupsComplete = groupsComplete;
+      if (rank == 0) {
+        INFO(NCCL_INIT|NCCL_ENV,
+          "NCCL-SAI fabric metadata: groups %d topologyNodes %d expectedNodesPerGroup %ld complete %d",
+          comm->saiA2a.nFabricGroups, comm->nNodes, (long)expectedNodes, groupsComplete ? 1 : 0);
+      }
+    } else if (rank == 0) {
+      INFO(NCCL_INIT|NCCL_ENV,
+        "NCCL-SAI fabric metadata ignored: ranks in one topology node reported different group IDs");
+    }
+  } else if ((saiFabricValidRanks != 0 || saiFabricInvalidRanks != 0) && rank == 0) {
+    INFO(NCCL_INIT|NCCL_ENV,
+      "NCCL-SAI fabric metadata ignored: validRanks %d absentRanks %d invalidRanks %d",
+      saiFabricValidRanks, saiFabricAbsentRanks, saiFabricInvalidRanks);
+  }
+  free(saiNodeGroupIds); saiNodeGroupIds = NULL;
+  free(saiNodeGroupSet); saiNodeGroupSet = NULL;
+  free(saiGroupIds); saiGroupIds = NULL;
+  free(saiGroupCounts); saiGroupCounts = NULL;
 
   // Alert the user to the presence of mixed CPUs. In the past this has caused
   // locks in some collective routines. This may help debug issues in the future.
@@ -1455,6 +1569,10 @@ exit:
   free(allTopoRanks);
   free(nodesTreePatterns);
   free(nodesFirstRank);
+  free(saiNodeGroupIds);
+  free(saiNodeGroupSet);
+  free(saiGroupIds);
+  free(saiGroupCounts);
   free(allGather3Data);
   free(rings);
   free(nvbPeers);
