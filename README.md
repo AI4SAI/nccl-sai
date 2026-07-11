@@ -20,11 +20,13 @@ copyright and license notices are retained; see `LICENSE.txt` and
 For SAI users, the intended runtime mode is drop-in replacement: put the
 NCCL-SAI build's `lib/` directory before the system NCCL in `LD_LIBRARY_PATH`.
 SAI site modules or prologs can enable transparent SAI behavior by setting
-`NCCL_SAI_FABRIC_PROFILE` to a recognized product-family name such as
-`ultrapod` or `slimpod`; a nonempty `-<variant>` suffix is also accepted.
-Unknown profile names, unsupported layouts, and non-SAI clusters fall back to
-upstream NCCL behavior unless explicitly opted in with
-`NCCL_SAI_A2A_ENABLE=1`.
+`NCCL_SAI_FABRIC_PROFILE` to a recognized product-family profile. The current
+phased AlltoAll defaults are selected by `ultrapod-fullmesh`; broader family
+names such as `ultrapod` and `slimpod` are recognized activation namespaces but
+do not imply that the same planner is valid for every topology. Unknown profile
+names and unsupported layouts fall back to upstream NCCL behavior unless an
+expert explicitly opts in with `NCCL_SAI_A2A_ENABLE=1` and the related planner
+controls.
 
 ## Introduction
 
@@ -97,4 +99,7 @@ $ ./build/all_reduce_perf -b 8 -e 256M -f 2 -g <ngpus>
 
 ## Copyright
 
-All source code and accompanying documentation is copyright (c) 2015-2020, NVIDIA CORPORATION. All rights reserved.
+Original NVIDIA NCCL source code and documentation retain their upstream
+copyright notices. NCCL-SAI modifications are copyright (c) 2026, AI4SAI
+contributors and are redistributed under `LICENSE.txt`; see
+`docs/sai/NOTICE.md` for the modification boundary.

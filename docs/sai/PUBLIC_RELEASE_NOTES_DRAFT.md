@@ -12,9 +12,10 @@ are retained in `LICENSE.txt`; see `docs/sai/NOTICE.md`.
 
 - `ncclAlltoAll()` on eligible SAI fabric profiles.
 
-The optimized AlltoAll paths require distinct send and receive buffers.
-Aliased buffers use the upstream path; this release does not claim an in-place
-AlltoAll contract.
+Eligible large out-of-place AlltoAll calls use the phased planner. Small
+messages and exactly aliased buffers use upstream scheduling. This release does
+not claim an in-place, partially overlapping, or universal small-message
+AlltoAll speedup. Release performance claims use out-of-place buffers.
 
 NCCL-SAI also includes a narrowly guarded local P2P transport-selection path
 for an eligible single-host 8-rank, two-island communicator. That path can
@@ -26,11 +27,13 @@ reduce-scatter, broadcast, and reduce collective algorithms remain unchanged.
 SAI sites can enable default NCCL-SAI behavior by setting:
 
 ```bash
-export NCCL_SAI_FABRIC_PROFILE=ultrapod
+export NCCL_SAI_FABRIC_PROFILE=ultrapod-fullmesh
 ```
 
 The recognized public families are `ultrapod` and `slimpod`; a nonempty
-`-<variant>` suffix is accepted for site packaging. Empty, unknown, or
+`-<variant>` suffix is accepted for site packaging. The current phased planner
+defaults are specific to the `ultrapod-fullmesh` profile; recognizing a broader
+family name does not enable that topology-specific planner. Empty, unknown, or
 disabled-style values such as `0`, `false`, `off`, `none`, `native`, and
 `upstream` fail closed to upstream behavior.
 
@@ -38,6 +41,8 @@ Explicit overrides:
 
 - `NCCL_SAI_A2A_ENABLE=1`: enable the alltoall SAI path.
 - `NCCL_SAI_A2A_ENABLE=0`: disable the alltoall SAI path.
+- `NCCL_SAI_FABRIC_GROUP_ID=<N>`: provide rank-local numeric metadata used to
+  validate complete multi-group layouts.
 - `NCCL_SAI_LOCAL_P2P_SYS_ENABLE=1`: enable the selected local P2P path guard.
 - `NCCL_SAI_LOCAL_P2P_SYS_ENABLE=0`: disable that local path guard.
 - Standard `NCCL_P2P_DISABLE` and `NCCL_P2P_LEVEL` settings take precedence
@@ -48,6 +53,25 @@ Explicit overrides:
 - `NCCL_SAI_P2P_FABRIC_NODES=<N>`: local fabric-domain node count for that
   advanced schedule, expressed as NCCL topology nodes rather than scheduler
   host count.
+
+When the validated full-mesh profile is active and the user has not explicitly
+set `NCCL_MIN_NCHANNELS` or its legacy alias, NCCL-SAI applies an implicit
+channel floor of at most eight channels. This setting is communicator-wide and
+is included in cross-collective release testing; explicit upstream channel
+settings take precedence.
+
+## Preliminary Performance Boundary
+
+In a sustained same-domain 64-GPU `alltoall_perf` run using a 1 GiB per-rank
+test size, the eligible out-of-place phased path measured 6.16 GB/s bus
+bandwidth. Disabling the NCCL-SAI AlltoAll policy in the same build measured
+4.80 GB/s. The exactly aliased benchmark path remained upstream at 4.76 GB/s,
+producing a combined average of 5.46 GB/s.
+
+This result demonstrates recovery of large out-of-place AlltoAll performance
+on the validated topology class. It does not demonstrate a universal
+small-message speedup, an in-place optimization, or an application-level
+speedup.
 
 ## Release Scope
 
@@ -63,6 +87,7 @@ Minimum public gates:
   package;
 - single-node, same-domain, cross-domain, and multi-domain alltoall;
 - KB, MB, and GB message-size coverage;
+- CUDA Graph capture and replay through the enqueue-based fallback;
 - allreduce, reduce-scatter, allgather, broadcast, and P2P non-regression;
 - fallback behavior when `NCCL_SAI_FABRIC_PROFILE` is unset or unrecognized.
 
