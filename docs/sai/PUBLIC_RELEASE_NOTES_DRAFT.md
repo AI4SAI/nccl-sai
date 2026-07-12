@@ -24,6 +24,12 @@ for an eligible single-host 8-rank, two-island communicator. That path can
 affect any operation using local P2P transport, while the allreduce, allgather,
 reduce-scatter, broadcast, and reduce collective algorithms remain unchanged.
 
+For the `ultrapod-fullmesh` profile, a GPU with exactly two topology-local NET
+candidates selects them by channel parity. This keeps both endpoints of a
+channel aligned to the same rail on the validated symmetric dual-rail topology.
+The rule does not activate for broader family-only profiles, unknown profiles,
+or any other local-NET count; those cases retain upstream selection.
+
 ## Transparent Runtime Model
 
 SAI sites can enable default NCCL-SAI behavior by setting:
@@ -34,10 +40,11 @@ export NCCL_SAI_FABRIC_PROFILE=ultrapod-fullmesh
 
 The recognized public families are `ultrapod` and `slimpod`; a nonempty
 `-<variant>` suffix is accepted for site packaging. The current island and
-phased defaults are specific to the `ultrapod-fullmesh` profile; recognizing a
-broader family name does not enable those topology-specific paths. Empty,
-unknown, or disabled-style values such as `0`, `false`, `off`, `none`,
-`native`, and `upstream` fail closed to upstream behavior.
+phased defaults and the guarded exactly-two-local-NET channel alignment are
+specific to the `ultrapod-fullmesh` profile; recognizing a broader family name
+does not enable those topology-specific paths. Empty, unknown, or
+disabled-style values such as `0`, `false`, `off`, `none`, `native`, and
+`upstream` fail closed to upstream behavior.
 
 Explicit overrides:
 
