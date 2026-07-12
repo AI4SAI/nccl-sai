@@ -167,14 +167,42 @@ static inline bool ncclSaiFullMeshProfileEnabled() {
   return ncclSaiProfileFamily(value, "ultrapod-fullmesh");
 }
 
-// The validated full-mesh topology exposes exactly two local network rails per
-// GPU. Keep this override fail-closed so every other profile and topology uses
-// the upstream local-NET index selected by ncclTopoGetLocalNet.
+static inline bool ncclSaiDualRailByChannelEnabled() {
+  const char* mergeNics = ncclGetEnv("NCCL_IB_MERGE_NICS");
+  return ncclSaiFullMeshProfileEnabled() && mergeNics != nullptr &&
+      strcmp(mergeNics, "0") == 0;
+}
+
+// The target full-mesh topology exposes exactly two local network rails per GPU
+// with NIC merging disabled. Keep this override fail-closed so every other
+// profile and topology uses the upstream local-NET index.
 static inline bool ncclSaiSelectLocalNetByChannel(
     int channelId, int localNetCount, int* localNetIndex) {
   if (localNetIndex == nullptr || channelId < 0 || localNetCount != 2 ||
-      !ncclSaiFullMeshProfileEnabled()) return false;
+      !ncclSaiDualRailByChannelEnabled()) return false;
   *localNetIndex = channelId % 2;
+  return true;
+}
+
+static inline bool ncclSaiSelectGraphNetByChannel(int channelId,
+    int64_t graphNetId, const int64_t* localNets, int localNetCount,
+    int64_t* selectedNetId) {
+  if (localNets == nullptr || selectedNetId == nullptr) return false;
+
+  int localNetIndex = 0;
+  if (!ncclSaiSelectLocalNetByChannel(
+          channelId, localNetCount, &localNetIndex)) return false;
+
+  bool graphNetIsLocal = false;
+  for (int n = 0; n < localNetCount; n++) {
+    if (localNets[n] == graphNetId) {
+      graphNetIsLocal = true;
+      break;
+    }
+  }
+  if (!graphNetIsLocal) return false;
+
+  *selectedNetId = localNets[localNetIndex];
   return true;
 }
 

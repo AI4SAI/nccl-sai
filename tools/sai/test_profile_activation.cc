@@ -10,9 +10,12 @@
 #include <string.h>
 
 static const char* testProfile = nullptr;
+static const char* testMergeNics = nullptr;
 
 const char* ncclGetEnv(const char* name) {
-  return strcmp(name, "NCCL_SAI_FABRIC_PROFILE") == 0 ? testProfile : nullptr;
+  if (strcmp(name, "NCCL_SAI_FABRIC_PROFILE") == 0) return testProfile;
+  if (strcmp(name, "NCCL_IB_MERGE_NICS") == 0) return testMergeNics;
+  return nullptr;
 }
 
 struct ProfileCase {
@@ -22,11 +25,22 @@ struct ProfileCase {
 
 struct LocalNetCase {
   const char* profile;
+  const char* mergeNics;
   int channelId;
   int localNetCount;
   int upstreamIndex;
   bool selected;
   int expectedIndex;
+};
+
+struct GraphNetCase {
+  const char* profile;
+  const char* mergeNics;
+  int channelId;
+  int64_t graphNetId;
+  int localNetCount;
+  bool selected;
+  int64_t expectedNetId;
 };
 
 int main() {
@@ -211,44 +225,89 @@ int main() {
   }
 
   const LocalNetCase localNetCases[] = {
-    {"ultrapod-fullmesh", 0, 2, 1, true, 0},
-    {"ultrapod-fullmesh", 1, 2, 0, true, 1},
-    {"ultrapod-fullmesh", 6, 2, 1, true, 0},
-    {"ultrapod-fullmesh-site_a.2", 7, 2, 0, true, 1},
-    {nullptr, 1, 2, 0, false, 0},
-    {"custom", 0, 2, 1, false, 1},
-    {"ultrapod", 1, 2, 0, false, 0},
-    {"slimpod", 0, 2, 1, false, 1},
-    {"ultrapod-fullmesh", 1, 1, 0, false, 0},
-    {"ultrapod-fullmesh", 2, 3, 2, false, 2},
-    {"ultrapod-fullmesh", 3, 4, 3, false, 3},
-    {"ultrapod-fullmesh", -1, 2, 1, false, 1},
+    {"ultrapod-fullmesh", "0", 0, 2, 1, true, 0},
+    {"ultrapod-fullmesh", "0", 1, 2, 0, true, 1},
+    {"ultrapod-fullmesh", "0", 6, 2, 1, true, 0},
+    {"ultrapod-fullmesh-site_a.2", "0", 7, 2, 0, true, 1},
+    {"ultrapod-fullmesh", nullptr, 1, 2, 0, false, 0},
+    {"ultrapod-fullmesh", "1", 1, 2, 0, false, 0},
+    {"ultrapod-fullmesh", "00", 1, 2, 0, false, 0},
+    {nullptr, "0", 1, 2, 0, false, 0},
+    {"custom", "0", 0, 2, 1, false, 1},
+    {"ultrapod", "0", 1, 2, 0, false, 0},
+    {"slimpod", "0", 0, 2, 1, false, 1},
+    {"ultrapod-fullmesh", "0", 1, 1, 0, false, 0},
+    {"ultrapod-fullmesh", "0", 2, 3, 2, false, 2},
+    {"ultrapod-fullmesh", "0", 3, 4, 3, false, 3},
+    {"ultrapod-fullmesh", "0", -1, 2, 1, false, 1},
   };
 
   for (size_t i = 0; i < sizeof(localNetCases) / sizeof(localNetCases[0]); i++) {
     const LocalNetCase& test = localNetCases[i];
     testProfile = test.profile;
+    testMergeNics = test.mergeNics;
     int localNetIndex = test.upstreamIndex;
     bool selected = ncclSaiSelectLocalNetByChannel(
         test.channelId, test.localNetCount, &localNetIndex);
     if (selected != test.selected || localNetIndex != test.expectedIndex) {
       fprintf(stderr,
-          "local NET case %zu failed: profile=%s channel=%d count=%d "
+          "local NET case %zu failed: profile=%s merge=%s channel=%d count=%d "
           "expected_selected=%d actual_selected=%d expected_index=%d actual_index=%d\n",
-          i, testProfile == nullptr ? "(null)" : testProfile, test.channelId,
-          test.localNetCount, test.selected, selected, test.expectedIndex, localNetIndex);
+          i, testProfile == nullptr ? "(null)" : testProfile,
+          testMergeNics == nullptr ? "(null)" : testMergeNics, test.channelId,
+          test.localNetCount, test.selected, selected, test.expectedIndex,
+          localNetIndex);
       return 1;
     }
   }
 
   testProfile = "ultrapod-fullmesh";
+  testMergeNics = "0";
   if (ncclSaiSelectLocalNetByChannel(0, 2, nullptr)) {
     fprintf(stderr, "null local NET output unexpectedly selected a rail\n");
     return 1;
   }
 
-  printf("profile activation checks passed: %zu profiles, %zu local NET cases\n",
+  const int64_t localNets[] = {0x10, 0x20, 0x30};
+  const GraphNetCase graphNetCases[] = {
+    {"ultrapod-fullmesh", "0", 0, 0x10, 2, true, 0x10},
+    {"ultrapod-fullmesh", "0", 1, 0x10, 2, true, 0x20},
+    {"ultrapod-fullmesh", "0", 6, 0x20, 2, true, 0x10},
+    {"ultrapod-fullmesh", "0", 1, 0x30, 2, false, 0x30},
+    {"ultrapod-fullmesh", "1", 1, 0x10, 2, false, 0x10},
+    {"ultrapod-fullmesh", "0", 1, 0x10, 3, false, 0x10},
+    {"ultrapod", "0", 1, 0x10, 2, false, 0x10},
+  };
+
+  for (size_t i = 0; i < sizeof(graphNetCases) / sizeof(graphNetCases[0]); i++) {
+    const GraphNetCase& test = graphNetCases[i];
+    testProfile = test.profile;
+    testMergeNics = test.mergeNics;
+    int64_t selectedNetId = test.graphNetId;
+    bool selected = ncclSaiSelectGraphNetByChannel(test.channelId,
+        test.graphNetId, localNets, test.localNetCount, &selectedNetId);
+    if (selected != test.selected || selectedNetId != test.expectedNetId) {
+      fprintf(stderr,
+          "graph NET case %zu failed: profile=%s merge=%s channel=%d "
+          "graph_net=%lx expected_selected=%d actual_selected=%d "
+          "expected_net=%lx actual_net=%lx\n",
+          i, testProfile == nullptr ? "(null)" : testProfile,
+          testMergeNics == nullptr ? "(null)" : testMergeNics,
+          test.channelId, (unsigned long)test.graphNetId, test.selected, selected,
+          (unsigned long)test.expectedNetId, (unsigned long)selectedNetId);
+      return 1;
+    }
+  }
+
+  if (ncclSaiSelectGraphNetByChannel(0, 0x10, nullptr, 2, nullptr)) {
+    fprintf(stderr, "null graph NET inputs unexpectedly selected a rail\n");
+    return 1;
+  }
+
+  printf("profile activation checks passed: %zu profiles, %zu local NET cases, "
+         "%zu graph NET cases\n",
       sizeof(cases) / sizeof(cases[0]),
-      sizeof(localNetCases) / sizeof(localNetCases[0]));
+      sizeof(localNetCases) / sizeof(localNetCases[0]),
+      sizeof(graphNetCases) / sizeof(graphNetCases[0]));
   return 0;
 }

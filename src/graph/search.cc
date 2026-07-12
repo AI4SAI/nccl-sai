@@ -7,6 +7,7 @@
 #include "comm.h"
 #include "core.h"
 #include "graph.h"
+#include "sai_profile.h"
 #include "topo.h"
 #include "transport.h"
 #include "xml.h"
@@ -1283,13 +1284,71 @@ ncclResult_t ncclTopoGetNetDev(struct ncclComm* comm, int rank, struct ncclTopoG
     int index = graph->intra[channel*ngpus] == rank ? 0 : 1;
     if (graph->pattern != NCCL_TOPO_PATTERN_NVLS) {
       netId = graph->inter[channel*2+index];
+      int64_t graphNetId = netId;
+      int64_t localNets[NCCL_TOPO_MAX_NODES];
+      int localNetCount = -1;
+      int graphNetDev = -1;
+      int localNetDev0 = -1;
+      int localNetDev1 = -1;
+      bool graphNetIsLocal = false;
+      bool railPolicySelected = false;
+
+      if (!graph->collNet && ncclParamCrossNic() == 0 &&
+          ncclSaiDualRailByChannelEnabled()) {
+        NCCLCHECK(ncclTopoGetLocalNets(
+            comm->topo, rank, localNets, &localNetCount));
+        for (int n = 0; n < localNetCount; n++) {
+          if (localNets[n] == graphNetId) graphNetIsLocal = true;
+        }
+
+        int64_t selectedNetId = graphNetId;
+        railPolicySelected = ncclSaiSelectGraphNetByChannel(
+            channelId, graphNetId, localNets, localNetCount, &selectedNetId);
+        if (railPolicySelected) {
+          netId = selectedNetId;
+        } else if (localNetCount == 2 && !graphNetIsLocal) {
+          WARN("SAI/GRAPH rail selection skipped for rank %d channel %d: "
+               "graph NET %lx is not topology-local", rank, channelId,
+               (unsigned long)graphNetId);
+        }
+
+        NCCLCHECK(ncclTopoIdToNetDev(comm->topo, graphNetId, &graphNetDev));
+        if (localNetCount > 0) {
+          NCCLCHECK(ncclTopoIdToNetDev(
+              comm->topo, localNets[0], &localNetDev0));
+        }
+        if (localNetCount > 1) {
+          NCCLCHECK(ncclTopoIdToNetDev(
+              comm->topo, localNets[1], &localNetDev1));
+        }
+      }
+
+      NCCLCHECK(ncclTopoIdToNetDev(comm->topo, netId, &netDev));
+      NCCLCHECK(ncclTopoGetIntermediateRank(
+          comm->topo, rank, netId, proxyRank));
+      if (localNetCount >= 0) {
+        INFO(NCCL_GRAPH | NCCL_NET,
+            "SAI/GRAPH rail selection rank=%d channel=%d graph=%d pattern=%d "
+            "endpoint=%d graphNet=%lx/%d localNetCount=%d "
+            "localNet0=%lx/%d localNet1=%lx/%d selectedNet=%lx/%d "
+            "proxyRank=%d graphNetIsLocal=%d policySelected=%d override=%d",
+            rank, channelId, graph->id, graph->pattern, index,
+            (unsigned long)graphNetId, graphNetDev, localNetCount,
+            (unsigned long)(localNetCount > 0 ? localNets[0] : -1), localNetDev0,
+            (unsigned long)(localNetCount > 1 ? localNets[1] : -1), localNetDev1,
+            (unsigned long)netId, netDev,
+            proxyRank == nullptr ? -1 : *proxyRank,
+            graphNetIsLocal, railPolicySelected,
+            railPolicySelected && netId != graphNetId);
+      }
     } else {
       NCCLCHECK(getNvlsNetDev(comm, graph, channelId, &netId));
+      NCCLCHECK(ncclTopoIdToNetDev(comm->topo, netId, &netDev));
+      NCCLCHECK(ncclTopoGetIntermediateRank(
+          comm->topo, rank, netId, proxyRank));
     }
-    NCCLCHECK(ncclTopoIdToNetDev(comm->topo, netId, &netDev));
     if (dev) *dev = netDev;
     if (id) *id = netId;
-    NCCLCHECK(ncclTopoGetIntermediateRank(comm->topo, rank, netId, proxyRank));
   } else if (peerRank == -1) {
     return ncclInternalError;
   } else {
