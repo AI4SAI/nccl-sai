@@ -185,23 +185,12 @@ static inline bool ncclSaiSelectLocalNetByChannel(
 }
 
 static inline bool ncclSaiSelectGraphNetByChannel(int channelId,
-    int64_t graphNetId, const int64_t* localNets, int localNetCount,
-    int64_t* selectedNetId) {
+    const int64_t* localNets, int localNetCount, int64_t* selectedNetId) {
   if (localNets == nullptr || selectedNetId == nullptr) return false;
 
   int localNetIndex = 0;
   if (!ncclSaiSelectLocalNetByChannel(
           channelId, localNetCount, &localNetIndex)) return false;
-
-  bool graphNetIsLocal = false;
-  for (int n = 0; n < localNetCount; n++) {
-    if (localNets[n] == graphNetId) {
-      graphNetIsLocal = true;
-      break;
-    }
-  }
-  if (!graphNetIsLocal) return false;
-
   *selectedNetId = localNets[localNetIndex];
   return true;
 }

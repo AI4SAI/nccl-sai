@@ -273,7 +273,7 @@ int main() {
     {"ultrapod-fullmesh", "0", 0, 0x10, 2, true, 0x10},
     {"ultrapod-fullmesh", "0", 1, 0x10, 2, true, 0x20},
     {"ultrapod-fullmesh", "0", 6, 0x20, 2, true, 0x10},
-    {"ultrapod-fullmesh", "0", 1, 0x30, 2, false, 0x30},
+    {"ultrapod-fullmesh", "0", 1, 0x30, 2, true, 0x20},
     {"ultrapod-fullmesh", "1", 1, 0x10, 2, false, 0x10},
     {"ultrapod-fullmesh", "0", 1, 0x10, 3, false, 0x10},
     {"ultrapod", "0", 1, 0x10, 2, false, 0x10},
@@ -284,8 +284,8 @@ int main() {
     testProfile = test.profile;
     testMergeNics = test.mergeNics;
     int64_t selectedNetId = test.graphNetId;
-    bool selected = ncclSaiSelectGraphNetByChannel(test.channelId,
-        test.graphNetId, localNets, test.localNetCount, &selectedNetId);
+    bool selected = ncclSaiSelectGraphNetByChannel(
+        test.channelId, localNets, test.localNetCount, &selectedNetId);
     if (selected != test.selected || selectedNetId != test.expectedNetId) {
       fprintf(stderr,
           "graph NET case %zu failed: profile=%s merge=%s channel=%d "
@@ -299,7 +299,7 @@ int main() {
     }
   }
 
-  if (ncclSaiSelectGraphNetByChannel(0, 0x10, nullptr, 2, nullptr)) {
+  if (ncclSaiSelectGraphNetByChannel(0, nullptr, 2, nullptr)) {
     fprintf(stderr, "null graph NET inputs unexpectedly selected a rail\n");
     return 1;
   }

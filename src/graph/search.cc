@@ -1301,15 +1301,13 @@ ncclResult_t ncclTopoGetNetDev(struct ncclComm* comm, int rank, struct ncclTopoG
           if (localNets[n] == graphNetId) graphNetIsLocal = true;
         }
 
+        // graph->inter may intentionally name a non-local NIC. On this profile,
+        // keep the endpoint on its own channel-aligned rail and recompute PXN.
         int64_t selectedNetId = graphNetId;
         railPolicySelected = ncclSaiSelectGraphNetByChannel(
-            channelId, graphNetId, localNets, localNetCount, &selectedNetId);
+            channelId, localNets, localNetCount, &selectedNetId);
         if (railPolicySelected) {
           netId = selectedNetId;
-        } else if (localNetCount == 2 && !graphNetIsLocal) {
-          WARN("SAI/GRAPH rail selection skipped for rank %d channel %d: "
-               "graph NET %lx is not topology-local", rank, channelId,
-               (unsigned long)graphNetId);
         }
 
         NCCLCHECK(ncclTopoIdToNetDev(comm->topo, graphNetId, &graphNetDev));
