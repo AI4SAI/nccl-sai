@@ -9,11 +9,14 @@ The first optimized API is `ncclAlltoAll()`: eligible small messages use a
 two-stage GPU-island aggregation path, while eligible large messages use a
 phased P2P planner. NCCL-SAI also has a narrowly guarded local P2P
 transport-selection path that can affect any operation on an eligible
-single-host communicator. On the `ultrapod-fullmesh` profile, GPUs with exactly
-two local network devices use channel parity to keep channel traffic aligned to
-the two rails. Other profiles and local-network-device counts retain upstream
-selection. Collective algorithms remain unchanged unless explicitly documented
-and validated. See
+single-host communicator. The validated dual-rail mode requires
+`NCCL_SAI_FABRIC_PROFILE=ultrapod-fullmesh`, `NCCL_IB_MERGE_NICS=0`, and
+`NCCL_CROSS_NIC=0`. GPUs with exactly two topology-local network devices then
+use channel parity, and ordinary ring/tree graph endpoints use the corresponding
+local device; CollNet and NVLS endpoint selection remains unchanged. Other
+profiles and ineligible layouts retain the corresponding upstream path.
+Collective algorithms remain unchanged unless explicitly documented and
+validated. See
 `docs/sai/README.md` and `docs/sai/COMMUNICATION_TUNING_MATRIX.md` for scope,
 rollback knobs, and validation requirements.
 
@@ -26,11 +29,11 @@ For SAI users, the intended runtime mode is drop-in replacement: put the
 NCCL-SAI build's `lib/` directory before the system NCCL in `LD_LIBRARY_PATH`.
 SAI site modules or prologs can enable transparent SAI behavior by setting
 `NCCL_SAI_FABRIC_PROFILE` to a recognized product-family profile. The current
-island and phased AlltoAll defaults are selected by `ultrapod-fullmesh`;
-that profile also enables the exactly-two-local-NET channel alignment described
-above. Broader family names such as `ultrapod` and `slimpod` are recognized
-activation namespaces but do not imply that the same topology-specific behavior
-is valid for every layout.
+island and phased AlltoAll defaults are selected by `ultrapod-fullmesh`. The
+dual-rail behavior described above additionally requires explicit merge- and
+cross-NIC settings. Broader family names such as `ultrapod` and `slimpod` are
+recognized activation namespaces but do not imply that the same
+topology-specific behavior is valid for every layout.
 Unknown profile names and unsupported layouts fall back to upstream NCCL
 behavior unless an expert explicitly opts in with `NCCL_SAI_A2A_ENABLE=1` and
 the related controls.

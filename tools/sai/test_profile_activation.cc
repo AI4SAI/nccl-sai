@@ -43,6 +43,14 @@ struct GraphNetCase {
   int64_t expectedNetId;
 };
 
+struct GraphRailActivationCase {
+  const char* profile;
+  const char* mergeNics;
+  int crossNic;
+  bool collNet;
+  bool enabled;
+};
+
 int main() {
   const uint32_t ncclVersion = 22809;
   if (NCCL_SAI_INIT_SCHEMA_TAG != 0x5b7u) {
@@ -224,6 +232,38 @@ int main() {
     return 1;
   }
 
+  const GraphRailActivationCase graphRailActivationCases[] = {
+    {"ultrapod-fullmesh", "0", 0, false, true},
+    {"ultrapod-fullmesh-site_a.2", "0", 0, false, true},
+    {"ultrapod-fullmesh", nullptr, 0, false, false},
+    {"ultrapod-fullmesh", "1", 0, false, false},
+    {"ultrapod-fullmesh", "0", 1, false, false},
+    {"ultrapod-fullmesh", "0", 2, false, false},
+    {"ultrapod-fullmesh", "0", 0, true, false},
+    {"ultrapod", "0", 0, false, false},
+    {nullptr, "0", 0, false, false},
+  };
+
+  for (size_t i = 0;
+       i < sizeof(graphRailActivationCases) /
+           sizeof(graphRailActivationCases[0]);
+       i++) {
+    const GraphRailActivationCase& test = graphRailActivationCases[i];
+    testProfile = test.profile;
+    testMergeNics = test.mergeNics;
+    bool actual = ncclSaiGraphRailByChannelEnabled(
+        test.crossNic, test.collNet);
+    if (actual != test.enabled) {
+      fprintf(stderr,
+          "graph rail activation case %zu failed: profile=%s merge=%s "
+          "cross_nic=%d coll_net=%d expected=%d actual=%d\n",
+          i, testProfile == nullptr ? "(null)" : testProfile,
+          testMergeNics == nullptr ? "(null)" : testMergeNics,
+          test.crossNic, test.collNet, test.enabled, actual);
+      return 1;
+    }
+  }
+
   const LocalNetCase localNetCases[] = {
     {"ultrapod-fullmesh", "0", 0, 2, 1, true, 0},
     {"ultrapod-fullmesh", "0", 1, 2, 0, true, 1},
@@ -304,9 +344,11 @@ int main() {
     return 1;
   }
 
-  printf("profile activation checks passed: %zu profiles, %zu local NET cases, "
+  printf("profile activation checks passed: %zu profiles, "
+         "%zu graph rail activation cases, %zu local NET cases, "
          "%zu graph NET cases\n",
       sizeof(cases) / sizeof(cases[0]),
+      sizeof(graphRailActivationCases) / sizeof(graphRailActivationCases[0]),
       sizeof(localNetCases) / sizeof(localNetCases[0]),
       sizeof(graphNetCases) / sizeof(graphNetCases[0]));
   return 0;

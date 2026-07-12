@@ -1,8 +1,8 @@
-# NCCL-SAI Public Release Notes Draft
+# NCCL-SAI v2.28.9-1-sai.1 Release Notes
 
-NCCL-SAI is an AI4SAI optimization branch derived from NVIDIA NCCL. The current
-source candidate is based on NCCL `v2.28.9-1` and targets SAI UltraPOD and
-SlimPOD GPU fabric families.
+NCCL-SAI is an AI4SAI optimization release derived from NVIDIA NCCL. This
+release is based on NCCL `v2.28.9-1` and targets SAI UltraPOD and SlimPOD GPU
+fabric families.
 
 NCCL-SAI modifications are maintained by AI4SAI/SAI contributors. This project
 is not endorsed by NVIDIA. Original NVIDIA NCCL copyright and license notices
@@ -24,30 +24,41 @@ for an eligible single-host 8-rank, two-island communicator. That path can
 affect any operation using local P2P transport, while the allreduce, allgather,
 reduce-scatter, broadcast, and reduce collective algorithms remain unchanged.
 
-For the `ultrapod-fullmesh` profile, a GPU with exactly two topology-local NET
-candidates selects them by channel parity. This keeps both endpoints of a
-channel aligned to the same rail on the validated symmetric dual-rail topology.
-The rule does not activate for broader family-only profiles, unknown profiles,
-or any other local-NET count; those cases retain upstream selection.
+The validated dual-rail mode requires
+`NCCL_SAI_FABRIC_PROFILE=ultrapod-fullmesh`, `NCCL_IB_MERGE_NICS=0`, and
+`NCCL_CROSS_NIC=0`. A GPU with exactly two topology-local NET candidates then
+selects them by channel parity. Ordinary ring/tree graph endpoints use the same
+channel-aligned local NET and recompute the network device and proxy rank;
+CollNet and NVLS graphs retain their existing endpoint selection. Broader
+family-only profiles, merged-NIC mode, nonzero cross-NIC mode, and any other
+local-NET count retain the corresponding upstream path.
 
 ## Transparent Runtime Model
 
-SAI sites can enable default NCCL-SAI behavior by setting:
+SAI sites can enable the validated AlltoAll defaults and dual-rail mode with:
 
 ```bash
 export NCCL_SAI_FABRIC_PROFILE=ultrapod-fullmesh
+export NCCL_IB_MERGE_NICS=0
+export NCCL_CROSS_NIC=0
 ```
 
 The recognized public families are `ultrapod` and `slimpod`; a nonempty
-`-<variant>` suffix is accepted for site packaging. The current island and
-phased defaults and the guarded exactly-two-local-NET channel alignment are
-specific to the `ultrapod-fullmesh` profile; recognizing a broader family name
-does not enable those topology-specific paths. Empty, unknown, or
-disabled-style values such as `0`, `false`, `off`, `none`, `native`, and
-`upstream` fail closed to upstream behavior.
+`-<variant>` suffix is accepted for site packaging. The profile selects the
+current island and phased defaults. Dual-rail local-NET selection additionally
+requires NIC merging to be explicitly disabled, and ordinary ring/tree graph
+endpoint override additionally requires cross-NIC mode to be explicitly
+disabled. Recognizing a broader family name does not enable those
+topology-specific paths. Empty, unknown, or disabled-style profile values such
+as `0`, `false`, `off`, `none`, `native`, and `upstream` fail closed to upstream
+behavior.
 
 Explicit overrides:
 
+- `NCCL_IB_MERGE_NICS=0`: keep the two validated physical NET candidates
+  separate so channel-parity selection can activate.
+- `NCCL_CROSS_NIC=0`: allow the ordinary ring/tree graph endpoint override;
+  other values retain the graph-selected endpoint.
 - `NCCL_SAI_A2A_ENABLE=1`: enable the alltoall SAI path.
 - `NCCL_SAI_A2A_ENABLE=0`: disable the alltoall SAI path.
 - `NCCL_SAI_A2A_ISLAND_ENABLE=0`: disable the small-message island path while
@@ -79,45 +90,48 @@ and pattern variables. Parsing and communicator-wide completeness checks fail
 closed; no scheduler command, file lookup, or fabric-management query occurs in
 the library.
 
-## Preliminary Performance Boundary
+## Historical RC1 Performance Boundary
 
 In the published RC1, a sustained same-domain 64-GPU `alltoall_perf` run using
-a 1 GiB per-rank test size measured 6.16 GB/s bus bandwidth on the eligible
+a 1 GiB per-rank test size measured 6.09 GB/s bus bandwidth on the eligible
 out-of-place phased path. Disabling the NCCL-SAI AlltoAll policy in the same
-build measured 4.80 GB/s. The exactly aliased benchmark path remained upstream
-at 4.76 GB/s, producing a combined average of 5.46 GB/s.
+build measured 4.78 GB/s. The exactly aliased benchmark path remained upstream
+at 4.71 GB/s, producing a combined average of 5.40 GB/s.
 
 This historical RC1 result demonstrates recovery of large out-of-place
 AlltoAll performance on the validated topology class. It does not qualify the
 new island path or demonstrate a universal application-level speedup. Public
 island performance claims remain gated on a clean exact-binary scale run.
 
-## Release Scope
+## Release Qualification
 
-This draft describes a source-level public candidate. Public binary packages
-should be published only after clean rebuild, architecture coverage, and
-sanitized validation evidence are available. Build and packaging expectations
-are documented in `docs/sai/BUILD_AND_PACKAGING.md`.
+The binary package distributed with this release passed the release gates
+recorded in its sanitized `RUNTIME_EVIDENCE.json`. Its `BUILD_INFO.txt` binds
+the exact source commit, source tree, source archive SHA256, shared-library
+SHA256, static-library SHA256, CUDA architecture coverage, and portable host
+ISA. Matching checksums and contents manifests are published with the source
+and binary assets.
 
-Minimum public gates:
+The build audit records the clean source identity, advertised SASS/PTX
+architecture coverage, portable host ISA target, package contents, and library
+digests. Communication, topology, message-size, CUDA Graph, fallback, and
+cross-collective claims are limited to the exact gate entries present in the
+published sanitized evidence summary. A gate or scale class not listed there
+is not claimed by this release.
 
-- clean source build;
-- CUDA SASS/PTX coverage and portable host ISA target evidence for the advertised
-  package;
-- single-node, same-domain, cross-domain, and multi-domain alltoall;
-- KB, MB, and GB message-size coverage;
-- CUDA Graph capture and replay through the enqueue-based paths;
-- allreduce, reduce-scatter, allgather, broadcast, and P2P non-regression;
-- fallback behavior when `NCCL_SAI_FABRIC_PROFILE` is unset or unrecognized.
+Application acceptance is a separate private gate bound to the exact final
+shared-library hash. Private workloads, scheduler records, and raw application
+logs are not release assets. This release does not use application acceptance
+as island-path evidence and does not claim a VASP application speedup.
 
 For the full-mesh layout class with 16 equal-bandwidth endpoints per group and
-one equal-bandwidth direct edge per group pair, final headline performance
-qualification must use 16-18 complete, uniformly occupied groups. Smaller
+one equal-bandwidth direct edge per group pair, any new headline performance
+qualification requires 16-18 complete, uniformly occupied groups. Smaller
 layouts remain correctness or topology-normalized efficiency evidence.
 
 ## Not Claimed
 
-This release draft does not claim:
+This release does not claim:
 
 - universal speedup for all NCCL or MPI collectives;
 - application-level speedup for programs that do not use the optimized path;
@@ -128,9 +142,9 @@ This release draft does not claim:
 
 ## Redistribution
 
-Publish under the `AI4SAI` organization as a public NCCL-SAI repository derived
-from NVIDIA NCCL. Keep upstream license files and copyright notices intact.
-Keep upstream provenance explicit through documentation, tags, and an upstream
-remote, but do not imply NVIDIA endorsement. Binary packages or tarballs must
-include `LICENSE.txt`, `docs/sai/NOTICE.md`, and release notes that reproduce
-the required upstream notice/disclaimer boundary.
+This release is published under the `AI4SAI` organization in a public NCCL-SAI
+repository derived from NVIDIA NCCL. Upstream license files and copyright
+notices remain intact, and the repository keeps upstream provenance explicit
+without implying NVIDIA endorsement. Binary packages and tarballs include
+`LICENSE.txt`, `docs/sai/NOTICE.md`, and release notes that reproduce the
+required upstream notice/disclaimer boundary.

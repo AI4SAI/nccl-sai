@@ -1293,8 +1293,8 @@ ncclResult_t ncclTopoGetNetDev(struct ncclComm* comm, int rank, struct ncclTopoG
       bool graphNetIsLocal = false;
       bool railPolicySelected = false;
 
-      if (!graph->collNet && ncclParamCrossNic() == 0 &&
-          ncclSaiDualRailByChannelEnabled()) {
+      if (ncclSaiGraphRailByChannelEnabled(
+              ncclParamCrossNic(), graph->collNet)) {
         NCCLCHECK(ncclTopoGetLocalNets(
             comm->topo, rank, localNets, &localNetCount));
         for (int n = 0; n < localNetCount; n++) {
@@ -1302,7 +1302,8 @@ ncclResult_t ncclTopoGetNetDev(struct ncclComm* comm, int rank, struct ncclTopoG
         }
 
         // graph->inter may intentionally name a non-local NIC. On this profile,
-        // keep the endpoint on its own channel-aligned rail and recompute PXN.
+        // keep the endpoint on its own channel-aligned rail and recompute its
+        // network device and proxy rank.
         int64_t selectedNetId = graphNetId;
         railPolicySelected = ncclSaiSelectGraphNetByChannel(
             channelId, localNets, localNetCount, &selectedNetId);

@@ -23,9 +23,10 @@ paths. Sites enable NCCL-SAI through generic controls:
   recognized product families. Current public families are `ultrapod` and
   `slimpod`; matching is case-insensitive.
 - `NCCL_SAI_FABRIC_PROFILE=ultrapod-fullmesh` selects the currently validated
-  island and phased AlltoAll defaults and the guarded dual-rail local-NET
-  selection described below. A family name alone does not assert that one
-  topology-specific behavior is valid for every product in that family.
+  island and phased AlltoAll defaults. It is also one of the required gates for
+  the dual-rail behavior described below; the profile alone does not enable
+  that behavior. A family name alone does not assert that one topology-specific
+  behavior is valid for every product in that family.
 - Empty, unknown, or disabled-style values such as `0`, `false`, `off`,
   `none`, `native`, and `upstream` fail closed to upstream behavior.
 - `NCCL_SAI_A2A_ENABLE=1` explicitly enables the AlltoAll policy.
@@ -41,16 +42,33 @@ NCCL-SAI follows upstream NCCL behavior.
 
 ### Dual-Rail Local-NET Selection
 
-When `NCCL_SAI_FABRIC_PROFILE=ultrapod-fullmesh` is active and a GPU has exactly
-two local NET candidates, even channels select the first topology-local NET and
-odd channels select the second. This keeps both endpoints of a channel aligned
-to the same rail on the validated symmetric dual-rail topology.
+The validated dual-rail runtime mode requires all three public controls:
 
-The rule does not activate when the profile is unset or unrecognized, for
-broader family-only profiles, or when the GPU has one or more than two local NET
-candidates. Those cases retain the upstream GPU-, topology-, and channel-based
-selection unchanged. No additional site-specific environment variable is
-required.
+```bash
+export NCCL_SAI_FABRIC_PROFILE=ultrapod-fullmesh
+export NCCL_IB_MERGE_NICS=0
+export NCCL_CROSS_NIC=0
+```
+
+The activation matrix is:
+
+| Behavior | Required conditions |
+| --- | --- |
+| Topology-local NET selection by channel parity | The full-mesh profile is active, `NCCL_IB_MERGE_NICS` is exactly `0`, and the calling GPU has exactly two topology-local NET candidates. |
+| Ordinary ring/tree graph endpoint override | All local-NET conditions above, plus `NCCL_CROSS_NIC=0`; CollNet and NVLS graphs retain their existing endpoint selection. |
+
+With those gates satisfied, even channels select the first topology-local NET
+and odd channels select the second. For ordinary ring and tree graphs, a graph
+endpoint is replaced by that channel-aligned local NET and its network device
+and proxy rank are recomputed. This keeps both endpoints of a channel aligned
+to the same rail on the validated symmetric dual-rail topology, including when
+the original graph endpoint is not topology-local to the calling rank.
+
+If the profile is unset or unrecognized, NIC merging is not explicitly
+disabled, or the GPU has any local-NET count other than two, the parity selector
+does not activate. If `NCCL_CROSS_NIC` does not resolve to `0`, or the graph is
+a CollNet or NVLS graph, the graph endpoint override does not activate. Each
+ineligible path retains its upstream selection behavior.
 
 ## AlltoAll Paths
 
@@ -199,11 +217,11 @@ topology-normalized efficiency evidence, not the ideal full-fabric result.
 
 The published RC1 has a sustained same-domain 64-GPU result for a
 1 GiB per-rank `alltoall_perf` case: the eligible out-of-place path measured
-6.16 GB/s bus bandwidth versus 4.80 GB/s through the upstream scheduler in the
+6.09 GB/s bus bandwidth versus 4.78 GB/s through the upstream scheduler in the
 same NCCL-SAI build. In that RC1, the exactly aliased case remained on the
-upstream path, so the combined benchmark average was 5.46 GB/s. This historical
-result does not qualify the newer island path; it is a scoped AlltoAll result,
-not a universal application or collective speedup claim.
+upstream path at 4.71 GB/s, so the combined benchmark average was 5.40 GB/s.
+This historical result does not qualify the newer island path; it is a scoped
+AlltoAll result, not a universal application or collective speedup claim.
 
 ## Offline Checks
 
@@ -217,8 +235,8 @@ python3 tools/sai/verify_a2a_algorithms.py --full-scale
 ```
 
 CI also compiles and runs `tools/sai/test_profile_activation.cc` to keep
-profile recognition, dual-rail local-NET selection, and metadata parsing
-fail-closed.
+profile recognition, the merge/cross-NIC dual-rail activation matrix,
+local-NET selection, and metadata parsing fail-closed.
 
 ## License And Notice
 

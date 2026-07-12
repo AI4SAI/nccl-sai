@@ -173,6 +173,11 @@ static inline bool ncclSaiDualRailByChannelEnabled() {
       strcmp(mergeNics, "0") == 0;
 }
 
+static inline bool ncclSaiGraphRailByChannelEnabled(
+    int crossNic, bool collNet) {
+  return crossNic == 0 && !collNet && ncclSaiDualRailByChannelEnabled();
+}
+
 // The target full-mesh topology exposes exactly two local network rails per GPU
 // with NIC merging disabled. Keep this override fail-closed so every other
 // profile and topology uses the upstream local-NET index.
