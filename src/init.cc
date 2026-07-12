@@ -21,6 +21,7 @@
 #include "profiler.h"
 #include "mnnvl.h"
 #include "sai_profile.h"
+#include <algorithm>
 #include <limits.h>
 #include <fcntl.h>
 #include <string.h>
@@ -261,6 +262,11 @@ static ncclResult_t commFree(ncclComm_t comm) {
     }
   }
 
+  if (comm->saiA2a.islandScratch != nullptr) {
+    CUDACHECK(cudaFree(comm->saiA2a.islandScratch));
+    comm->saiA2a.islandScratch = nullptr;
+    comm->saiA2a.islandScratchBytes = 0;
+  }
   if (comm->memPool) CUDACHECK(cudaMemPoolDestroy(comm->memPool));
 
   delete[] comm->userRedOps;
@@ -278,6 +284,9 @@ static ncclResult_t commFree(ncclComm_t comm) {
   free(comm->rankToNode);
   free(comm->rankToLocalRank);
   free(comm->saiA2a.nodeToFabricGroup);
+  free(comm->saiA2a.fabricGroupCounts);
+  free(comm->saiA2a.raggedRoundOrder);
+  free(comm->saiA2a.raggedPhaseEnds);
   free(comm->collNetHeads);
   free(comm->clique.ranks);
 
@@ -771,16 +780,417 @@ static ncclResult_t initNvlDomainInfo(struct ncclComm* comm) {
 
 NCCL_PARAM(GroupSize, "P2P_SCHEDULE_GROUP_SIZE", NCCL_MAX_DEV_WORK_P2P_PER_BATCH);
 NCCL_PARAM(SaiP2pFabricGroupSchedule, "SAI_P2P_FABRIC_GROUP_SCHEDULE", -1);
-NCCL_PARAM(SaiP2pFabricNodes, "SAI_P2P_FABRIC_NODES", -1);
 
-static ncclResult_t ncclP2pSchedule(struct ncclComm* comm) {
-  struct ncclNodeRanks* nodeRanks = comm->nodeRanks;
-  // For MNNVL systems, we need to split the nodes into different groups to guarantee the proper PXN aggregation factor.
-  int groupSize = (comm->nNodes > 1) ? ncclParamGroupSize() : comm->maxLocalRanks;
-  for (int node = 0; node < comm->nNodes; node++) {
-    int localRanks = nodeRanks[node].localRanks;
-    if (localRanks % groupSize != 0 || localRanks < groupSize) groupSize = gcd(groupSize, nodeRanks[node].localRanks);
+static ncclResult_t ncclSaiRaggedShiftPhases(int nRankGroups, int nFabricGroups,
+    const int* rankGroupToFabric, int** shiftOrderOut, uint8_t** phaseEndsOut,
+    bool* useGreedyOrderOut, int* sumPhaseMaxOut, int* densestEdgeOut) {
+  ncclResult_t ret = ncclSuccess;
+  int *groupCounts = NULL, *shiftMax = NULL, *shiftCross = NULL;
+  int *sortedShifts = NULL, *phaseSizes = NULL, *phaseLoads = NULL;
+  int *phaseShifts = NULL, *shiftOrder = NULL;
+  int *baselinePhaseLoad = NULL, *shiftLoads = NULL;
+  uint8_t* phaseEnds = NULL;
+  int edgeCount = 0, nPhases = 0;
+  int fullPhases = 0, remainder = 0;
+  int output = 0, sumPhaseMax = 0, densestEdge = 0;
+  int baselineOutput = 0, baselinePhaseSize = 0, baselineScore = 0;
+  int baselinePow2 = 0;
+  size_t shiftLoadCount = 0;
+  uint32_t baselineRound = 0, baselineDelta = 0;
+  bool useGreedyOrder = false;
+  if (shiftOrderOut == NULL || phaseEndsOut == NULL || useGreedyOrderOut == NULL ||
+      rankGroupToFabric == NULL ||
+      nRankGroups <= 0 || nFabricGroups <= 1 ||
+      nFabricGroups > INT_MAX / nFabricGroups) return ncclInvalidArgument;
+  *shiftOrderOut = NULL;
+  *phaseEndsOut = NULL;
+  *useGreedyOrderOut = false;
+
+  edgeCount = nFabricGroups * nFabricGroups;
+  nPhases = (nRankGroups + nFabricGroups - 1) / nFabricGroups;
+  if ((size_t)nRankGroups > SIZE_MAX / (size_t)edgeCount ||
+      (size_t)nPhases > SIZE_MAX / (size_t)edgeCount ||
+      (size_t)nPhases > SIZE_MAX / (size_t)nFabricGroups) return ncclInvalidArgument;
+  shiftLoadCount = (size_t)nRankGroups * edgeCount;
+  NCCLCHECKGOTO(ncclCalloc(&groupCounts, nFabricGroups), ret, fail);
+  NCCLCHECKGOTO(ncclCalloc(&shiftLoads, shiftLoadCount), ret, fail);
+  NCCLCHECKGOTO(ncclCalloc(&shiftMax, nRankGroups), ret, fail);
+  NCCLCHECKGOTO(ncclCalloc(&shiftCross, nRankGroups), ret, fail);
+  NCCLCHECKGOTO(ncclCalloc(&sortedShifts, nRankGroups), ret, fail);
+  NCCLCHECKGOTO(ncclCalloc(&phaseSizes, nPhases), ret, fail);
+  NCCLCHECKGOTO(ncclCalloc(&phaseLoads, (size_t)nPhases * edgeCount), ret, fail);
+  NCCLCHECKGOTO(ncclCalloc(&phaseShifts, (size_t)nPhases * nFabricGroups), ret, fail);
+  NCCLCHECKGOTO(ncclCalloc(&shiftOrder, nRankGroups), ret, fail);
+  NCCLCHECKGOTO(ncclCalloc(&phaseEnds, nRankGroups), ret, fail);
+  NCCLCHECKGOTO(ncclCalloc(&baselinePhaseLoad, edgeCount), ret, fail);
+
+  for (int group = 0; group < nRankGroups; group++) {
+    int fabric = rankGroupToFabric[group];
+    if (fabric < 0 || fabric >= nFabricGroups) {
+      ret = ncclInvalidArgument;
+      goto fail;
+    }
+    groupCounts[fabric]++;
   }
+  for (int shift = 0; shift < nRankGroups; shift++) {
+    sortedShifts[shift] = shift;
+    int* load = shiftLoads + (size_t)shift * edgeCount;
+    for (int source = 0; source < nRankGroups; source++) {
+      int sourceFabric = rankGroupToFabric[source];
+      int destinationFabric = rankGroupToFabric[(source + shift) % nRankGroups];
+      if (sourceFabric == destinationFabric) continue;
+      int edge = sourceFabric * nFabricGroups + destinationFabric;
+      load[edge]++;
+      shiftCross[shift]++;
+      shiftMax[shift] = std::max(shiftMax[shift], load[edge]);
+    }
+  }
+  std::sort(sortedShifts, sortedShifts + nRankGroups,
+      [shiftMax, shiftCross](int left, int right) {
+        if (shiftMax[left] != shiftMax[right]) return shiftMax[left] > shiftMax[right];
+        if (shiftCross[left] != shiftCross[right]) return shiftCross[left] > shiftCross[right];
+        return left < right;
+      });
+
+  fullPhases = nRankGroups / nFabricGroups;
+  remainder = nRankGroups % nFabricGroups;
+  for (int sorted = 0; sorted < nRankGroups; sorted++) {
+    int shift = sortedShifts[sorted];
+    int bestPhase = -1, bestIncrease = 0, bestMaximum = 0, bestSize = 0;
+    uint64_t bestDeviation = 0;
+    for (int phase = 0; phase < nPhases; phase++) {
+      int capacity = phase < fullPhases ? nFabricGroups : remainder;
+      if (capacity == 0) capacity = nFabricGroups;
+      if (phaseSizes[phase] >= capacity) continue;
+      int oldMaximum = 0, newMaximum = 0;
+      uint64_t deviation = 0;
+      int* current = phaseLoads + (size_t)phase * edgeCount;
+      int* addition = shiftLoads + (size_t)shift * edgeCount;
+      for (int sourceFabric = 0; sourceFabric < nFabricGroups; sourceFabric++) {
+        for (int destinationFabric = 0; destinationFabric < nFabricGroups; destinationFabric++) {
+          if (sourceFabric == destinationFabric) continue;
+          int edge = sourceFabric * nFabricGroups + destinationFabric;
+          int merged = current[edge] + addition[edge];
+          oldMaximum = std::max(oldMaximum, current[edge]);
+          newMaximum = std::max(newMaximum, merged);
+          int64_t target = (int64_t)groupCounts[sourceFabric] * groupCounts[destinationFabric];
+          int64_t delta = (int64_t)merged * nPhases - target;
+          deviation += (uint64_t)(delta * delta);
+        }
+      }
+      int increase = newMaximum - oldMaximum;
+      bool better = bestPhase < 0 || increase < bestIncrease ||
+          (increase == bestIncrease && newMaximum < bestMaximum) ||
+          (increase == bestIncrease && newMaximum == bestMaximum && deviation < bestDeviation) ||
+          (increase == bestIncrease && newMaximum == bestMaximum && deviation == bestDeviation &&
+           phaseSizes[phase] < bestSize);
+      if (better) {
+        bestPhase = phase;
+        bestIncrease = increase;
+        bestMaximum = newMaximum;
+        bestDeviation = deviation;
+        bestSize = phaseSizes[phase];
+      }
+    }
+    if (bestPhase < 0) {
+      ret = ncclInternalError;
+      goto fail;
+    }
+    int slot = phaseSizes[bestPhase]++;
+    phaseShifts[(size_t)bestPhase * nFabricGroups + slot] = shift;
+    int* destination = phaseLoads + (size_t)bestPhase * edgeCount;
+    int* addition = shiftLoads + (size_t)shift * edgeCount;
+    for (int edge = 0; edge < edgeCount; edge++) destination[edge] += addition[edge];
+  }
+
+  for (int sourceFabric = 0; sourceFabric < nFabricGroups; sourceFabric++) {
+    for (int destinationFabric = 0; destinationFabric < nFabricGroups; destinationFabric++) {
+      if (sourceFabric == destinationFabric) continue;
+      densestEdge = std::max(densestEdge,
+          groupCounts[sourceFabric] * groupCounts[destinationFabric]);
+    }
+  }
+  for (int phase = 0; phase < nPhases; phase++) {
+    int phaseMaximum = 0;
+    int* load = phaseLoads + (size_t)phase * edgeCount;
+    for (int edge = 0; edge < edgeCount; edge++) phaseMaximum = std::max(phaseMaximum, load[edge]);
+    sumPhaseMax += phaseMaximum;
+    for (int slot = 0; slot < phaseSizes[phase]; slot++) {
+      shiftOrder[output++] = phaseShifts[(size_t)phase * nFabricGroups + slot];
+    }
+    if (output > 0) phaseEnds[output - 1] = 1;
+  }
+  if (output != nRankGroups) {
+    ret = ncclInternalError;
+    goto fail;
+  }
+  baselinePow2 = pow2Up(nRankGroups);
+  do {
+    if (baselineDelta < (uint32_t)nRankGroups) {
+      sortedShifts[baselineOutput++] = (int)baselineDelta;
+      for (int source = 0; source < nRankGroups; source++) {
+        int sourceFabric = rankGroupToFabric[source];
+        int destinationFabric = rankGroupToFabric[(source + baselineDelta) % nRankGroups];
+        if (sourceFabric != destinationFabric) {
+          baselinePhaseLoad[sourceFabric * nFabricGroups + destinationFabric]++;
+        }
+      }
+      baselinePhaseSize++;
+      if (baselinePhaseSize == nFabricGroups || baselineOutput == nRankGroups) {
+        int phaseMaximum = 0;
+        for (int edge = 0; edge < edgeCount; edge++) {
+          phaseMaximum = std::max(phaseMaximum, baselinePhaseLoad[edge]);
+          baselinePhaseLoad[edge] = 0;
+        }
+        baselineScore += phaseMaximum;
+        baselinePhaseSize = 0;
+      }
+    }
+    baselineRound++;
+    baselineDelta = (baselineDelta + baselineRound) & (baselinePow2 - 1);
+  } while (baselineRound != (uint32_t)baselinePow2);
+  useGreedyOrder = sumPhaseMax < baselineScore;
+  if (!useGreedyOrder) {
+    memcpy(shiftOrder, sortedShifts, (size_t)nRankGroups * sizeof(int));
+    memset(phaseEnds, 0, (size_t)nRankGroups * sizeof(uint8_t));
+    for (int begin = 0; begin < nRankGroups; begin += nFabricGroups) {
+      phaseEnds[std::min(nRankGroups, begin + nFabricGroups) - 1] = 1;
+    }
+    sumPhaseMax = baselineScore;
+  }
+  *shiftOrderOut = shiftOrder;
+  *phaseEndsOut = phaseEnds;
+  *useGreedyOrderOut = useGreedyOrder;
+  if (sumPhaseMaxOut != NULL) *sumPhaseMaxOut = sumPhaseMax;
+  if (densestEdgeOut != NULL) *densestEdgeOut = densestEdge;
+  shiftOrder = NULL;
+  phaseEnds = NULL;
+
+fail:
+  free(groupCounts);
+  free(shiftLoads);
+  free(shiftMax);
+  free(shiftCross);
+  free(sortedShifts);
+  free(phaseSizes);
+  free(phaseLoads);
+  free(phaseShifts);
+  free(baselinePhaseLoad);
+  free(shiftOrder);
+  free(phaseEnds);
+  return ret;
+}
+
+static ncclResult_t ncclSaiBuildRaggedRoundOrder(struct ncclComm* comm,
+    int nRankGroups, int rankGroupSize, const int* groupToNode) {
+  ncclResult_t ret = ncclSuccess;
+  int *rankGroupToFabric = NULL, *shiftOrder = NULL, *shiftToNativeBlock = NULL;
+  int* roundOrder = NULL;
+  uint8_t *shiftPhaseEnds = NULL, *phaseEnds = NULL, *seenRounds = NULL;
+  bool useGreedyOrder = false;
+  int sumPhaseMax = 0, densestEdge = 0;
+  int nativeBlock = 0, logicalRound = 0;
+
+  if (comm == NULL || groupToNode == NULL || nRankGroups <= 0 || rankGroupSize <= 0 ||
+      nRankGroups > INT_MAX / rankGroupSize ||
+      nRankGroups * rankGroupSize != comm->nRanks || comm->saiA2a.nFabricGroups <= 1 ||
+      comm->saiA2a.nodeToFabricGroup == NULL) return ncclInternalError;
+
+  NCCLCHECKGOTO(ncclCalloc(&rankGroupToFabric, nRankGroups), ret, fail);
+  NCCLCHECKGOTO(ncclCalloc(&shiftToNativeBlock, nRankGroups), ret, fail);
+  NCCLCHECKGOTO(ncclCalloc(&roundOrder, comm->nRanks), ret, fail);
+  NCCLCHECKGOTO(ncclCalloc(&phaseEnds, comm->nRanks), ret, fail);
+  NCCLCHECKGOTO(ncclCalloc(&seenRounds, comm->nRanks), ret, fail);
+
+  for (int group = 0; group < nRankGroups; group++) {
+    int node = groupToNode[group];
+    if (node < 0 || node >= comm->nNodes) {
+      ret = ncclInternalError;
+      goto fail;
+    }
+    int fabric = comm->saiA2a.nodeToFabricGroup[node];
+    if (fabric < 0 || fabric >= comm->saiA2a.nFabricGroups) {
+      ret = ncclInternalError;
+      goto fail;
+    }
+    rankGroupToFabric[group] = fabric;
+    shiftToNativeBlock[group] = -1;
+  }
+
+  {
+    int nRankGroupsPow2 = pow2Up(nRankGroups);
+    uint32_t nativeRound = 0, nativeShift = 0;
+    do {
+      if (nativeShift < (uint32_t)nRankGroups) {
+        shiftToNativeBlock[nativeShift] = nativeBlock++;
+      }
+      nativeRound++;
+      nativeShift = (nativeShift + nativeRound) & (nRankGroupsPow2 - 1);
+    } while (nativeRound != (uint32_t)nRankGroupsPow2);
+  }
+  if (nativeBlock != nRankGroups) {
+    ret = ncclInternalError;
+    goto fail;
+  }
+
+  NCCLCHECKGOTO(ncclSaiRaggedShiftPhases(
+      nRankGroups, comm->saiA2a.nFabricGroups, rankGroupToFabric,
+      &shiftOrder, &shiftPhaseEnds, &useGreedyOrder,
+      &sumPhaseMax, &densestEdge), ret, fail);
+
+  for (int localDelta = 0; localDelta < rankGroupSize; localDelta++) {
+    for (int shiftIndex = 0; shiftIndex < nRankGroups; shiftIndex++) {
+      int shift = shiftOrder[shiftIndex];
+      if (shift < 0 || shift >= nRankGroups || shiftToNativeBlock[shift] < 0) {
+        ret = ncclInternalError;
+        goto fail;
+      }
+      int channelRound = shiftToNativeBlock[shift] * rankGroupSize + localDelta;
+      if (channelRound < 0 || channelRound >= comm->nRanks || seenRounds[channelRound]) {
+        ret = ncclInternalError;
+        goto fail;
+      }
+      seenRounds[channelRound] = 1;
+      roundOrder[logicalRound] = channelRound;
+      phaseEnds[logicalRound] = shiftPhaseEnds[shiftIndex];
+      logicalRound++;
+    }
+  }
+  if (logicalRound != comm->nRanks) {
+    ret = ncclInternalError;
+    goto fail;
+  }
+
+  comm->saiA2a.raggedRoundOrder = roundOrder;
+  comm->saiA2a.raggedPhaseEnds = phaseEnds;
+  comm->saiA2a.raggedScheduleReady = true;
+  roundOrder = NULL;
+  phaseEnds = NULL;
+  if (comm->rank == 0) {
+    INFO(NCCL_GRAPH,
+        "%s: using SAI ragged AlltoAll round map, topologyNodes %d fabricGroups %d maxNodesPerGroup %d order %s phaseEdgeScore %d lowerBound %d",
+        __func__, comm->nNodes, comm->saiA2a.nFabricGroups,
+        comm->saiA2a.maxFabricGroupNodes,
+        useGreedyOrder ? "native-greedy" : "native-quadratic",
+        sumPhaseMax, densestEdge);
+  }
+
+fail:
+  if (ret != ncclSuccess && comm != NULL && comm->rank == 0) {
+    INFO(NCCL_GRAPH,
+        "%s: SAI ragged AlltoAll round map construction failed, error %d",
+        __func__, ret);
+  }
+  free(rankGroupToFabric);
+  free(shiftOrder);
+  free(shiftToNativeBlock);
+  free(roundOrder);
+  free(shiftPhaseEnds);
+  free(phaseEnds);
+  free(seenRounds);
+  return ret;
+}
+
+static int ncclP2pScheduleGroupSize(struct ncclComm* comm, int64_t configuredGroupSize) {
+  if (comm->nNodes == 1) return comm->maxLocalRanks;
+  if (configuredGroupSize <= 0 || configuredGroupSize > INT_MAX) return 0;
+  int groupSize = (int)configuredGroupSize;
+  for (int node = 0; node < comm->nNodes; node++) {
+    int localRanks = comm->nodeRanks[node].localRanks;
+    if (localRanks % groupSize != 0 || localRanks < groupSize) groupSize = gcd(groupSize, localRanks);
+  }
+  return groupSize;
+}
+
+static ncclResult_t ncclSaiP2pFabricGroupOrder(struct ncclComm* comm,
+    int groupSize, int groupsPerNode, int nGroups,
+    int* groupToNode, int* groupToLocal) {
+  ncclResult_t ret = ncclSuccess;
+  int *groupedNodes = NULL, *groupedLocals = NULL;
+  int *fabricOffsets = NULL, *fabricNext = NULL, *rankGroupsPerFabric = NULL;
+  int groupCount = 0;
+  NCCLCHECKGOTO(ncclCalloc(&groupedNodes, nGroups), ret, fail);
+  NCCLCHECKGOTO(ncclCalloc(&groupedLocals, nGroups), ret, fail);
+  NCCLCHECKGOTO(ncclCalloc(&fabricOffsets, comm->saiA2a.nFabricGroups + 1), ret, fail);
+  NCCLCHECKGOTO(ncclCalloc(&fabricNext, comm->saiA2a.nFabricGroups), ret, fail);
+  NCCLCHECKGOTO(ncclCalloc(&rankGroupsPerFabric, comm->saiA2a.nFabricGroups), ret, fail);
+  for (int fabricGroup = 0; fabricGroup < comm->saiA2a.nFabricGroups; fabricGroup++) {
+    rankGroupsPerFabric[fabricGroup] =
+        comm->saiA2a.fabricGroupCounts[fabricGroup] * groupsPerNode;
+    fabricOffsets[fabricGroup + 1] =
+        fabricOffsets[fabricGroup] + rankGroupsPerFabric[fabricGroup];
+  }
+  if (fabricOffsets[comm->saiA2a.nFabricGroups] != nGroups) {
+    WARN("SAI fabric group rank-count mismatch: %d vs %d",
+        fabricOffsets[comm->saiA2a.nFabricGroups], nGroups);
+    ret = ncclInternalError;
+    goto fail;
+  }
+  for (int n = 0; n < comm->nNodes; ++n) {
+    if (comm->nodeRanks[n].localRanks % groupSize != 0) {
+      WARN("nLocals = %d should be a diviser of the number of ranks in node %d = %d",
+          groupSize, n, comm->nodeRanks[n].localRanks);
+      ret = ncclInternalError;
+      goto fail;
+    }
+    int fabricGroup = comm->saiA2a.nodeToFabricGroup[n];
+    if (fabricGroup < 0 || fabricGroup >= comm->saiA2a.nFabricGroups) {
+      ret = ncclInternalError;
+      goto fail;
+    }
+    int nGroupsInNode = comm->nodeRanks[n].localRanks / groupSize;
+    for (int g = 0; g < nGroupsInNode; ++g) {
+      int index = fabricOffsets[fabricGroup] + fabricNext[fabricGroup]++;
+      if (index < 0 || index >= nGroups) {
+        ret = ncclInternalError;
+        goto fail;
+      }
+      groupedLocals[index] = g * groupSize;
+      groupedNodes[index] = n;
+    }
+  }
+  for (int index = 0; index < nGroups; index++) {
+    groupToNode[groupCount] = groupedNodes[index];
+    groupToLocal[groupCount] = groupedLocals[index];
+    groupCount++;
+  }
+
+fail:
+  free(groupedNodes);
+  free(groupedLocals);
+  free(fabricOffsets);
+  free(fabricNext);
+  free(rankGroupsPerFabric);
+  return ret;
+}
+
+static bool ncclSaiRaggedScheduleCandidate(struct ncclComm* comm, int groupSize) {
+  int64_t groupNodesParam =
+      comm->saiA2a.config.field[ncclSaiA2aConfigGroupNodes];
+  int64_t islandSize =
+      comm->saiA2a.config.field[ncclSaiA2aConfigIslandSize];
+  if (!comm->saiA2a.configConsistent ||
+      comm->saiA2a.config.field[ncclSaiA2aConfigEnabled] == 0 ||
+      comm->saiA2a.config.field[ncclSaiA2aConfigPlannerEnable] == 0 ||
+      groupNodesParam <= 0 || groupNodesParam > INT_MAX ||
+      islandSize <= 0 || islandSize > INT_MAX ||
+      comm->saiA2a.nodeToFabricGroup == nullptr ||
+      comm->saiA2a.fabricGroupCounts == nullptr ||
+      !ncclSaiA2aRaggedLayoutAllowed(
+          comm->nNodes, (int)groupNodesParam,
+          comm->saiA2a.config.field[ncclSaiA2aConfigMultigroupEnable],
+          comm->saiA2a.fabricMetadataValid, comm->saiA2a.fabricGroupsComplete,
+          comm->saiA2a.nFabricGroups, comm->saiA2a.maxFabricGroupNodes)) return false;
+  for (int n = 0; n < comm->nNodes; n++) {
+    if (comm->nodeRanks[n].localRanks != comm->nodeRanks[0].localRanks ||
+        comm->nodeRanks[n].localRanks % groupSize != 0) return false;
+  }
+  return comm->nodeRanks[0].localRanks == islandSize && groupSize == islandSize;
+}
+
+static ncclResult_t ncclP2pSchedule(struct ncclComm* comm, int groupSize) {
+  struct ncclNodeRanks* nodeRanks = comm->nodeRanks;
+  if (groupSize <= 0) return ncclInvalidUsage;
   comm->p2pSchedGroupSize = groupSize;
 
   int local = comm->localRank % groupSize; // local id inside my group
@@ -789,61 +1199,89 @@ static ncclResult_t ncclP2pSchedule(struct ncclComm* comm) {
   int nGroups = comm->nRanks / groupSize;
   int nGroupsPow2 = pow2Up(nGroups);
 
-  int64_t saiFabricNodesParam = comm->saiA2a.config.field[ncclSaiA2aConfigP2pFabricNodes];
-  bool validSaiFabricNodes = saiFabricNodesParam > 0 && saiFabricNodesParam <= INT_MAX;
-  int saiFabricNodes = validSaiFabricNodes ? (int)saiFabricNodesParam : 0;
+  int64_t saiGroupNodesParam = comm->saiA2a.config.field[ncclSaiA2aConfigGroupNodes];
+  bool validSaiGroupNodes = saiGroupNodesParam > 0 && saiGroupNodesParam <= INT_MAX;
+  int saiGroupNodes = validSaiGroupNodes ? (int)saiGroupNodesParam : 0;
+  int groupsPerNode = nodeRanks[0].localRanks / groupSize;
+  bool uniformLocalRanks = groupsPerNode > 0;
+  for (int n = 0; n < comm->nNodes; n++) {
+    uniformLocalRanks &= nodeRanks[n].localRanks == nodeRanks[0].localRanks &&
+        nodeRanks[n].localRanks % groupSize == 0;
+  }
   bool saiScheduleRequested = comm->saiA2a.configConsistent &&
       comm->saiA2a.config.field[ncclSaiA2aConfigP2pFabricSchedule] != 0;
-  bool saiMultigroup = validSaiFabricNodes && comm->nNodes > saiFabricNodes;
-  bool saiMultigroupAllowed = !saiMultigroup || ncclSaiA2aMultigroupAllowed(
+  bool saiCompleteScheduleAllowed = validSaiGroupNodes && ncclSaiP2pFabricScheduleAllowed(
+      comm->nNodes, saiGroupNodes,
       comm->saiA2a.config.field[ncclSaiA2aConfigMultigroupEnable],
       comm->saiA2a.fabricGroupsComplete);
-  bool saiSchedule = saiScheduleRequested && validSaiFabricNodes &&
-      comm->nNodes % saiFabricNodes == 0 && saiMultigroupAllowed;
-  bool useFabricMetadataOrder = saiSchedule && saiMultigroup &&
-      comm->saiA2a.fabricGroupsComplete && comm->saiA2a.nodeToFabricGroup != nullptr;
+  bool saiRaggedScheduleAllowed = validSaiGroupNodes && ncclSaiA2aRaggedLayoutAllowed(
+      comm->nNodes, saiGroupNodes,
+      comm->saiA2a.config.field[ncclSaiA2aConfigMultigroupEnable],
+      comm->saiA2a.fabricMetadataValid, comm->saiA2a.fabricGroupsComplete,
+      comm->saiA2a.nFabricGroups, comm->saiA2a.maxFabricGroupNodes);
+  bool saiSchedule = saiScheduleRequested && saiCompleteScheduleAllowed &&
+      uniformLocalRanks && comm->saiA2a.nodeToFabricGroup != nullptr &&
+      comm->saiA2a.fabricGroupCounts != nullptr;
+  int64_t saiIslandSize =
+      comm->saiA2a.config.field[ncclSaiA2aConfigIslandSize];
+  bool completeIslandRankGroups = saiIslandSize > 0 && saiIslandSize <= INT_MAX &&
+      nodeRanks[0].localRanks == saiIslandSize && groupSize == saiIslandSize;
+  bool saiRaggedSchedule = ncclSaiRaggedScheduleCandidate(comm, groupSize);
+  bool useFabricMetadataOrder = saiSchedule;
 
-  int *groupToNode, *groupToLocal;
-  NCCLCHECK(ncclCalloc(&groupToNode, nGroups));  // node hosting the group
-  NCCLCHECK(ncclCalloc(&groupToLocal, nGroups)); // local offset of the group
+  int *groupToNode = NULL, *groupToLocal = NULL;
+  ncclResult_t ret = ncclCalloc(&groupToNode, nGroups); // node hosting the group
+  if (ret != ncclSuccess) return ret;
+  ret = ncclCalloc(&groupToLocal, nGroups); // local offset of the group
+  if (ret != ncclSuccess) {
+    free(groupToNode);
+    return ret;
+  }
   int groupCount = 0;
-  for (int fabricGroup = 0;
-      fabricGroup < (useFabricMetadataOrder ? comm->saiA2a.nFabricGroups : 1);
-      fabricGroup++) {
+  if (useFabricMetadataOrder) {
+    ret = ncclSaiP2pFabricGroupOrder(
+        comm, groupSize, groupsPerNode, nGroups, groupToNode, groupToLocal);
+    if (ret != ncclSuccess) {
+      free(groupToNode);
+      free(groupToLocal);
+      return ret;
+    }
+    groupCount = nGroups;
+  } else {
     for (int n = 0; n < comm->nNodes; ++n) {
-      if (useFabricMetadataOrder && comm->saiA2a.nodeToFabricGroup[n] != fabricGroup) continue;
       if (0 != comm->nodeRanks[n].localRanks % groupSize) {
         WARN("nLocals = %d should be a diviser of the number of ranks in node %d = %d", groupSize, n, comm->nodeRanks[n].localRanks);
+        free(groupToNode); free(groupToLocal);
         return ncclInternalError;
       }
       int nGroupsInNode = comm->nodeRanks[n].localRanks / groupSize;
       for (int g = 0; g < nGroupsInNode; ++g) {
-        if (n == comm->node && g == localGroup) group = groupCount;
         groupToLocal[groupCount] = g * groupSize;
         groupToNode[groupCount] = n;
         groupCount++;
       }
     }
   }
+  for (int candidate = 0; candidate < groupCount; candidate++) {
+    if (groupToNode[candidate] == comm->node &&
+        groupToLocal[candidate] == localGroup * groupSize) group = candidate;
+  }
   if (groupCount != nGroups || group < 0) {
     WARN("Group creation failed: count %d vs %d localGroup %d", groupCount, nGroups, group);
+    free(groupToNode);
+    free(groupToLocal);
     return ncclInternalError;
   }
   INFO(NCCL_GRAPH,"%s: group size used is %d",__func__,groupSize);
 
   int round = 0;
   if (saiSchedule) {
-    int groupsPerNode = nodeRanks[0].localRanks / groupSize;
-    bool uniformLocalRanks = groupsPerNode > 0;
-    for (int n = 0; n < comm->nNodes; n++) {
-      uniformLocalRanks &= nodeRanks[n].localRanks == nodeRanks[0].localRanks;
-    }
-    int groupsPerFabric = saiFabricNodes * groupsPerNode;
+    int groupsPerFabric = saiGroupNodes * groupsPerNode;
     if (uniformLocalRanks && groupsPerFabric > 0 && nGroups % groupsPerFabric == 0) {
       int nFabricGroups = nGroups / groupsPerFabric;
       int nFabricGroupsPow2 = pow2Up(nFabricGroups);
-      INFO(NCCL_GRAPH, "%s: using SAI fabric group schedule, fabricNodes %d, groupsPerFabric %d, fabricGroups %d metadataOrder %d",
-           __func__, saiFabricNodes, groupsPerFabric, nFabricGroups, useFabricMetadataOrder ? 1 : 0);
+      INFO(NCCL_GRAPH, "%s: using SAI fabric group schedule, groupNodes %d, groupsPerFabric %d, fabricGroups %d",
+           __func__, saiGroupNodes, groupsPerFabric, nFabricGroups);
       for (int delta = 0; delta < groupSize; delta++) {
         for (int groupSkew = 0; groupSkew < groupsPerFabric; groupSkew++) {
           uint32_t fabricRound = 0, fabricDelta = 0;
@@ -868,16 +1306,27 @@ static ncclResult_t ncclP2pSchedule(struct ncclComm* comm) {
     } else {
       INFO(NCCL_GRAPH, "%s: SAI fabric group schedule disabled, localRanks/group layout is not uniform", __func__);
     }
-  } else if (saiScheduleRequested) {
-    if (!validSaiFabricNodes) {
-      INFO(NCCL_GRAPH, "%s: SAI fabric group schedule disabled, invalid fabricNodes %ld",
-           __func__, (long)saiFabricNodesParam);
-    } else if (!saiMultigroupAllowed) {
-      INFO(NCCL_GRAPH, "%s: SAI fabric group schedule disabled, complete fabric-group metadata is unavailable",
-           __func__);
+  } else if (saiScheduleRequested && !saiRaggedSchedule) {
+    if (!validSaiGroupNodes) {
+      INFO(NCCL_GRAPH, "%s: SAI fabric group schedule disabled, invalid groupNodes %ld",
+           __func__, (long)saiGroupNodesParam);
+    } else if (!ncclSaiA2aMultigroupAllowed(
+        comm->saiA2a.config.field[ncclSaiA2aConfigMultigroupEnable],
+        comm->saiA2a.fabricGroupsComplete)) {
+      INFO(NCCL_GRAPH, "%s: SAI fabric group schedule disabled by multigroup policy", __func__);
+    } else if (!comm->saiA2a.fabricMetadataValid ||
+        comm->saiA2a.nodeToFabricGroup == nullptr) {
+      INFO(NCCL_GRAPH, "%s: SAI fabric group schedule disabled, fabric-group metadata is unavailable", __func__);
+    } else if (!uniformLocalRanks) {
+      INFO(NCCL_GRAPH, "%s: SAI fabric group schedule disabled, local rank groups are not uniform", __func__);
+    } else if (saiRaggedScheduleAllowed && !completeIslandRankGroups) {
+      INFO(NCCL_GRAPH, "%s: SAI ragged fabric schedule disabled, topology nodes are not complete configured islands", __func__);
+    } else if (comm->nNodes < saiGroupNodes) {
+      INFO(NCCL_GRAPH, "%s: SAI fabric group schedule disabled below one configured group", __func__);
+    } else if (comm->saiA2a.maxFabricGroupNodes > saiGroupNodes) {
+      INFO(NCCL_GRAPH, "%s: SAI fabric group schedule disabled, observed group occupancy exceeds configured capacity", __func__);
     } else {
-      INFO(NCCL_GRAPH, "%s: SAI fabric group schedule disabled, nNodes %d is not divisible by fabricNodes %d",
-           __func__, comm->nNodes, saiFabricNodes);
+      INFO(NCCL_GRAPH, "%s: SAI fabric group schedule disabled for this fabric layout", __func__);
     }
   }
   if (round == 0) {
@@ -905,18 +1354,44 @@ static ncclResult_t ncclP2pSchedule(struct ncclComm* comm) {
     } while (groupRound != nGroupsPow2);
   }
 
-  free(groupToNode);
-  free(groupToLocal);
-
   if (round != comm->nRanks) {
     WARN("P2p schedule creation has bugs.");
+    free(groupToNode);
+    free(groupToLocal);
     return ncclInternalError;
   }
+  if (saiRaggedSchedule) {
+    ncclResult_t mapResult = ncclSaiBuildRaggedRoundOrder(
+        comm, nGroups, groupSize, groupToNode);
+    if (mapResult != ncclSuccess) {
+      free(groupToNode);
+      free(groupToLocal);
+      return mapResult;
+    }
+  }
+
+  free(groupToNode);
+  free(groupToLocal);
   return ncclSuccess;
 }
 
+static bool ncclSaiA2aAllocIslandScratch(struct ncclComm* comm,
+    const struct ncclSaiA2aConfig* config, size_t* reserveBytesOut, void** scratchOut) {
+  if (reserveBytesOut != nullptr) *reserveBytesOut = 0;
+  if (scratchOut != nullptr) *scratchOut = nullptr;
+  if (comm == nullptr || config == nullptr || scratchOut == nullptr) return false;
+
+  size_t reserveBytes = ncclSaiA2aIslandScratchReserveBytes(config, comm->nRanks);
+  if (reserveBytesOut != nullptr) *reserveBytesOut = reserveBytes;
+  if (reserveBytes == 0) return true;
+
+  cudaError_t status = cudaMalloc(scratchOut, reserveBytes);
+  if (status != cudaSuccess) (void)cudaGetLastError();
+  return status == cudaSuccess;
+}
+
 static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* parent, uint64_t timers[TIMERS_INIT_COUNT]) {
-  // We use 2 AllGathers
+  // We use two mandatory AllGathers.
   // 1. { peerInfo, comm, compCap}
   // 2. { nChannels, graphInfo, topoRanks }
   ncclResult_t ret = ncclSuccess;
@@ -942,11 +1417,19 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     int crossNic;
   };
 
+  struct raggedBuildStatus {
+    int result;
+    int ready;
+  };
+
   struct allGatherInfo {
     struct graphInfo graphInfo[NCCL_NUM_ALGORITHMS];
     struct ncclTopoRanks topoRanks;
     struct ncclSaiA2aConfig saiA2aConfig;
     struct ncclSaiFabricGroupInfo saiFabricGroup;
+    uint64_t saiIslandScratchReserveBytes;
+    int64_t p2pScheduleGroupSize;
+    int saiIslandScratchReady;
     int cpuArch;
     int cpuVendor;
     int localRanks;
@@ -965,7 +1448,11 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   int* pxnPeers = NULL;
   int *topParentLocalRanks = NULL;
   int p2pLevel = -1;
+  int p2pScheduleGroupSize = 0;
+  bool raggedBuildStatusRequired = false;
   int saiFabricValidRanks = 0, saiFabricAbsentRanks = 0, saiFabricInvalidRanks = 0;
+  size_t saiIslandScratchReserveBytes = 0;
+  void* saiIslandScratch = nullptr;
 
   timers[TIMER_INIT_ALLGATHER] = clockNano();
   // AllGather1 - begin
@@ -1172,6 +1659,12 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   allGather3Data[rank].cpuVendor = comm->cpuVendor;
   ncclSaiA2aGetConfig(comm, &allGather3Data[rank].saiA2aConfig);
   ncclSaiA2aGetFabricGroupInfo(&allGather3Data[rank].saiFabricGroup);
+  allGather3Data[rank].p2pScheduleGroupSize = ncclParamGroupSize();
+  saiIslandScratchReserveBytes = 0;
+  allGather3Data[rank].saiIslandScratchReady = ncclSaiA2aAllocIslandScratch(
+      comm, &allGather3Data[rank].saiA2aConfig, &saiIslandScratchReserveBytes,
+      &saiIslandScratch) ? 1 : 0;
+  allGather3Data[rank].saiIslandScratchReserveBytes = saiIslandScratchReserveBytes;
 
   comm->nChannels = std::min(treeGraph->nChannels, ringGraph->nChannels);
   NCCLCHECKGOTO(ncclTopoPreset(comm, graphs, &allGather3Data[rank].topoRanks), ret, fail);
@@ -1192,6 +1685,28 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     goto fail;
   }
   comm->saiA2a.config = allGather3Data[rank].saiA2aConfig;
+  comm->saiA2a.islandScratchReady = true;
+  for (int r = 0; r < nranks; r++) {
+    if (allGather3Data[r].saiIslandScratchReady == 0 ||
+        allGather3Data[r].saiIslandScratchReserveBytes != saiIslandScratchReserveBytes) {
+      comm->saiA2a.islandScratchReady = false;
+      break;
+    }
+  }
+  if (comm->saiA2a.islandScratchReady && saiIslandScratchReserveBytes != 0) {
+    comm->saiA2a.islandScratch = saiIslandScratch;
+    comm->saiA2a.islandScratchBytes = saiIslandScratchReserveBytes;
+    saiIslandScratch = nullptr;
+  } else if (saiIslandScratch != nullptr) {
+    (void)cudaFree(saiIslandScratch);
+    saiIslandScratch = nullptr;
+  }
+  if (rank == 0 && allGather3Data[rank].saiIslandScratchReserveBytes != 0) {
+    INFO(NCCL_INIT|NCCL_ENV,
+      "NCCL-SAI island scratch reserve: bytes %llu ready %d",
+      (unsigned long long)allGather3Data[rank].saiIslandScratchReserveBytes,
+      comm->saiA2a.islandScratchReady ? 1 : 0);
+  }
 
   // Determine nNodes, firstRanks, ...
   NCCLCHECKGOTO(ncclCalloc(&nodesFirstRank, nranks), ret, fail);
@@ -1221,7 +1736,9 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
 
   comm->saiA2a.fabricMetadataValid = false;
   comm->saiA2a.fabricGroupsComplete = false;
+  comm->saiA2a.raggedScheduleReady = false;
   comm->saiA2a.nFabricGroups = 0;
+  comm->saiA2a.maxFabricGroupNodes = 0;
   saiFabricValidRanks = saiFabricAbsentRanks = saiFabricInvalidRanks = 0;
   for (int r = 0; r < nranks; r++) {
     switch (allGather3Data[r].saiFabricGroup.state) {
@@ -1261,17 +1778,22 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
         saiGroupCounts[fabricGroup]++;
       }
       comm->saiA2a.fabricMetadataValid = true;
-      int64_t expectedNodes = comm->saiA2a.config.field[ncclSaiA2aConfigP2pFabricNodes];
+      int64_t expectedNodes = comm->saiA2a.config.field[ncclSaiA2aConfigGroupNodes];
       bool groupsComplete = expectedNodes > 0 && expectedNodes <= INT_MAX &&
           comm->nNodes == comm->saiA2a.nFabricGroups * expectedNodes;
       for (int group = 0; group < comm->saiA2a.nFabricGroups; group++) {
         groupsComplete &= saiGroupCounts[group] == expectedNodes;
+        comm->saiA2a.maxFabricGroupNodes = std::max(
+            comm->saiA2a.maxFabricGroupNodes, saiGroupCounts[group]);
       }
       comm->saiA2a.fabricGroupsComplete = groupsComplete;
+      comm->saiA2a.fabricGroupCounts = saiGroupCounts;
+      saiGroupCounts = NULL;
       if (rank == 0) {
         INFO(NCCL_INIT|NCCL_ENV,
-          "NCCL-SAI fabric metadata: groups %d topologyNodes %d expectedNodesPerGroup %ld complete %d",
-          comm->saiA2a.nFabricGroups, comm->nNodes, (long)expectedNodes, groupsComplete ? 1 : 0);
+          "NCCL-SAI fabric metadata: groups %d topologyNodes %d expectedNodesPerGroup %ld maxObservedNodesPerGroup %d complete %d",
+          comm->saiA2a.nFabricGroups, comm->nNodes, (long)expectedNodes,
+          comm->saiA2a.maxFabricGroupNodes, groupsComplete ? 1 : 0);
       }
     } else if (rank == 0) {
       INFO(NCCL_INIT|NCCL_ENV,
@@ -1324,6 +1846,27 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   comm->localRank = comm->rankToLocalRank[rank];
   comm->localRanks = comm->nodeRanks[comm->node].localRanks;
 
+  p2pScheduleGroupSize = ncclP2pScheduleGroupSize(
+      comm, allGather3Data[rank].p2pScheduleGroupSize);
+  if (comm->saiA2a.config.field[ncclSaiA2aConfigEnabled] != 0 ||
+      comm->saiA2a.config.field[ncclSaiA2aConfigP2pFabricSchedule] != 0) {
+    if (p2pScheduleGroupSize <= 0) {
+      WARN("NCCL-SAI invalid effective P2P schedule group size");
+      ret = ncclInvalidUsage;
+      goto fail;
+    }
+    for (int r = 0; r < nranks; r++) {
+      if (ncclP2pScheduleGroupSize(
+          comm, allGather3Data[r].p2pScheduleGroupSize) != p2pScheduleGroupSize) {
+        WARN("NCCL-SAI effective P2P schedule group size differs across ranks");
+        ret = ncclInvalidUsage;
+        goto fail;
+      }
+    }
+  }
+  raggedBuildStatusRequired =
+      ncclSaiRaggedScheduleCandidate(comm, p2pScheduleGroupSize);
+
   NCCLCHECKGOTO(initNvlDomainInfo(comm), ret, fail);
 
   TRACE(NCCL_INIT,"hostHash[%d] %lx localRank %d localRanks %d localRank0 %d",
@@ -1373,7 +1916,7 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
       comm->config.collnetEnable = 0;
     }
   }
-  NCCLCHECK(ncclTopoPathAllNVLink(comm->topo, &comm->isAllNvlink));
+  NCCLCHECKGOTO(ncclTopoPathAllNVLink(comm->topo, &comm->isAllNvlink), ret, fail);
   comm->isOneRPN = (comm->maxLocalRanks == 1);
 
   NCCLCHECKGOTO(ncclCalloc(&rings, nranks*MAXCHANNELS), ret, fail);
@@ -1417,7 +1960,7 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   comm->topParentLocalRanks = topParentLocalRanks;
 
   // Profiler plugin context has to be initialized before proxy thread
-  NCCLCHECK(ncclProfilerPluginInit(comm));
+  NCCLCHECKGOTO(ncclProfilerPluginInit(comm), ret, fail);
 
   NCCLCHECKGOTO(ncclTransportCheckP2pType(comm, &comm->isAllDirectP2p, &comm->directMode, &comm->isAllCudaP2p), ret, fail);
   // Launch proxy service thread, after this, the proxy calls can be used.
@@ -1433,7 +1976,39 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   // Build p2p schedule
   comm->p2pSchedule = ncclMemoryStackAlloc<ncclComm::P2pSchedulePair>(&comm->memPermanent, comm->nRanks);
   comm->planner.peers = ncclMemoryStackAlloc<ncclKernelPlanner::Peer>(&comm->memPermanent, comm->nRanks);
-  NCCLCHECK(ncclP2pSchedule(comm));
+  {
+    ncclResult_t scheduleResult = ncclP2pSchedule(comm, p2pScheduleGroupSize);
+    if (!raggedBuildStatusRequired) {
+      if (scheduleResult != ncclSuccess) {
+        ret = scheduleResult;
+        goto fail;
+      }
+    } else {
+      struct raggedBuildStatus* status =
+          reinterpret_cast<struct raggedBuildStatus*>(allGather3Data);
+      status[rank].result = (int)scheduleResult;
+      status[rank].ready = scheduleResult == ncclSuccess &&
+          comm->saiA2a.raggedScheduleReady &&
+          comm->saiA2a.raggedRoundOrder != NULL &&
+          comm->saiA2a.raggedPhaseEnds != NULL;
+      uint64_t statusStart = clockNano();
+      NCCLCHECKGOTO(bootstrapAllGather(
+          comm->bootstrap, status, sizeof(*status)), ret, fail);
+      uint64_t statusElapsed = clockNano() - statusStart;
+      timers[TIMER_INIT_ALLGATHER] += statusElapsed;
+      timers[TIMER_INIT_CONNECT] += statusElapsed;
+      for (int peer = 0; peer < nranks; peer++) {
+        if (status[peer].result != (int)ncclSuccess) {
+          ret = (ncclResult_t)status[peer].result;
+          goto fail;
+        }
+        if (status[peer].ready == 0) {
+          ret = ncclInternalError;
+          goto fail;
+        }
+      }
+    }
+  }
 
   comm->runtimeConn = comm->cuMemSupport && ncclParamRuntimeConnect();
   if (comm->runtimeConn) {
@@ -1520,7 +2095,7 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   NCCLCHECKGOTO(ncclTopoInitTunerConstants(comm), ret, fail);
   NCCLCHECKGOTO(ncclTunerPluginLoad(comm), ret, fail);
   if (comm->tuner) {
-    NCCLCHECK(comm->tuner->init(&comm->tunerContext, comm->commHash, comm->nRanks, comm->nNodes, ncclDebugLog, &comm->nvlDomainInfo, &comm->tunerConstants));
+    NCCLCHECKGOTO(comm->tuner->init(&comm->tunerContext, comm->commHash, comm->nRanks, comm->nNodes, ncclDebugLog, &comm->nvlDomainInfo, &comm->tunerConstants), ret, fail);
   }
   NCCLCHECKGOTO(ncclTopoTuneModel(comm, comm->minCompCap, comm->maxCompCap, graphs), ret, fail);
 
@@ -1561,6 +2136,7 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   TRACE(NCCL_INIT, "rank %d nranks %d - DONE", rank, nranks);
 
 exit:
+  if (saiIslandScratch != nullptr) (void)cudaFree(saiIslandScratch);
   if (CPU_COUNT(&comm->cpuAffinity)) sched_setaffinity(0, sizeof(cpu_set_t), &affinitySave);
   /* If split resource is shared, we are not able to unlink the proxy ops pool here since the child comm can
    * attach the proxy ops pool of parent at any time; otherwise, unlink it here to make sure the pool will be

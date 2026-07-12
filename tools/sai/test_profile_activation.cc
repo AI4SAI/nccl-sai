@@ -22,27 +22,41 @@ struct ProfileCase {
 
 int main() {
   const uint32_t ncclVersion = 22809;
+  if (NCCL_SAI_INIT_SCHEMA_TAG != 0x5b7u) {
+    fprintf(stderr, "initialization schema tag was not advanced\n");
+    return 1;
+  }
+  if (NCCL_SAI_A2A_ISLAND_MIN_RANKS_DEFAULT != 576) {
+    fprintf(stderr, "island scale guard changed unexpectedly\n");
+    return 1;
+  }
   const uint32_t peerVersion = ncclSaiPeerVersion(ncclVersion);
   if ((peerVersion >> 20) != NCCL_SAI_INIT_SCHEMA_TAG ||
       (peerVersion & NCCL_SAI_PEER_NCCL_VERSION_MASK) != ncclVersion) {
     fprintf(stderr, "peer version schema packing failed\n");
     return 1;
   }
-  if (ncclSaiProfileMinNchannels(true, false, 32) != 8 ||
-      ncclSaiProfileMinNchannels(true, false, 4) != 4 ||
-      ncclSaiProfileMinNchannels(true, true, 32) != 0 ||
-      ncclSaiProfileMinNchannels(false, false, 32) != 0) {
-    fprintf(stderr, "profile channel floor clipping failed\n");
-    return 1;
-  }
   if (ncclSaiA2aPlannerRoundWindow(-1, 16, 16) != 4 ||
       ncclSaiA2aPlannerRoundWindow(-1, 32, 16) != 4 ||
       ncclSaiA2aPlannerRoundWindow(-1, 48, 16) != 6 ||
       ncclSaiA2aPlannerRoundWindow(-1, 256, 16) != 16 ||
-      ncclSaiA2aPlannerRoundWindow(-1, 336, 16) != 21 ||
+      ncclSaiA2aPlannerRoundWindow(-1, 272, 16) != 17 ||
       ncclSaiA2aPlannerRoundWindow(8, 256, 16) != 8 ||
       ncclSaiA2aPlannerRoundWindow(-1, 8, 16) != 4) {
     fprintf(stderr, "planner round-window selection failed\n");
+    return 1;
+  }
+  if (ncclSaiA2aPlannerRoundLimit(10, 100, 4) != 14 ||
+      ncclSaiA2aPlannerRoundLimit(10, 100, 0) != 100 ||
+      ncclSaiA2aPlannerRoundLimit(90, 100, 9) != 99 ||
+      ncclSaiA2aPlannerRoundLimit(90, 100, 10) != 100 ||
+      ncclSaiA2aPlannerRoundLimit(INT_MAX - 10, INT_MAX, 4) != INT_MAX - 6 ||
+      ncclSaiA2aPlannerRoundLimit(INT_MAX - 2, INT_MAX, 4) != INT_MAX ||
+      ncclSaiA2aPlannerRoundLimit(1, INT_MAX, INT_MAX) != INT_MAX ||
+      ncclSaiA2aPlannerRoundLimit(INT_MAX, INT_MAX, 1) != INT_MAX ||
+      ncclSaiA2aPlannerRoundLimit(-1, 100, 4) != -1 ||
+      ncclSaiA2aPlannerRoundLimit(101, 100, 4) != 101) {
+    fprintf(stderr, "planner round-limit overflow guard failed\n");
     return 1;
   }
   if (!ncclSaiA2aPlannerGroupsComplete(16, 16) ||
@@ -61,6 +75,40 @@ int main() {
     fprintf(stderr, "multigroup metadata gating failed\n");
     return 1;
   }
+  if (ncclSaiA2aGroupedLayoutAllowed(16, 16, -1, false) ||
+      !ncclSaiA2aGroupedLayoutAllowed(16, 16, -1, true) ||
+      !ncclSaiA2aGroupedLayoutAllowed(16, 16, 0, true) ||
+      !ncclSaiA2aGroupedLayoutAllowed(32, 16, -1, true) ||
+      ncclSaiA2aGroupedLayoutAllowed(32, 16, -1, false) ||
+      ncclSaiA2aGroupedLayoutAllowed(32, 16, 0, true) ||
+      !ncclSaiA2aGroupedLayoutAllowed(32, 16, 1, false) ||
+      !ncclSaiA2aGroupedLayoutAllowed(8, 16, 1, false) ||
+      ncclSaiA2aGroupedLayoutAllowed(32, 0, -1, true)) {
+    fprintf(stderr, "grouped-layout eligibility failed\n");
+    return 1;
+  }
+  if (!ncclSaiA2aRaggedLayoutAllowed(16, 16, 1, true, false, 4, 4) ||
+      !ncclSaiA2aRaggedLayoutAllowed(30, 16, 1, true, false, 3, 12) ||
+      ncclSaiA2aRaggedLayoutAllowed(16, 16, -1, true, false, 4, 4) ||
+      ncclSaiA2aRaggedLayoutAllowed(15, 16, 1, true, false, 3, 8) ||
+      ncclSaiA2aRaggedLayoutAllowed(16, 16, 0, true, false, 4, 4) ||
+      ncclSaiA2aRaggedLayoutAllowed(16, 16, 1, false, false, 4, 4) ||
+      ncclSaiA2aRaggedLayoutAllowed(16, 16, 1, true, true, 1, 16) ||
+      ncclSaiA2aRaggedLayoutAllowed(20, 16, 1, true, false, 2, 17) ||
+      ncclSaiA2aRaggedLayoutAllowed(20, 16, 1, true, false, 1, 10)) {
+    fprintf(stderr, "ragged-layout eligibility failed\n");
+    return 1;
+  }
+  if (ncclSaiP2pFabricScheduleAllowed(16, 16, -1, true) ||
+      !ncclSaiP2pFabricScheduleAllowed(32, 16, -1, true) ||
+      !ncclSaiP2pFabricScheduleAllowed(272, 16, -1, true) ||
+      ncclSaiP2pFabricScheduleAllowed(32, 16, -1, false) ||
+      ncclSaiP2pFabricScheduleAllowed(32, 16, 1, false) ||
+      ncclSaiP2pFabricScheduleAllowed(32, 16, 0, true) ||
+      ncclSaiP2pFabricScheduleAllowed(24, 16, -1, true)) {
+    fprintf(stderr, "P2P fabric schedule eligibility failed\n");
+    return 1;
+  }
   uint64_t fabricGroupId = 0;
   if (!ncclSaiParseFabricGroupId("0", &fabricGroupId) || fabricGroupId != 0 ||
       !ncclSaiParseFabricGroupId("18446744073709551615", &fabricGroupId) ||
@@ -69,6 +117,28 @@ int main() {
       ncclSaiParseFabricGroupId("12x", &fabricGroupId) ||
       ncclSaiParseFabricGroupId(nullptr, &fabricGroupId)) {
     fprintf(stderr, "fabric group ID parsing failed\n");
+    return 1;
+  }
+  uint64_t slurmGroupA1 = 0, slurmGroupA2 = 0, slurmGroupB = 0;
+  if (!ncclSaiSlurmFabricGroupId(
+          "root.fabric.group-a.node-1", "switch.switch.switch.node", &slurmGroupA1) ||
+      !ncclSaiSlurmFabricGroupId(
+          "root.fabric.group-a.node-2", "switch.switch.switch.node", &slurmGroupA2) ||
+      !ncclSaiSlurmFabricGroupId(
+          "root.fabric.group-b.node-3", "switch.switch.switch.node", &slurmGroupB) ||
+      slurmGroupA1 != slurmGroupA2 || slurmGroupA1 == slurmGroupB ||
+      ncclSaiSlurmFabricGroupId(
+          "root.fabric.node-1", "switch.switch.switch.node", &slurmGroupA1) ||
+      ncclSaiSlurmFabricGroupId(
+          "root.fabric.group-a.node-1", "switch.switch.node", &slurmGroupA1) ||
+      ncclSaiSlurmFabricGroupId(
+          "root..group-a.node-1", "switch.switch.switch.node", &slurmGroupA1) ||
+      ncclSaiSlurmFabricGroupId(
+          "root.fabric.group-a.node-1", "switch.block.switch.node", &slurmGroupA1) ||
+      ncclSaiSlurmFabricGroupId(
+          "root.fabric.group-a", "switch.switch.switch", &slurmGroupA1) ||
+      ncclSaiSlurmFabricGroupId(nullptr, nullptr, &slurmGroupA1)) {
+    fprintf(stderr, "Slurm fabric group parsing failed\n");
     return 1;
   }
 

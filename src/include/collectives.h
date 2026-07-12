@@ -49,9 +49,12 @@ enum ncclSaiA2aConfigField {
   ncclSaiA2aConfigMultigroupEnable,
   ncclSaiA2aConfigMinPeerBytes,
   ncclSaiA2aConfigMinRanks,
+  ncclSaiA2aConfigIslandEnable,
+  ncclSaiA2aConfigIslandSize,
+  ncclSaiA2aConfigIslandMaxPeerBytes,
+  ncclSaiA2aConfigIslandMinRanks,
+  ncclSaiA2aConfigIslandScratchCapBytes,
   ncclSaiA2aConfigP2pFabricSchedule,
-  ncclSaiA2aConfigP2pFabricNodes,
-  ncclSaiA2aConfigProfileMinNchannels,
   ncclSaiA2aConfigFieldCount,
 };
 struct ncclSaiA2aConfig {
@@ -66,8 +69,21 @@ struct ncclSaiFabricGroupInfo {
   uint64_t id;
   int state;
 };
+struct ncclSaiA2aIslandLayout {
+  int islandSize;
+  int nIslands;
+  int myIsland;
+  int myIslandLocal;
+  size_t blockCount;
+  size_t blockBytes;
+  size_t stageBytes;
+};
 void ncclSaiA2aGetConfig(struct ncclComm* comm, struct ncclSaiA2aConfig* config);
 void ncclSaiA2aGetFabricGroupInfo(struct ncclSaiFabricGroupInfo* info);
+size_t ncclSaiA2aIslandScratchReserveBytes(
+    const struct ncclSaiA2aConfig* config, int nRanks);
+bool ncclSaiA2aIslandEligible(struct ncclComm* comm, size_t count, size_t peerBytes,
+    struct ncclSaiA2aIslandLayout* layout, const char** reasonOut);
 
 inline int ncclTypeSize(ncclDataType_t type) {
   switch (type) {

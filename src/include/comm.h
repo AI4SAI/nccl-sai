@@ -257,12 +257,14 @@ struct ncclSaiA2aPlanRound {
   struct ncclTaskP2p* send;
   struct ncclTaskP2p* recv;
   int channelRound;
+  bool stageEnd;
 };
 
 struct ncclSaiA2aPlanOp {
   struct ncclSaiA2aPlanOp* next;
   uint64_t seq;
   uint64_t ordinaryCutoff;
+  int kind;
   int roundWindow;
   int nRounds;
   int nextRound;
@@ -463,10 +465,20 @@ struct ncclCommSymTeams;
 struct ncclSaiA2aState {
   struct ncclSaiA2aConfig config;
   bool configConsistent;
+  bool islandScratchReady;
+  void* islandScratch;
+  size_t islandScratchBytes;
   bool fabricMetadataValid;
   bool fabricGroupsComplete;
+  // This flag controls participation in a bootstrap collective and must only
+  // depend on communicator-wide metadata, never rank-local planner state.
+  bool raggedScheduleReady;
   int nFabricGroups;
+  int maxFabricGroupNodes;
   int* nodeToFabricGroup;
+  int* fabricGroupCounts;
+  int* raggedRoundOrder;
+  uint8_t* raggedPhaseEnds;
   uint64_t nextSeq;
 };
 

@@ -23,12 +23,13 @@ NCCL_PARAM(SaiA2aGroupNodes, "SAI_A2A_GROUP_NODES", -1);
 NCCL_PARAM(SaiA2aMultigroupEnable, "SAI_A2A_MULTIGROUP_ENABLE", -1);
 NCCL_PARAM(SaiA2aMinPeerBytes, "SAI_A2A_MIN_PEER_BYTES", 131072);
 NCCL_PARAM(SaiA2aMinRanks, "SAI_A2A_MIN_RANKS", 32);
+NCCL_PARAM(SaiA2aIslandEnable, "SAI_A2A_ISLAND_ENABLE", -1);
+NCCL_PARAM(SaiA2aIslandSize, "SAI_A2A_ISLAND_SIZE", 4);
+NCCL_PARAM(SaiA2aIslandMaxPeerBytes, "SAI_A2A_ISLAND_MAX_PEER_BYTES", 4096);
+NCCL_PARAM(SaiA2aIslandMinRanks, "SAI_A2A_ISLAND_MIN_RANKS", NCCL_SAI_A2A_ISLAND_MIN_RANKS_DEFAULT);
+NCCL_PARAM(SaiA2aIslandScratchCapBytes, "SAI_A2A_ISLAND_SCRATCH_CAP_BYTES", 64 * 1024 * 1024);
 
-extern int64_t ncclParamMinNrings();
-extern int64_t ncclParamMinNchannels();
 extern int64_t ncclParamSaiP2pFabricGroupSchedule();
-extern int64_t ncclParamSaiP2pFabricNodes();
-extern int ncclMaxNchannels();
 
 const char* ncclFuncToString(ncclFunc_t fn) {
   switch (fn) {
@@ -109,16 +110,24 @@ void ncclSaiA2aGetFabricGroupInfo(struct ncclSaiFabricGroupInfo* info) {
   info->id = 0;
   info->state = ncclSaiFabricGroupIdAbsent;
   const char* value = ncclGetEnv("NCCL_SAI_FABRIC_GROUP_ID");
-  if (value == nullptr) return;
-  if (!ncclSaiParseFabricGroupId(value, &info->id)) {
-    info->state = ncclSaiFabricGroupIdInvalid;
+  if (value != nullptr) {
+    if (!ncclSaiParseFabricGroupId(value, &info->id)) {
+      info->state = ncclSaiFabricGroupIdInvalid;
+      return;
+    }
+    info->state = ncclSaiFabricGroupIdValid;
     return;
   }
-  info->state = ncclSaiFabricGroupIdValid;
+  if (ncclSaiFullMeshProfileEnabled() && ncclSaiSlurmFabricGroupId(
+      ncclGetEnv("SLURM_TOPOLOGY_ADDR"),
+      ncclGetEnv("SLURM_TOPOLOGY_ADDR_PATTERN"), &info->id)) {
+    info->state = ncclSaiFabricGroupIdValid;
+  }
 }
 
 void ncclSaiA2aGetConfig(struct ncclComm* comm, struct ncclSaiA2aConfig* config) {
   if (config == nullptr) return;
+  (void)comm;
   memset(config, 0, sizeof(*config));
   bool fullMeshProfile = ncclSaiFullMeshProfileEnabled();
   bool a2aEnabled = saiA2aFabricEnabled();
@@ -131,29 +140,26 @@ void ncclSaiA2aGetConfig(struct ncclComm* comm, struct ncclSaiA2aConfig* config)
   int64_t multigroupEnable = ncclParamSaiA2aMultigroupEnable();
   int64_t minPeerBytes = ncclParamSaiA2aMinPeerBytes();
   int64_t minRanks = ncclParamSaiA2aMinRanks();
+  int64_t islandEnable = ncclParamSaiA2aIslandEnable();
+  int64_t islandSize = ncclParamSaiA2aIslandSize();
+  int64_t islandMaxPeerBytes = ncclParamSaiA2aIslandMaxPeerBytes();
+  int64_t islandMinRanks = ncclParamSaiA2aIslandMinRanks();
+  int64_t islandScratchCapBytes = ncclParamSaiA2aIslandScratchCapBytes();
   int64_t p2pFabricSchedule = ncclParamSaiP2pFabricGroupSchedule();
-  int64_t p2pFabricNodes = ncclParamSaiP2pFabricNodes();
-  int64_t profileMinNchannels = 0;
-  bool minNchannelsExplicit = false;
-  if (ncclParamMinNrings() != -2) {
-    minNchannelsExplicit = true;
-  }
-  if (ncclParamMinNchannels() != -2) {
-    minNchannelsExplicit = true;
-  }
   if (plannerEnable < 0) plannerEnable = fullMeshDefaults ? 1 : 0;
   bool autoPlannerRounds = plannerRounds == -1 && fullMeshDefaults;
   if (!autoPlannerRounds && (plannerRounds < 1 || plannerRounds > INT_MAX)) plannerRounds = 4;
-  if (groupNodes < 0) groupNodes = fullMeshProfile ? 16 : 4;
-  if (groupNodes < 1 || groupNodes > INT_MAX) groupNodes = 4;
+  int64_t defaultGroupNodes = fullMeshProfile ? 16 : 4;
+  if (groupNodes < 0) groupNodes = defaultGroupNodes;
+  if (groupNodes < 1 || groupNodes > INT_MAX) groupNodes = defaultGroupNodes;
   if (minPeerBytes < 0) minPeerBytes = 0;
   if (minRanks < 0) minRanks = 0;
+  if (islandEnable < 0) islandEnable = fullMeshDefaults ? 1 : 0;
+  if (islandSize < 2 || islandSize > INT_MAX) islandSize = 4;
+  if (islandMaxPeerBytes < 0) islandMaxPeerBytes = 0;
+  if (islandMinRanks < 0) islandMinRanks = 0;
+  if (islandScratchCapBytes < 0) islandScratchCapBytes = 0;
   if (p2pFabricSchedule < 0) p2pFabricSchedule = fullMeshDefaults ? 1 : 0;
-  if (p2pFabricNodes < 0) p2pFabricNodes = fullMeshProfile ? 16 : 4;
-  int effectiveMaxNchannels = ncclMaxNchannels();
-  if (comm != nullptr) effectiveMaxNchannels = std::min(effectiveMaxNchannels, comm->config.maxCTAs);
-  profileMinNchannels = ncclSaiProfileMinNchannels(
-      fullMeshDefaults, minNchannelsExplicit, effectiveMaxNchannels);
   config->field[ncclSaiA2aConfigPlannerEnable] = plannerEnable != 0 ? 1 : 0;
   config->field[ncclSaiA2aConfigPlannerRounds] = plannerRounds;
   config->field[ncclSaiA2aConfigGroupNodes] = groupNodes;
@@ -161,9 +167,168 @@ void ncclSaiA2aGetConfig(struct ncclComm* comm, struct ncclSaiA2aConfig* config)
   config->field[ncclSaiA2aConfigMultigroupEnable] = multigroupEnable > 0 ? 1 : multigroupEnable;
   config->field[ncclSaiA2aConfigMinPeerBytes] = minPeerBytes;
   config->field[ncclSaiA2aConfigMinRanks] = minRanks;
+  config->field[ncclSaiA2aConfigIslandEnable] = islandEnable != 0 ? 1 : 0;
+  config->field[ncclSaiA2aConfigIslandSize] = islandSize;
+  config->field[ncclSaiA2aConfigIslandMaxPeerBytes] = islandMaxPeerBytes;
+  config->field[ncclSaiA2aConfigIslandMinRanks] = islandMinRanks;
+  config->field[ncclSaiA2aConfigIslandScratchCapBytes] = islandScratchCapBytes;
   config->field[ncclSaiA2aConfigP2pFabricSchedule] = p2pFabricSchedule != 0 ? 1 : 0;
-  config->field[ncclSaiA2aConfigP2pFabricNodes] = p2pFabricNodes;
-  config->field[ncclSaiA2aConfigProfileMinNchannels] = profileMinNchannels;
+}
+
+static void saiA2aSetReason(const char** reasonOut, const char* reason) {
+  if (reasonOut != nullptr) *reasonOut = reason;
+}
+
+static bool saiA2aMulSize(size_t a, size_t b, size_t* result) {
+  if (result == nullptr || (a != 0 && b > SIZE_MAX / a)) return false;
+  *result = a * b;
+  return true;
+}
+
+size_t ncclSaiA2aIslandScratchReserveBytes(
+    const struct ncclSaiA2aConfig* config, int nRanks) {
+  if (config == nullptr || nRanks <= 0 ||
+      config->field[ncclSaiA2aConfigEnabled] == 0 ||
+      config->field[ncclSaiA2aConfigIslandEnable] == 0) return 0;
+
+  int64_t minRanksParam = config->field[ncclSaiA2aConfigIslandMinRanks];
+  if (minRanksParam > 0 && nRanks < minRanksParam) return 0;
+
+  int64_t islandSizeParam = config->field[ncclSaiA2aConfigIslandSize];
+  int64_t scratchCapParam = config->field[ncclSaiA2aConfigIslandScratchCapBytes];
+  if (islandSizeParam < 2 || islandSizeParam > INT_MAX || scratchCapParam <= 0) return 0;
+  int islandSize = (int)islandSizeParam;
+  if (nRanks % islandSize != 0) return 0;
+
+  size_t scratchCap = (uint64_t)scratchCapParam > SIZE_MAX ?
+      SIZE_MAX : (size_t)scratchCapParam;
+  int64_t maxPeerBytesParam = config->field[ncclSaiA2aConfigIslandMaxPeerBytes];
+  if (maxPeerBytesParam <= 0) return scratchCap;
+
+  size_t maxPeerBytes = (uint64_t)maxPeerBytesParam > SIZE_MAX ?
+      SIZE_MAX : (size_t)maxPeerBytesParam;
+  size_t scratchBytes = 0;
+  if (!saiA2aMulSize(maxPeerBytes, (size_t)nRanks, &scratchBytes)) return scratchCap;
+  return std::min(scratchBytes, scratchCap);
+}
+
+static bool saiA2aUniformLocalRanks(struct ncclComm* comm) {
+  if (comm == nullptr || comm->nodeRanks == nullptr || comm->localRanks <= 0 || comm->nNodes <= 0) return false;
+  for (int node = 0; node < comm->nNodes; node++) {
+    if (comm->nodeRanks[node].localRanks != comm->localRanks) return false;
+  }
+  return true;
+}
+
+static int saiA2aIslandRank(
+    struct ncclComm* comm, int island, int islandLocal, int islandSize) {
+  int islandsPerNode = comm->localRanks / islandSize;
+  int node = island / islandsPerNode;
+  int nodeIsland = island % islandsPerNode;
+  return comm->nodeRanks[node].localRankToRank[nodeIsland * islandSize + islandLocal];
+}
+
+static bool saiA2aIslandGlobalContiguous(struct ncclComm* comm, int islandSize) {
+  int islandsPerNode = comm->localRanks / islandSize;
+  int nIslands = comm->nRanks / islandSize;
+  for (int island = 0; island < nIslands; island++) {
+    for (int islandLocal = 0; islandLocal < islandSize; islandLocal++) {
+      if (saiA2aIslandRank(comm, island, islandLocal, islandSize) !=
+          island * islandSize + islandLocal) return false;
+    }
+  }
+  return islandsPerNode > 0;
+}
+
+bool ncclSaiA2aIslandEligible(struct ncclComm* comm, size_t count, size_t peerBytes,
+    struct ncclSaiA2aIslandLayout* layout,
+    const char** reasonOut) {
+  if (comm == nullptr || layout == nullptr) { saiA2aSetReason(reasonOut, "bad_args"); return false; }
+  const struct ncclSaiA2aConfig* config = &comm->saiA2a.config;
+  if (!comm->saiA2a.configConsistent) { saiA2aSetReason(reasonOut, "config_mismatch"); return false; }
+  if (config->field[ncclSaiA2aConfigEnabled] == 0) { saiA2aSetReason(reasonOut, "profile_disabled"); return false; }
+  if (config->field[ncclSaiA2aConfigIslandEnable] == 0) { saiA2aSetReason(reasonOut, "island_disabled"); return false; }
+  if (!comm->saiA2a.islandScratchReady) {
+    saiA2aSetReason(reasonOut, "island_scratch_unavailable");
+    return false;
+  }
+  if (comm->nRanks < config->field[ncclSaiA2aConfigIslandMinRanks]) {
+    saiA2aSetReason(reasonOut, "island_too_few_ranks");
+    return false;
+  }
+  int64_t groupNodesParam = config->field[ncclSaiA2aConfigGroupNodes];
+  if (groupNodesParam <= 0 || groupNodesParam > INT_MAX) {
+    saiA2aSetReason(reasonOut, "island_invalid_fabric_group");
+    return false;
+  }
+  if (!ncclSaiA2aGroupedLayoutAllowed(comm->nNodes, (int)groupNodesParam,
+      config->field[ncclSaiA2aConfigMultigroupEnable],
+      comm->saiA2a.fabricGroupsComplete)) {
+    bool multigroup = comm->nNodes > groupNodesParam;
+    saiA2aSetReason(reasonOut,
+      multigroup && config->field[ncclSaiA2aConfigMultigroupEnable] == 0 ?
+      "island_multigroup_disabled" : "island_fabric_group_metadata_unavailable");
+    return false;
+  }
+  if (peerBytes == 0) { saiA2aSetReason(reasonOut, "island_zero_peer_bytes"); return false; }
+  int64_t maxPeerBytes = config->field[ncclSaiA2aConfigIslandMaxPeerBytes];
+  if (maxPeerBytes > 0 && peerBytes > (size_t)maxPeerBytes) {
+    saiA2aSetReason(reasonOut, "island_large_peer_bytes");
+    return false;
+  }
+  int64_t islandSizeParam = config->field[ncclSaiA2aConfigIslandSize];
+  if (islandSizeParam < 2 || islandSizeParam > INT_MAX) {
+    saiA2aSetReason(reasonOut, "island_bad_size");
+    return false;
+  }
+  int islandSize = (int)islandSizeParam;
+  if (comm->localRanks < islandSize || comm->nRanks % islandSize != 0 ||
+      comm->localRanks % islandSize != 0) {
+    saiA2aSetReason(reasonOut, "island_bad_size");
+    return false;
+  }
+  if (!saiA2aUniformLocalRanks(comm)) { saiA2aSetReason(reasonOut, "nonuniform_local_ranks"); return false; }
+  if (comm->nNodes > INT_MAX / comm->localRanks || comm->nNodes * comm->localRanks != comm->nRanks) {
+    saiA2aSetReason(reasonOut, "nonuniform_local_ranks");
+    return false;
+  }
+  if (comm->node < 0 || comm->node >= comm->nNodes ||
+      comm->localRank < 0 || comm->localRank >= comm->localRanks) {
+    saiA2aSetReason(reasonOut, "invalid_local_rank");
+    return false;
+  }
+  int islandsPerNode = comm->localRanks / islandSize;
+  for (int node = 0; node < comm->nNodes; node++) {
+    if (comm->nodeRanks[node].localRankToRank == nullptr) {
+      saiA2aSetReason(reasonOut, "missing_local_rank_map");
+      return false;
+    }
+  }
+  if (!saiA2aIslandGlobalContiguous(comm, islandSize)) {
+    saiA2aSetReason(reasonOut, "island_noncontiguous_global_ranks");
+    return false;
+  }
+
+  int nIslands = comm->nRanks / islandSize;
+  if (!saiA2aMulSize(count, (size_t)islandSize, &layout->blockCount) ||
+      !saiA2aMulSize(peerBytes, (size_t)islandSize, &layout->blockBytes) ||
+      !saiA2aMulSize(layout->blockBytes, (size_t)nIslands, &layout->stageBytes)) {
+    saiA2aSetReason(reasonOut, "island_bad_scratch_size");
+    return false;
+  }
+  int64_t scratchCapBytes = config->field[ncclSaiA2aConfigIslandScratchCapBytes];
+  if (scratchCapBytes <= 0 || layout->stageBytes > (size_t)scratchCapBytes ||
+      layout->stageBytes > comm->saiA2a.islandScratchBytes || comm->saiA2a.islandScratch == nullptr) {
+    saiA2aSetReason(reasonOut, "island_scratch_cap");
+    return false;
+  }
+
+  layout->islandSize = islandSize;
+  layout->nIslands = nIslands;
+  layout->myIslandLocal = comm->localRank % islandSize;
+  layout->myIsland = comm->node * islandsPerNode + comm->localRank / islandSize;
+  saiA2aSetReason(reasonOut, "eligible");
+  return true;
 }
 
 

@@ -19,26 +19,29 @@
 
 // Keep one schema tag for both the peer-version handshake and the extended
 // initialization all-gather. The low 20 bits remain the upstream NCCL version.
-#define NCCL_SAI_INIT_SCHEMA_TAG 0x5a8u
+#define NCCL_SAI_INIT_SCHEMA_TAG 0x5b7u
 #define NCCL_SAI_PEER_NCCL_VERSION_MASK 0x000fffffu
+#define NCCL_SAI_A2A_ISLAND_MIN_RANKS_DEFAULT 576
 
 static inline uint32_t ncclSaiPeerVersion(uint32_t ncclVersion) {
   return (NCCL_SAI_INIT_SCHEMA_TAG << 20) | (ncclVersion & NCCL_SAI_PEER_NCCL_VERSION_MASK);
 }
 
-static inline int ncclSaiProfileMinNchannels(bool fullMeshDefaults, bool explicitMin,
-    int effectiveMaxNchannels) {
-  if (!fullMeshDefaults || explicitMin || effectiveMaxNchannels <= 0) return 0;
-  return effectiveMaxNchannels < 8 ? effectiveMaxNchannels : 8;
-}
-
 static inline int ncclSaiA2aPlannerRoundWindow(int64_t configuredRounds,
-    int topologyNodes, int fabricNodes) {
+    int topologyNodes, int groupNodes) {
   if (configuredRounds > 0 && configuredRounds <= INT_MAX) return (int)configuredRounds;
-  if (topologyNodes <= 0 || fabricNodes <= 0 || topologyNodes % fabricNodes != 0) return 4;
-  int fabricGroups = topologyNodes / fabricNodes;
+  if (topologyNodes <= 0 || groupNodes <= 0 || topologyNodes % groupNodes != 0) return 4;
+  int fabricGroups = topologyNodes / groupNodes;
   int completeCycles = (4 + fabricGroups - 1) / fabricGroups;
   return fabricGroups * completeCycles;
+}
+
+static inline int ncclSaiA2aPlannerRoundLimit(
+    int roundBegin, int nRounds, int roundWindow) {
+  if (roundBegin < 0 || roundBegin > nRounds) return roundBegin;
+  int remaining = nRounds - roundBegin;
+  if (roundWindow <= 0 || roundWindow >= remaining) return nRounds;
+  return roundBegin + roundWindow;
 }
 
 static inline bool ncclSaiA2aPlannerGroupsComplete(int topologyNodes, int groupNodes) {
@@ -52,6 +55,29 @@ static inline bool ncclSaiA2aMultigroupAllowed(int64_t mode, bool fabricGroupsCo
   return fabricGroupsComplete;
 }
 
+static inline bool ncclSaiA2aGroupedLayoutAllowed(int topologyNodes, int groupNodes,
+    int64_t multigroupMode, bool fabricGroupsComplete) {
+  if (topologyNodes <= 0 || groupNodes <= 0) return false;
+  if (multigroupMode > 0) return true;
+  if (!fabricGroupsComplete) return false;
+  return topologyNodes <= groupNodes || multigroupMode != 0;
+}
+
+static inline bool ncclSaiA2aRaggedLayoutAllowed(int topologyNodes, int groupNodes,
+    int64_t multigroupMode, bool fabricMetadataValid, bool fabricGroupsComplete,
+    int fabricGroups, int maxFabricGroupNodes) {
+  return topologyNodes >= groupNodes && groupNodes > 0 && multigroupMode > 0 &&
+      fabricMetadataValid && !fabricGroupsComplete && fabricGroups > 1 &&
+      maxFabricGroupNodes > 0 && maxFabricGroupNodes <= groupNodes;
+}
+
+static inline bool ncclSaiP2pFabricScheduleAllowed(int topologyNodes, int groupNodes,
+    int64_t multigroupMode, bool fabricGroupsComplete) {
+  return fabricGroupsComplete && topologyNodes > groupNodes && groupNodes > 0 &&
+      topologyNodes % groupNodes == 0 &&
+      ncclSaiA2aMultigroupAllowed(multigroupMode, fabricGroupsComplete);
+}
+
 static inline bool ncclSaiParseFabricGroupId(const char* value, uint64_t* id) {
   if (value == nullptr || id == nullptr || value[0] == '\0' || value[0] == '-' || value[0] == '+') return false;
   errno = 0;
@@ -59,6 +85,56 @@ static inline bool ncclSaiParseFabricGroupId(const char* value, uint64_t* id) {
   unsigned long long parsed = strtoull(value, &end, 10);
   if (errno != 0 || end == value || *end != '\0') return false;
   *id = (uint64_t)parsed;
+  return true;
+}
+
+static inline bool ncclSaiSlurmFabricGroupId(
+    const char* address, const char* pattern, uint64_t* id) {
+  if (address == nullptr || pattern == nullptr || id == nullptr ||
+      address[0] == '\0' || pattern[0] == '\0') return false;
+
+  const char* addressPart = address;
+  const char* patternPart = pattern;
+  size_t leafSwitchPrefixLen = 0;
+  bool sawNode = false;
+  while (true) {
+    const char* addressEnd = strchr(addressPart, '.');
+    const char* patternEnd = strchr(patternPart, '.');
+    size_t addressLen = addressEnd == nullptr ? strlen(addressPart) :
+        (size_t)(addressEnd - addressPart);
+    size_t patternLen = patternEnd == nullptr ? strlen(patternPart) :
+        (size_t)(patternEnd - patternPart);
+    if (addressLen == 0 || patternLen == 0 ||
+        (addressEnd == nullptr) != (patternEnd == nullptr)) return false;
+
+    bool isSwitch = patternLen == 6 && strncmp(patternPart, "switch", 6) == 0;
+    bool isNode = patternLen == 4 && strncmp(patternPart, "node", 4) == 0;
+    if (!isSwitch && !isNode) return false;
+    if (isNode) {
+      if (patternEnd != nullptr || leafSwitchPrefixLen == 0) return false;
+      sawNode = true;
+    } else {
+      if (sawNode) return false;
+      leafSwitchPrefixLen = (size_t)((addressPart + addressLen) - address);
+    }
+
+    if (addressEnd == nullptr) break;
+    addressPart = addressEnd + 1;
+    patternPart = patternEnd + 1;
+  }
+  if (!sawNode || leafSwitchPrefixLen == 0) return false;
+
+  uint64_t hash = UINT64_C(14695981039346656037);
+  static const char domain[] = "nccl-sai:slurm-topology:";
+  for (size_t i = 0; i < sizeof(domain) - 1; i++) {
+    hash ^= (unsigned char)domain[i];
+    hash *= UINT64_C(1099511628211);
+  }
+  for (size_t i = 0; i < leafSwitchPrefixLen; i++) {
+    hash ^= (unsigned char)address[i];
+    hash *= UINT64_C(1099511628211);
+  }
+  *id = hash;
   return true;
 }
 

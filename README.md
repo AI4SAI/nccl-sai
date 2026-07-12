@@ -5,10 +5,12 @@ Optimized primitives for inter-GPU communication.
 ## NCCL-SAI Branch
 
 This branch carries AI4SAI changes for SAI UltraPOD and SlimPOD GPU fabrics.
-The first optimized API is `ncclAlltoAll()`. NCCL-SAI also has a narrowly
-guarded local P2P transport-selection path that can affect any operation on an
-eligible single-host communicator; other collective algorithms remain
-unchanged unless explicitly documented and validated. See
+The first optimized API is `ncclAlltoAll()`: eligible small messages use a
+two-stage GPU-island aggregation path, while eligible large messages use a
+phased P2P planner. NCCL-SAI also has a narrowly guarded local P2P
+transport-selection path that can affect any operation on an eligible
+single-host communicator; other collective algorithms remain unchanged unless
+explicitly documented and validated. See
 `docs/sai/README.md` and `docs/sai/COMMUNICATION_TUNING_MATRIX.md` for scope,
 rollback knobs, and validation requirements.
 
@@ -21,12 +23,12 @@ For SAI users, the intended runtime mode is drop-in replacement: put the
 NCCL-SAI build's `lib/` directory before the system NCCL in `LD_LIBRARY_PATH`.
 SAI site modules or prologs can enable transparent SAI behavior by setting
 `NCCL_SAI_FABRIC_PROFILE` to a recognized product-family profile. The current
-phased AlltoAll defaults are selected by `ultrapod-fullmesh`; broader family
-names such as `ultrapod` and `slimpod` are recognized activation namespaces but
-do not imply that the same planner is valid for every topology. Unknown profile
-names and unsupported layouts fall back to upstream NCCL behavior unless an
-expert explicitly opts in with `NCCL_SAI_A2A_ENABLE=1` and the related planner
-controls.
+island and phased AlltoAll defaults are selected by `ultrapod-fullmesh`;
+broader family names such as `ultrapod` and `slimpod` are recognized activation
+namespaces but do not imply that the same planner is valid for every topology.
+Unknown profile names and unsupported layouts fall back to upstream NCCL
+behavior unless an expert explicitly opts in with `NCCL_SAI_A2A_ENABLE=1` and
+the related controls.
 
 ## Introduction
 

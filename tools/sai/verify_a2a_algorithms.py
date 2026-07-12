@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Verify NCCL-SAI P2P schedules and phased AlltoAll planner invariants."""
+"""Verify NCCL-SAI P2P schedules and AlltoAll planner invariants."""
 
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 from collections import Counter
 from dataclasses import asdict, dataclass
@@ -12,6 +13,7 @@ from typing import Iterable
 
 P2P_BATCH_ROUNDS = 8
 DEFAULT_PLANNER_ROUNDS = 4
+DEFAULT_ISLAND_SCRATCH_CAP = 64 * 1024 * 1024
 
 
 class VerificationError(RuntimeError):
@@ -355,6 +357,53 @@ def verify_planner_head_guard() -> dict[str, object]:
     }
 
 
+def verify_ordinary_cutoff_after_join() -> dict[str, object]:
+    stale_ordinal = 7
+
+    # Joining the first operation of a new group resets planner-local ordinals.
+    current_ordinal = 0
+    cutoff = current_ordinal
+    current_ordinal += 1
+    post_alltoall_ordinal = current_ordinal
+    require(
+        post_alltoall_ordinal > cutoff,
+        "ordinary P2P after AlltoAll crossed the planner cutoff",
+    )
+
+    # If ordinary P2P already joined the group, AlltoAll must retain that prefix.
+    current_ordinal = 1
+    cutoff_with_prefix = current_ordinal
+    require(1 <= cutoff_with_prefix, "ordinary P2P prefix was excluded from the cutoff")
+    return {
+        "kind": "a2a_ordinary_cutoff_after_join",
+        "stale_ordinal_ignored": stale_ordinal,
+        "new_group_cutoff": cutoff,
+        "post_alltoall_ordinal": post_alltoall_ordinal,
+        "prefixed_group_cutoff": cutoff_with_prefix,
+    }
+
+
+def verify_fullmesh_group_cardinality() -> dict[str, object]:
+    layout = ScheduleLayout(
+        topology_nodes=272,
+        local_ranks=4,
+        fabric_nodes=16,
+        p2p_group_size=4,
+    )
+    require(layout.ranks == 1088, "unexpected full-mesh rank count")
+    require(layout.fabric_groups == 17, "sixteen-island groups did not produce 17 fabric groups")
+    require(planner_round_window(layout) == 17, "planner did not align to 17 groups")
+    return {
+        "kind": "fullmesh_group_cardinality",
+        "layout": asdict(layout),
+        "fabric_groups": layout.fabric_groups,
+        "planner_rounds": planner_round_window(layout),
+        "ranks_per_island": layout.local_ranks,
+        "islands_per_group": layout.fabric_nodes,
+        "physical_hosts": layout.ranks // 16,
+    }
+
+
 def fabric_metadata_order(group_ids: tuple[int, ...], expected_nodes_per_group: int) -> tuple[list[int], bool]:
     require(group_ids, "fabric metadata must contain at least one topology node")
     require(expected_nodes_per_group > 0, "expected fabric group size must be positive")
@@ -393,6 +442,334 @@ def verify_fabric_metadata_order() -> dict[str, object]:
         "expected_nodes_per_group": 4,
         "ordered_nodes": order,
         "complete": complete,
+    }
+
+
+def ragged_native_group_order(occupancy: tuple[int, ...], interleaved: bool = False) -> list[int]:
+    require(len(occupancy) > 1, "ragged layout needs multiple fabric groups")
+    require(all(count > 0 for count in occupancy), "ragged group occupancy must be positive")
+    if interleaved:
+        order = [
+            group
+            for slot in range(max(occupancy))
+            for group, count in enumerate(occupancy)
+            if slot < count
+        ]
+    else:
+        order = [group for group, count in enumerate(occupancy) for _ in range(count)]
+    require(Counter(order) == Counter(dict(enumerate(occupancy))), "native order changed occupancy")
+    return order
+
+
+def ragged_shift_loads(order: list[int]) -> list[Counter[tuple[int, int]]]:
+    loads: list[Counter[tuple[int, int]]] = []
+    for shift in range(len(order)):
+        load: Counter[tuple[int, int]] = Counter()
+        for source, source_group in enumerate(order):
+            destination_group = order[(source + shift) % len(order)]
+            if source_group != destination_group:
+                load[(source_group, destination_group)] += 1
+        loads.append(load)
+    return loads
+
+
+def ragged_phase_capacities(rounds: int, fabric_groups: int) -> list[int]:
+    capacities = [fabric_groups] * (rounds // fabric_groups)
+    if rounds % fabric_groups:
+        capacities.append(rounds % fabric_groups)
+    return capacities
+
+
+def ragged_phases(order: list[int]) -> list[list[int]]:
+    fabric_groups = len(set(order))
+    loads = ragged_shift_loads(order)
+    capacities = ragged_phase_capacities(len(order), fabric_groups)
+    phases = [[] for _ in capacities]
+    phase_loads = [Counter() for _ in capacities]
+    group_counts = Counter(order)
+    phase_count = len(phases)
+    shifts = sorted(
+        range(len(order)),
+        key=lambda shift: (max(loads[shift].values(), default=0), sum(loads[shift].values()), -shift),
+        reverse=True,
+    )
+    for shift in shifts:
+        best_phase = None
+        best_score = None
+        for phase, capacity in enumerate(capacities):
+            if len(phases[phase]) >= capacity:
+                continue
+            merged = phase_loads[phase] + loads[shift]
+            old_maximum = max(phase_loads[phase].values(), default=0)
+            new_maximum = max(merged.values(), default=0)
+            deviation = 0
+            for source_group in range(fabric_groups):
+                for destination_group in range(fabric_groups):
+                    if source_group == destination_group:
+                        continue
+                    target = group_counts[source_group] * group_counts[destination_group]
+                    delta = merged[(source_group, destination_group)] * phase_count - target
+                    deviation += delta * delta
+            score = (new_maximum - old_maximum, new_maximum, deviation, len(phases[phase]))
+            if best_score is None or score < best_score:
+                best_score = score
+                best_phase = phase
+        require(best_phase is not None, "ragged shift could not be assigned")
+        phases[best_phase].append(shift)
+        phase_loads[best_phase].update(loads[shift])
+    return phases
+
+
+def ragged_phase_score(order: list[int], phases: list[list[int]]) -> int:
+    loads = ragged_shift_loads(order)
+    score = 0
+    for phase in phases:
+        load: Counter[tuple[int, int]] = Counter()
+        for shift in phase:
+            load.update(loads[shift])
+        score += max(load.values(), default=0)
+    return score
+
+
+def verify_ragged_schedule(
+    occupancy: tuple[int, ...], group_capacity: int, *, interleaved: bool = False
+) -> dict[str, object]:
+    require(sum(occupancy) >= group_capacity, "ragged automatic path starts at one group of total occupancy")
+    require(max(occupancy) <= group_capacity, "ragged occupancy exceeds configured group capacity")
+    group_size = 4
+    native_order = ragged_native_group_order(occupancy, interleaved=interleaved)
+    native_shifts = quadratic_permutation(len(native_order))
+    baseline_phases = [
+        native_shifts[start : start + len(occupancy)]
+        for start in range(0, len(native_shifts), len(occupancy))
+    ]
+    greedy_phases = ragged_phases(native_order)
+    baseline_score = ragged_phase_score(native_order, baseline_phases)
+    greedy_score = ragged_phase_score(native_order, greedy_phases)
+    use_greedy = greedy_score < baseline_score
+    phases = greedy_phases if use_greedy else baseline_phases
+    shifts = [shift for phase in phases for shift in phase]
+    require(sorted(shifts) == list(range(len(native_order))), "ragged phases lost or duplicated a shift")
+    require(
+        all(len(phase) <= len(occupancy) for phase in phases),
+        "ragged phase exceeds the fabric-group round limit",
+    )
+
+    native_rounds = tuple(
+        (shift, local_delta)
+        for shift in native_shifts
+        for local_delta in range(group_size)
+    )
+    shift_to_native_block = {shift: block for block, shift in enumerate(native_shifts)}
+    round_order: list[int] = []
+    phase_ends: list[bool] = []
+    for local_delta in range(group_size):
+        for phase in phases:
+            for slot, shift in enumerate(phase):
+                round_order.append(shift_to_native_block[shift] * group_size + local_delta)
+                phase_ends.append(slot + 1 == len(phase))
+    require(
+        sorted(round_order) == list(range(len(native_rounds))),
+        "ragged round map is not a native-round permutation",
+    )
+    remapped_rounds = tuple(native_rounds[channel_round] for channel_round in round_order)
+    expected_remap = tuple(
+        (shift, local_delta)
+        for local_delta in range(group_size)
+        for phase in phases
+        for shift in phase
+    )
+    require(remapped_rounds == expected_remap, "ragged round map changed native peer semantics")
+    require(
+        sum(phase_ends) == len(phases) * group_size,
+        "ragged phase boundaries were not expanded across local deltas",
+    )
+
+    for source in range(len(native_order)):
+        destinations = {(source + shift) % len(native_order) for shift in shifts}
+        require(len(destinations) == len(native_order), f"ragged source {source} missed a peer")
+        for shift in shifts:
+            destination = (source + shift) % len(native_order)
+            require(
+                (destination - shift + len(native_order)) % len(native_order) == source,
+                f"ragged send/recv mismatch for source {source}",
+            )
+
+    total: Counter[tuple[int, int]] = Counter()
+    for load in ragged_shift_loads(native_order):
+        total.update(load)
+    expected = Counter(
+        {
+            (source, destination): occupancy[source] * occupancy[destination]
+            for source in range(len(occupancy))
+            for destination in range(len(occupancy))
+            if source != destination
+        }
+    )
+    require(total == expected, "ragged schedule changed total fabric-edge load")
+
+    ragged_score = ragged_phase_score(native_order, phases)
+    require(ragged_score <= baseline_score, "ragged phase packing regressed the native baseline")
+    return {
+        "kind": "ragged_fabric_schedule",
+        "occupancy": occupancy,
+        "group_capacity": group_capacity,
+        "native_group_order": "interleaved" if interleaved else "contiguous",
+        "rank_groups": len(native_order),
+        "rank_group_size": group_size,
+        "phases": len(phases),
+        "order": "native-greedy" if use_greedy else "native-quadratic",
+        "maximum_phase_rounds": max(map(len, phases)),
+        "baseline_phase_edge_score": baseline_score,
+        "ragged_phase_edge_score": ragged_score,
+        "densest_total_edge_load": max(total.values()),
+        "native_rounds_preserved": len(native_rounds),
+        "round_map_is_permutation": True,
+    }
+
+
+def verify_ragged_exhaustive() -> dict[str, object]:
+    checked = 0
+    selected: Counter[str] = Counter()
+    for fabric_groups in range(2, 7):
+        for occupancy in itertools.product(range(1, 5), repeat=fabric_groups):
+            if sum(occupancy) < 4 or all(count == 4 for count in occupancy):
+                continue
+            result = verify_ragged_schedule(occupancy, 4)
+            selected[str(result["order"])] += 1
+            checked += 1
+    return {
+        "kind": "ragged_fabric_schedule_exhaustive",
+        "group_capacity": 4,
+        "maximum_fabric_groups": 6,
+        "occupancy_shapes_checked": checked,
+        "selected_orders": dict(selected),
+    }
+
+
+def expected_alltoall_value(source_rank: int, destination_rank: int) -> tuple[int, int]:
+    return source_rank, destination_rank
+
+
+def island_scratch_bytes(rank_count: int, island_size: int, peer_bytes: int) -> int:
+    require(rank_count > 0, "rank_count must be positive")
+    require(island_size >= 2, "island_size must be at least two")
+    require(rank_count % island_size == 0, "rank_count must contain complete islands")
+    require(peer_bytes >= 0, "peer_bytes must be nonnegative")
+    return peer_bytes * rank_count
+
+
+def verify_island_scratch() -> dict[str, object]:
+    cases = ((32, 4), (64, 4), (256, 4), (512, 4), (1088, 4), (256, 8), (8192, 4))
+    peer_bytes = 4096
+    checked: list[dict[str, int]] = []
+    for rank_count, island_size in cases:
+        scratch_bytes = island_scratch_bytes(rank_count, island_size, peer_bytes)
+        reserve_bytes = min(scratch_bytes, DEFAULT_ISLAND_SCRATCH_CAP)
+        require(0 < reserve_bytes <= DEFAULT_ISLAND_SCRATCH_CAP, "invalid scratch reserve")
+        checked.append(
+            {
+                "ranks": rank_count,
+                "island_size": island_size,
+                "peer_bytes": peer_bytes,
+                "scratch_bytes": scratch_bytes,
+                "reserve_bytes": reserve_bytes,
+            }
+        )
+    default_scale_reserve = {
+        rank_count: (
+            min(island_scratch_bytes(rank_count, 4, peer_bytes), DEFAULT_ISLAND_SCRATCH_CAP)
+            if rank_count >= 576
+            else 0
+        )
+        for rank_count in (64, 512, 576, 1088)
+    }
+    require(default_scale_reserve[64] == 0, "low-scale scratch was reserved")
+    require(default_scale_reserve[512] == 0, "pre-threshold scratch was reserved")
+    require(default_scale_reserve[576] > 0, "threshold scratch was not reserved")
+    return {
+        "kind": "a2a_island_scratch",
+        "default_cap_bytes": DEFAULT_ISLAND_SCRATCH_CAP,
+        "default_scale_reserve": default_scale_reserve,
+        "cases": checked,
+    }
+
+
+def verify_island_enqueue(
+    layout: ScheduleLayout, island_size: int, in_place: bool
+) -> dict[str, object]:
+    require(layout.local_ranks % island_size == 0, "local ranks must contain complete islands")
+    rank_count = layout.ranks
+    n_islands = rank_count // island_size
+    descriptors = fabric_rounds(layout)
+    send_buffers = [
+        [expected_alltoall_value(source, destination) for destination in range(rank_count)]
+        for source in range(rank_count)
+    ]
+    recv_buffers = send_buffers if in_place else [[None] * rank_count for _ in range(rank_count)]
+
+    stage = [[[None] * island_size for _ in range(n_islands)] for _ in range(rank_count)]
+    stage_one_messages = 0
+    for descriptor in descriptors:
+        for source_rank in range(rank_count):
+            send_peer, _ = p2p_peers(layout, source_rank, descriptor)
+            if send_peer % island_size != source_rank % island_size:
+                continue
+            _, peer_recv = p2p_peers(layout, send_peer, descriptor)
+            require(peer_recv == source_rank, "stage-one send/recv peers do not match")
+            source_island = source_rank // island_size
+            destination_island = send_peer // island_size
+            first_destination = destination_island * island_size
+            stage[send_peer][source_island] = send_buffers[source_rank][
+                first_destination : first_destination + island_size
+            ]
+            stage_one_messages += 1
+
+    stage_two_messages = 0
+    for source_island in range(n_islands):
+        for descriptor in descriptors:
+            for source_rank in range(rank_count):
+                send_peer, _ = p2p_peers(layout, source_rank, descriptor)
+                if send_peer // island_size != source_rank // island_size:
+                    continue
+                _, peer_recv = p2p_peers(layout, send_peer, descriptor)
+                require(peer_recv == source_rank, "stage-two send/recv peers do not match")
+                destination_local = send_peer % island_size
+                source_local = source_rank % island_size
+                source_global_rank = source_island * island_size + source_local
+                recv_buffers[send_peer][source_global_rank] = stage[source_rank][source_island][
+                    destination_local
+                ]
+                stage_two_messages += 1
+
+    for destination_rank in range(rank_count):
+        for source_rank in range(rank_count):
+            expected = expected_alltoall_value(source_rank, destination_rank)
+            actual = recv_buffers[destination_rank][source_rank]
+            require(
+                actual == expected,
+                f"island enqueue mismatch in_place={in_place} dst={destination_rank} "
+                f"src={source_rank}: {actual}",
+            )
+
+    require(
+        stage_one_messages == rank_count * n_islands,
+        "stage one did not exchange one block per source/destination island pair",
+    )
+    require(
+        stage_two_messages == rank_count * island_size * n_islands,
+        "stage two did not deliver every staged element",
+    )
+    return {
+        "kind": "a2a_island_enqueue",
+        "layout": asdict(layout),
+        "islands": n_islands,
+        "island_size": island_size,
+        "ranks": rank_count,
+        "in_place": in_place,
+        "stage_one_messages": stage_one_messages,
+        "stage_two_messages": stage_two_messages,
+        "elements_checked": rank_count * rank_count,
     }
 
 
@@ -444,7 +821,30 @@ def run(full_scale: bool) -> list[dict[str, object]]:
         )
     )
     results.append(verify_planner_head_guard())
+    results.append(verify_ordinary_cutoff_after_join())
+    results.append(verify_fullmesh_group_cardinality())
     results.append(verify_fabric_metadata_order())
+    for occupancy, capacity in (
+        ((4, 3, 2, 1), 4),
+        ((4, 4, 3, 1), 4),
+        ((8, 6, 6, 4, 2), 8),
+        ((8, 8, 7, 5, 3, 1), 8),
+    ):
+        results.append(verify_ragged_schedule(occupancy, capacity))
+    results.append(verify_ragged_schedule((4, 3, 2, 1), 4, interleaved=True))
+    if full_scale:
+        results.append(verify_ragged_exhaustive())
+    results.append(verify_island_scratch())
+    island_layouts = (
+        (ScheduleLayout(topology_nodes=4), 4),
+        (ScheduleLayout(topology_nodes=8), 4),
+        (ScheduleLayout(topology_nodes=16), 4),
+        (ScheduleLayout(topology_nodes=4, local_ranks=16, p2p_group_size=8), 4),
+        (ScheduleLayout(topology_nodes=4, local_ranks=16, p2p_group_size=8), 8),
+    )
+    for layout, island_size in island_layouts:
+        for in_place in (False, True):
+            results.append(verify_island_enqueue(layout, island_size, in_place))
     return results
 
 

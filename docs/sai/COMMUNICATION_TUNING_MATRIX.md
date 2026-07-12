@@ -20,6 +20,24 @@ Use portable topology classes in public reports:
 Do not publish private domain labels, node lists, switch names, job IDs, or
 private artifact paths.
 
+## Full-Mesh Normalization
+
+For a direct full-mesh fabric with `E` equal-bandwidth endpoints per group and
+one endpoint-bandwidth edge per group pair, the injection/edge balance point is
+`E + 1` complete groups. A 16-endpoint group is therefore balanced at 17
+groups, with 16 and 18 groups forming the practical qualification bracket.
+
+Runs below that bracket can still prove correctness and report efficiency
+against their layout-specific pair-edge bound. They must not be presented as
+the ideal full-fabric bandwidth result. Fragmented allocations and concurrent
+traffic are separate isolation gates rather than substitutes for a balanced
+complete-group run.
+
+Automatic complete-group algorithms must fail closed when occupancy metadata
+is missing or any group is partial, even if the total endpoint count equals an
+integer number of groups. Fragmented-group performance requires a separate
+occupancy-aware schedule and must not be inferred from group-ID discovery alone.
+
 ## Collective Gates
 
 | Collective/API | Why It Matters | Required Public Gate |
@@ -40,6 +58,10 @@ At each relevant topology class, include:
 - GB-scale large messages for bandwidth and rail utilization;
 - sustained runs long enough for monitoring and fabric counters to become
   meaningful.
+
+Topology-specific small-message aggregation must also have a measured scale
+guard. Below the first validated beneficial scale, transparent mode should keep
+the upstream path instead of assuming that reduced network fanout always wins.
 
 Short smoke tests are useful for correctness, but they are not sufficient for
 release performance claims.
