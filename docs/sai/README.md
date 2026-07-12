@@ -23,8 +23,9 @@ paths. Sites enable NCCL-SAI through generic controls:
   recognized product families. Current public families are `ultrapod` and
   `slimpod`; matching is case-insensitive.
 - `NCCL_SAI_FABRIC_PROFILE=ultrapod-fullmesh` selects the currently validated
-  island and phased AlltoAll defaults. A family name alone does not assert that
-  one topology-specific planner is valid for every product in that family.
+  island and phased AlltoAll defaults and the guarded dual-rail local-NET
+  selection described below. A family name alone does not assert that one
+  topology-specific behavior is valid for every product in that family.
 - Empty, unknown, or disabled-style values such as `0`, `false`, `off`,
   `none`, `native`, and `upstream` fail closed to upstream behavior.
 - `NCCL_SAI_A2A_ENABLE=1` explicitly enables the AlltoAll policy.
@@ -37,6 +38,19 @@ paths. Sites enable NCCL-SAI through generic controls:
 Site modulefiles, prologs, SPANK plugins, or container entrypoints may set these
 variables privately. When no recognized profile or explicit enable is present,
 NCCL-SAI follows upstream NCCL behavior.
+
+### Dual-Rail Local-NET Selection
+
+When `NCCL_SAI_FABRIC_PROFILE=ultrapod-fullmesh` is active and a GPU has exactly
+two local NET candidates, even channels select the first topology-local NET and
+odd channels select the second. This keeps both endpoints of a channel aligned
+to the same rail on the validated symmetric dual-rail topology.
+
+The rule does not activate when the profile is unset or unrecognized, for
+broader family-only profiles, or when the GPU has one or more than two local NET
+candidates. Those cases retain the upstream GPU-, topology-, and channel-based
+selection unchanged. No additional site-specific environment variable is
+required.
 
 ## AlltoAll Paths
 
@@ -203,7 +217,8 @@ python3 tools/sai/verify_a2a_algorithms.py --full-scale
 ```
 
 CI also compiles and runs `tools/sai/test_profile_activation.cc` to keep
-profile recognition and metadata parsing fail-closed.
+profile recognition, dual-rail local-NET selection, and metadata parsing
+fail-closed.
 
 ## License And Notice
 

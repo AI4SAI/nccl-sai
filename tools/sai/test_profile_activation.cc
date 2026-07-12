@@ -20,6 +20,15 @@ struct ProfileCase {
   bool enabled;
 };
 
+struct LocalNetCase {
+  const char* profile;
+  int channelId;
+  int localNetCount;
+  int upstreamIndex;
+  bool selected;
+  int expectedIndex;
+};
+
 int main() {
   const uint32_t ncclVersion = 22809;
   if (NCCL_SAI_INIT_SCHEMA_TAG != 0x5b7u) {
@@ -201,6 +210,45 @@ int main() {
     return 1;
   }
 
-  printf("profile activation checks passed: %zu\n", sizeof(cases) / sizeof(cases[0]));
+  const LocalNetCase localNetCases[] = {
+    {"ultrapod-fullmesh", 0, 2, 1, true, 0},
+    {"ultrapod-fullmesh", 1, 2, 0, true, 1},
+    {"ultrapod-fullmesh", 6, 2, 1, true, 0},
+    {"ultrapod-fullmesh-site_a.2", 7, 2, 0, true, 1},
+    {nullptr, 1, 2, 0, false, 0},
+    {"custom", 0, 2, 1, false, 1},
+    {"ultrapod", 1, 2, 0, false, 0},
+    {"slimpod", 0, 2, 1, false, 1},
+    {"ultrapod-fullmesh", 1, 1, 0, false, 0},
+    {"ultrapod-fullmesh", 2, 3, 2, false, 2},
+    {"ultrapod-fullmesh", 3, 4, 3, false, 3},
+    {"ultrapod-fullmesh", -1, 2, 1, false, 1},
+  };
+
+  for (size_t i = 0; i < sizeof(localNetCases) / sizeof(localNetCases[0]); i++) {
+    const LocalNetCase& test = localNetCases[i];
+    testProfile = test.profile;
+    int localNetIndex = test.upstreamIndex;
+    bool selected = ncclSaiSelectLocalNetByChannel(
+        test.channelId, test.localNetCount, &localNetIndex);
+    if (selected != test.selected || localNetIndex != test.expectedIndex) {
+      fprintf(stderr,
+          "local NET case %zu failed: profile=%s channel=%d count=%d "
+          "expected_selected=%d actual_selected=%d expected_index=%d actual_index=%d\n",
+          i, testProfile == nullptr ? "(null)" : testProfile, test.channelId,
+          test.localNetCount, test.selected, selected, test.expectedIndex, localNetIndex);
+      return 1;
+    }
+  }
+
+  testProfile = "ultrapod-fullmesh";
+  if (ncclSaiSelectLocalNetByChannel(0, 2, nullptr)) {
+    fprintf(stderr, "null local NET output unexpectedly selected a rail\n");
+    return 1;
+  }
+
+  printf("profile activation checks passed: %zu profiles, %zu local NET cases\n",
+      sizeof(cases) / sizeof(cases[0]),
+      sizeof(localNetCases) / sizeof(localNetCases[0]));
   return 0;
 }

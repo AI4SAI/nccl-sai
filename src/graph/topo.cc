@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include "cpuset.h"
 #include "bootstrap.h"
+#include "sai_profile.h"
 #include <mutex>
 
 #define BUSID_SIZE (sizeof("0000:00:00.0"))
@@ -1665,8 +1666,10 @@ ncclResult_t ncclTopoGetLocalNet(struct ncclTopoSystem* system, int rank, int ch
   int net = system->nodes[GPU].nodes[gpu].gpu.dev;
   if (isPow2(localNetCount)) net = mirrorBits(net, localNetCount);
   net += channelId%(netsPerGpu);
-  if (id) *id = system->nodes[NET].nodes[localNets[net%localNetCount]].id;
-  if (dev) *dev = system->nodes[NET].nodes[localNets[net%localNetCount]].net.dev;
+  int localNetIndex = net%localNetCount;
+  ncclSaiSelectLocalNetByChannel(channelId, localNetCount, &localNetIndex);
+  if (id) *id = system->nodes[NET].nodes[localNets[localNetIndex]].id;
+  if (dev) *dev = system->nodes[NET].nodes[localNets[localNetIndex]].net.dev;
   return ncclSuccess;
 }
 

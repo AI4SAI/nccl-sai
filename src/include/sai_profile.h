@@ -167,4 +167,15 @@ static inline bool ncclSaiFullMeshProfileEnabled() {
   return ncclSaiProfileFamily(value, "ultrapod-fullmesh");
 }
 
+// The validated full-mesh topology exposes exactly two local network rails per
+// GPU. Keep this override fail-closed so every other profile and topology uses
+// the upstream local-NET index selected by ncclTopoGetLocalNet.
+static inline bool ncclSaiSelectLocalNetByChannel(
+    int channelId, int localNetCount, int* localNetIndex) {
+  if (localNetIndex == nullptr || channelId < 0 || localNetCount != 2 ||
+      !ncclSaiFullMeshProfileEnabled()) return false;
+  *localNetIndex = channelId % 2;
+  return true;
+}
+
 #endif
