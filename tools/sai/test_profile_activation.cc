@@ -77,6 +77,25 @@ int main() {
     fprintf(stderr, "island scale guard changed unexpectedly\n");
     return 1;
   }
+  if (ncclSaiRailPathCapabilityClass(4, 4, 5) != 5 ||
+      ncclSaiRailPathCapabilityClass(5, 4, 5) != 5 ||
+      ncclSaiRailPathCapabilityClass(3, 4, 5) != -1 ||
+      ncclSaiRailPathCapabilityClass(6, 4, 5) != -1 ||
+      !ncclSaiRailPathPairEligible(4, 12.0f, 4, 12.0f, 4, 5) ||
+      !ncclSaiRailPathPairEligible(5, 12.0f, 5, 12.0f, 4, 5) ||
+      ncclSaiRailPathPairEligible(4, 12.0f, 5, 12.0f, 4, 5) ||
+      ncclSaiRailPathPairEligible(4, 12.0f, 4, 6.0f, 4, 5) ||
+      ncclSaiRailPathPairEligible(4, 0.0f, 4, 0.0f, 4, 5) ||
+      ncclSaiRailPathPairEligible(3, 12.0f, 3, 12.0f, 4, 5) ||
+      ncclSaiRailPathPairEligible(6, 12.0f, 6, 12.0f, 4, 5) ||
+      !ncclSaiRailPathClassesCompatible(5, 12.0f, 4, 12.0f, 4, 5) ||
+      !ncclSaiRailPathClassesCompatible(4, 12.0f, 5, 12.0f, 4, 5) ||
+      ncclSaiRailPathClassesCompatible(5, 12.0f, 6, 12.0f, 4, 5) ||
+      ncclSaiRailPathClassesCompatible(5, 0.0f, 4, 0.0f, 4, 5) ||
+      ncclSaiRailPathClassesCompatible(5, 12.0f, 4, 6.0f, 4, 5)) {
+    fprintf(stderr, "rail path qualification changed unexpectedly\n");
+    return 1;
+  }
   const uint32_t peerVersion = ncclSaiPeerVersion(ncclVersion);
   if ((peerVersion >> 20) != NCCL_SAI_INIT_SCHEMA_TAG ||
       (peerVersion & NCCL_SAI_PEER_NCCL_VERSION_MASK) != ncclVersion) {
@@ -356,18 +375,55 @@ int main() {
     fprintf(stderr, "ineligible rail rank was accepted\n");
     return 1;
   }
+  railInfo[1].eligible = 2;
+  if (ncclSaiRailInfoConsensus(railInfo, 2, &railEligibleRanks) ||
+      railEligibleRanks != 1) {
+    fprintf(stderr, "non-boolean rail eligibility was accepted\n");
+    return 1;
+  }
   railInfo[1].eligible = 1;
+  railInfo[1].policySignature++;
+  if (ncclSaiRailInfoConsensus(railInfo, 2, &railEligibleRanks)) {
+    fprintf(stderr, "mismatched rail policy was accepted\n");
+    return 1;
+  }
+  railInfo[1].policySignature = railInfo[0].policySignature;
   railInfo[1].topologyClass++;
   if (ncclSaiRailInfoConsensus(railInfo, 2, &railEligibleRanks)) {
     fprintf(stderr, "mismatched rail topology was accepted\n");
     return 1;
   }
   railInfo[1].topologyClass = railInfo[0].topologyClass;
-  railInfo[1].railSubnet[1]++;
+  railInfo[1].railSubnet[0]++;
   if (ncclSaiRailInfoConsensus(railInfo, 2, &railEligibleRanks)) {
-    fprintf(stderr, "mismatched rail subnet was accepted\n");
+    fprintf(stderr, "mismatched rail-0 subnet was accepted\n");
     return 1;
   }
+  railInfo[1].railSubnet[0] = railInfo[0].railSubnet[0];
+  railInfo[1].railSubnet[1]++;
+  if (ncclSaiRailInfoConsensus(railInfo, 2, &railEligibleRanks)) {
+    fprintf(stderr, "mismatched rail-1 subnet was accepted\n");
+    return 1;
+  }
+  railInfo[1].railSubnet[1] = railInfo[0].railSubnet[1];
+  for (int rank = 0; rank < 2; rank++) railInfo[rank].policySignature = 0;
+  if (ncclSaiRailInfoConsensus(railInfo, 2, &railEligibleRanks)) {
+    fprintf(stderr, "missing rail policy identity was accepted\n");
+    return 1;
+  }
+  for (int rank = 0; rank < 2; rank++) railInfo[rank].policySignature = 0x100;
+  for (int rank = 0; rank < 2; rank++) railInfo[rank].topologyClass = 0;
+  if (ncclSaiRailInfoConsensus(railInfo, 2, &railEligibleRanks)) {
+    fprintf(stderr, "missing rail topology identity was accepted\n");
+    return 1;
+  }
+  for (int rank = 0; rank < 2; rank++) railInfo[rank].topologyClass = 0x200;
+  for (int rank = 0; rank < 2; rank++) railInfo[rank].railSubnet[1] = 0x1111;
+  if (ncclSaiRailInfoConsensus(railInfo, 2, &railEligibleRanks)) {
+    fprintf(stderr, "identical rail subnets were accepted\n");
+    return 1;
+  }
+  for (int rank = 0; rank < 2; rank++) railInfo[rank].railSubnet[1] = 0x2222;
 
   struct ncclSaiIbEndpointPreflight ibEndpoints[9] = {};
   static const char* ibAdapterPaths[5] = {

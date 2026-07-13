@@ -206,18 +206,27 @@ struct ncclSaiRailInfo {
   int eligible;
 };
 
+static inline bool ncclSaiRailInfoComplete(
+    const struct ncclSaiRailInfo* info) {
+  return info != nullptr && info->eligible == 1 &&
+      info->policySignature != 0 && info->topologyClass != 0 &&
+      info->railSubnet[0] != 0 && info->railSubnet[1] != 0 &&
+      info->railSubnet[0] != info->railSubnet[1];
+}
+
 static inline bool ncclSaiRailInfoConsensus(
     const struct ncclSaiRailInfo* info, int ranks, int* eligibleRanks) {
   if (eligibleRanks != nullptr) *eligibleRanks = 0;
   if (info == nullptr || ranks <= 0) return false;
   bool enabled = true;
   for (int rank = 0; rank < ranks; rank++) {
-    if (info[rank].eligible != 0) {
+    if (info[rank].eligible == 1) {
       if (eligibleRanks != nullptr) (*eligibleRanks)++;
     } else {
       enabled = false;
     }
-    if (info[rank].policySignature != info[0].policySignature ||
+    if (!ncclSaiRailInfoComplete(info+rank) ||
+        info[rank].policySignature != info[0].policySignature ||
         info[rank].topologyClass != info[0].topologyClass ||
         info[rank].railSubnet[0] != info[0].railSubnet[0] ||
         info[rank].railSubnet[1] != info[0].railSubnet[1]) {
@@ -240,6 +249,32 @@ static inline bool ncclSaiRailSubnetsComplete(
     const uint64_t railSubnet[2]) {
   return railSubnet != nullptr && railSubnet[0] != 0 &&
       railSubnet[1] != 0 && railSubnet[0] != railSubnet[1];
+}
+
+static inline int ncclSaiRailPathCapabilityClass(
+    int pathType, int minimumType, int maximumType) {
+  return pathType >= minimumType && pathType <= maximumType ? maximumType : -1;
+}
+
+static inline bool ncclSaiRailPathPairEligible(
+    int firstType, float firstBw, int secondType, float secondBw,
+    int minimumType, int maximumType) {
+  return ncclSaiRailPathCapabilityClass(
+      firstType, minimumType, maximumType) >= 0 &&
+      ncclSaiRailPathCapabilityClass(
+          secondType, minimumType, maximumType) >= 0 &&
+      firstType == secondType && firstBw > 0 && firstBw == secondBw;
+}
+
+static inline bool ncclSaiRailPathClassesCompatible(
+    int referenceType, float referenceBw, int candidateType,
+    float candidateBw, int minimumType, int maximumType) {
+  int referenceClass = ncclSaiRailPathCapabilityClass(
+      referenceType, minimumType, maximumType);
+  int candidateClass = ncclSaiRailPathCapabilityClass(
+      candidateType, minimumType, maximumType);
+  return referenceClass >= 0 && referenceClass == candidateClass &&
+      referenceBw > 0 && referenceBw == candidateBw;
 }
 
 // The internal IB plugin has three endpoint-fusion states. Explicit

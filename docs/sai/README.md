@@ -88,8 +88,10 @@ locality domain. The node exposes four capability-symmetric dual-port network
 adapters; each adapter must provide two GDR-capable NET endpoints on one ASIC
 with physical ports `{1,2}`. The final topology must contain eight unmerged NET
 endpoints, every clique must resolve one distinct port pair, all GPU-to-port
-paths must have the same type and bandwidth, and all ranks must report the same
-normalized capability class. The internal IB transport must also expose two
+pairs must be type/bandwidth symmetric per GPU and no farther than PXB,
+all accepted GPU-to-port bandwidths must match, and all ranks must report the
+same normalized capability class. A clique may contain both PIX-local and
+PXB-local GPUs. The internal IB transport must also expose two
 distinct selected GID subnet prefixes: every physical port 1 must resolve the
 same prefix across all ranks, every physical port 2 must resolve the other
 prefix, and the two prefixes must differ. External network plugins or missing

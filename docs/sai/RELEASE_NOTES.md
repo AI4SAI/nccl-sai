@@ -44,8 +44,10 @@ contain one to four complete, equal-bandwidth four-GPU NVLink cliques of SM70
 GPUs, each on a distinct CPU locality domain, and exactly eight unmerged NET
 endpoints arranged as four capability-symmetric, GDR-capable dual-port
 adapters. Each clique must resolve one distinct physical port pair, and all
-GPU-to-port paths must have the same type and bandwidth. Slurm metadata, HCA
-strings, and merge-variable strings are not activation tests.
+GPU-to-port pairs must be symmetric and no farther than PXB. PIX/PXB placement
+may differ between GPUs in one clique, while the accepted path bandwidth must
+remain equal. Slurm metadata, HCA strings, and merge-variable strings are not
+activation tests.
 The internal IB transport must report two distinct selected GID subnet
 prefixes, with port 1 and port 2 each communicator-wide consistent; missing or
 inconsistent hardware identity retains upstream selection.

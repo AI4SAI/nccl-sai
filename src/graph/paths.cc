@@ -334,6 +334,32 @@ struct ncclSaiRailProbeDiagnostic {
   float bw1;
 };
 
+static const char* ncclSaiRailProbeRejectStageName(int stage) {
+  switch (stage) {
+  case ncclSaiRailProbeAccepted: return "accepted";
+  case ncclSaiRailProbeInvalidInput: return "invalid-input";
+  case ncclSaiRailProbeGpuCount: return "gpu-count";
+  case ncclSaiRailProbeGpuCapability: return "gpu-capability";
+  case ncclSaiRailProbeNvlinkShape: return "nvlink-shape";
+  case ncclSaiRailProbeNvlinkClique: return "nvlink-clique";
+  case ncclSaiRailProbeNvlinkBandwidth: return "nvlink-bandwidth";
+  case ncclSaiRailProbeCpuLocality: return "cpu-locality";
+  case ncclSaiRailProbeNetCount: return "net-count";
+  case ncclSaiRailProbeEndpointShape: return "endpoint-shape";
+  case ncclSaiRailProbeLocalNetCount: return "local-net-count";
+  case ncclSaiRailProbeLocalNetAdapter: return "local-net-adapter";
+  case ncclSaiRailProbeRailPort: return "rail-port";
+  case ncclSaiRailProbeLocalPathPair: return "local-path-pair";
+  case ncclSaiRailProbeGlobalPathShape: return "global-path-shape";
+  case ncclSaiRailProbeIslandNetBinding: return "island-net-binding";
+  case ncclSaiRailProbeIslandNetUniqueness:
+    return "island-net-uniqueness";
+  case ncclSaiRailProbeSubnetIdentity: return "subnet-identity";
+  case ncclSaiRailProbeSubnetPair: return "subnet-pair";
+  default: return "unknown";
+  }
+}
+
 static bool ncclSaiRejectRailProbe(
     struct ncclSaiRailProbeDiagnostic* diagnostic, int stage, int index = -1,
     int value0 = 0, int value1 = 0, float bw0 = 0, float bw1 = 0) {
@@ -544,8 +570,9 @@ static bool ncclSaiDualPortIslandTopology(
     struct ncclTopoNode* gpu = system->nodes[GPU].nodes+g;
     struct ncclTopoLinkList* path1 = gpu->paths[NET]+port1;
     struct ncclTopoLinkList* path2 = gpu->paths[NET]+port2;
-    if (path1->type > PATH_PXB || path2->type > PATH_PXB ||
-        path1->type != path2->type || path1->bw != path2->bw) {
+    if (!ncclSaiRailPathPairEligible(
+        path1->type, path1->bw, path2->type, path2->bw,
+        PATH_PIX, PATH_PXB)) {
       return ncclSaiRejectRailProbe(
           diagnostic, ncclSaiRailProbeLocalPathPair, g, path1->type,
           path2->type, path1->bw, path2->bw);
@@ -553,8 +580,9 @@ static bool ncclSaiDualPortIslandTopology(
     if (referencePathType == -1) {
       referencePathType = path1->type;
       referencePathBw = path1->bw;
-    } else if (referencePathType != path1->type ||
-        referencePathBw != path1->bw) {
+    } else if (!ncclSaiRailPathClassesCompatible(
+        referencePathType, referencePathBw, path1->type, path1->bw,
+        PATH_PIX, PATH_PXB)) {
       return ncclSaiRejectRailProbe(
           diagnostic, ncclSaiRailProbeGlobalPathShape, g,
           referencePathType, path1->type, referencePathBw, path1->bw);
@@ -603,7 +631,13 @@ static bool ncclSaiDualPortIslandTopology(
       topologyHash, endpointShape[0].gdrSupport);
   topologyHash = ncclSaiTopologyHashValue(
       topologyHash, endpointShape[0].collSupport);
-  topologyHash = ncclSaiTopologyHashValue(topologyHash, referencePathType);
+  // PIX/PXB placement can legitimately differ within one four-GPU island.
+  // The per-GPU dual-port pair is still required to be symmetric above, so
+  // hash the accepted capability ceiling instead of an enumeration-dependent
+  // first-GPU path type.
+  topologyHash = ncclSaiTopologyHashValue(topologyHash,
+      ncclSaiRailPathCapabilityClass(
+        referencePathType, PATH_PIX, PATH_PXB));
   topologyHash = ncclSaiTopologyHashFloat(topologyHash, referencePathBw);
   *topologyClass = topologyHash;
   return true;
@@ -641,11 +675,13 @@ ncclResult_t ncclTopoSaiGetRailInfo(
         &diagnostic, ncclSaiRailProbeSubnetPair, -1,
         railSubnet[0] != 0, railSubnet[1] != 0);
   }
-  if (!topologyEligible && comm != NULL) {
+  if (!topologyEligible && comm != NULL && system != NULL &&
+      system->nodes[NET].count == 8) {
     INFO(NCCL_INIT|NCCL_ENV,
-      "NCCL-SAI rail qualification rejected: rank %d stage %d index %d "
+      "NCCL-SAI rail qualification rejected: rank %d stage %s(%d) index %d "
       "value0 %d value1 %d bw0 %.3f bw1 %.3f",
-      comm->rank, diagnostic.stage, diagnostic.index, diagnostic.value0,
+      comm->rank, ncclSaiRailProbeRejectStageName(diagnostic.stage),
+      diagnostic.stage, diagnostic.index, diagnostic.value0,
       diagnostic.value1, diagnostic.bw0, diagnostic.bw1);
   }
   int automaticNetDevsPolicy = 0;
