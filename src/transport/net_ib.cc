@@ -968,6 +968,42 @@ ncclResult_t ncclIbGetProperties(int dev, ncclNetProperties_t* props) {
   return ncclSuccess;
 }
 
+ncclResult_t ncclIbGetSaiRailIdentity(
+    int dev, uint64_t* subnetPrefix, int* valid) {
+  if (subnetPrefix == nullptr || valid == nullptr) return ncclInvalidArgument;
+  *subnetPrefix = 0;
+  *valid = 0;
+  if (dev < 0 || dev >= ncclNMergedIbDevs) return ncclSuccess;
+
+  struct ncclIbMergedDev* mergedDev = ncclIbMergedDevs + dev;
+  if (mergedDev->vProps.ndevs != 1) return ncclSuccess;
+  int physDev = mergedDev->vProps.devs[0];
+  if (physDev < 0 || physDev >= ncclNIbDevs) return ncclSuccess;
+
+  struct ncclIbDev* ibDev = ncclIbDevs + physDev;
+  std::lock_guard<std::mutex> lock(ibDev->mutex);
+  if (ibDev->link != IBV_LINK_LAYER_INFINIBAND) return ncclSuccess;
+
+  int gidIndex = 0;
+  ncclResult_t result = ncclIbGetGidIndex(
+      ibDev->context, ibDev->portNum, &ibDev->portAttr, &gidIndex);
+  if (result != ncclSuccess) return ncclSuccess;
+  union ibv_gid gid;
+  result = wrap_ibv_query_gid(
+      ibDev->context, ibDev->portNum, gidIndex, &gid);
+  if (result != ncclSuccess) return ncclSuccess;
+
+  // Routable FLID GIDs encode a per-endpoint FLID in the upper portion of the
+  // raw prefix. Rail identity is the local subnet component used by the QP
+  // routing logic, not that endpoint-specific FLID.
+  uint64_t prefix = ncclIbExtractLocalSubnetPrefix(
+      gid.global.subnet_prefix);
+  if (prefix == 0) return ncclSuccess;
+  *subnetPrefix = prefix;
+  *valid = 1;
+  return ncclSuccess;
+}
+
 // We need to support NCCL_NET_MAX_REQUESTS for each concurrent receive
 #define MAX_REQUESTS (NCCL_NET_MAX_REQUESTS*NCCL_NET_IB_MAX_RECVS)
 static_assert(MAX_REQUESTS <= 256, "request id are encoded in wr_id and we need up to 8 requests ids per completion");

@@ -82,17 +82,26 @@ export FFLAGS="$CFLAGS"
 
 For an AVX-512 package, replace `x86-64-v3` with `x86-64-v4`.
 
-For NVIDIA HPC SDK compilers, prefer the matching portable target form when
-available:
+The NCCL-SAI 2.28.9 release build is pinned to GNU GCC because NCCL's default
+`PROFAPI` uses GNU alias/weak declarations that NVIDIA HPC SDK 25.7 `nvc++`
+does not compile correctly. Loading an NVHPC/OpenMPI consumer module can export
+`CXX=nvc++`, so the release command must override it explicitly:
 
 ```bash
-export CFLAGS="-O3 -DNDEBUG -tp=x86-64-v3"
+export CFLAGS="-O3 -DNDEBUG -march=x86-64-v3 -mtune=generic"
 export CXXFLAGS="$CFLAGS"
-export FCFLAGS="$CFLAGS"
+make -j "${BUILD_JOBS}" src.build \
+  CC=/usr/bin/gcc CXX=/usr/bin/g++ \
+  CUDA_HOME=<cuda-12.4-root> \
+  BUILDDIR="$PWD/build-release"
 ```
 
-Use `-tp=x86-64-v4` for an AVX-512 package. Avoid `native`, `host`, `znver*`,
-and Intel microarchitecture targets for public generic packages.
+Start from a fresh build directory. Record the real paths and versions of
+`gcc`, `g++`, and `nvcc`, the source/archive hash, `CUDA_HOME`,
+`NVCC_GENCODE`, and the complete make command in `BUILD_INFO.txt`. NVHPC remains
+a supported consumer MPI/application stack; it is not a claimed NCCL compiler
+for this release. Avoid `native`, `host`, `znver*`, and Intel
+microarchitecture targets for public generic packages.
 
 ## Dependency Consistency
 
@@ -118,8 +127,9 @@ tags. A safe public pattern is:
 - load `x86-64-v3` by default;
 - load `x86-64-v4` only when the current host satisfies the v4 feature set;
 - never silently load a v4 package on a v3-only host;
-- keep NCCL-SAI behavior disabled unless a site profile or explicit override is
-  set, as described in `docs/sai/README.md`.
+- require no `NCCL_SAI_*` activation variable in normal use; each optimization
+  must enable only after its runtime topology predicate and communicator-wide
+  agreement pass, as described in `docs/sai/README.md`.
 
 Runtime selection should be based on feature-level checks, not on CPU vendor
 strings or cluster-specific node names.

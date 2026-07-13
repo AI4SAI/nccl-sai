@@ -17,6 +17,7 @@
 #include "cpuset.h"
 #include "bootstrap.h"
 #include "sai_profile.h"
+#include <algorithm>
 #include <mutex>
 
 #define BUSID_SIZE (sizeof("0000:00:00.0"))
@@ -1633,6 +1634,44 @@ ncclResult_t ncclTopoGetNetDevsPolicy(enum netDevsPolicy* policy, int* policyNum
   return ncclSuccess;
 }
 
+void ncclTopoSaiSetRailByChannel(
+    struct ncclTopoSystem* system, bool enabled) {
+  if (system != NULL) system->saiRailByChannel = enabled;
+}
+
+bool ncclTopoSaiRailByChannelEnabled(struct ncclTopoSystem* system) {
+  return system != NULL && system->saiRailByChannel;
+}
+
+void ncclTopoSaiSetLocalP2pSys(
+    struct ncclTopoSystem* system, bool enabled) {
+  if (system != NULL) system->saiLocalP2pSys = enabled;
+}
+
+bool ncclTopoSaiLocalP2pSysEnabled(struct ncclTopoSystem* system) {
+  return system != NULL && system->saiLocalP2pSys;
+}
+
+static ncclResult_t ncclTopoSaiOrderLocalRailNets(
+    struct ncclTopoSystem* system, int* localNets, int localNetCount) {
+  if (!system->saiRailByChannel) return ncclSuccess;
+  if (localNets == NULL || localNetCount != 2) return ncclInternalError;
+
+  struct ncclTopoNode* net0 = system->nodes[NET].nodes+localNets[0];
+  struct ncclTopoNode* net1 = system->nodes[NET].nodes+localNets[1];
+  if (net0->net.asic != net1->net.asic) return ncclInternalError;
+  int port1Index = -1;
+  int port2Index = -1;
+  if (!ncclSaiOrderDualPortRails(
+      net0->net.port, net1->net.port, &port1Index, &port2Index)) {
+    return ncclInternalError;
+  }
+  if (port1Index == 1 && port2Index == 0) {
+    std::swap(localNets[0], localNets[1]);
+  }
+  return ncclSuccess;
+}
+
 ncclResult_t ncclTopoGetLocalNet(struct ncclTopoSystem* system, int rank, int channelId, int64_t* id, int* dev) {
   int gpu;
   NCCLCHECK(ncclTopoRankToIndex(system, rank, &gpu, /*showWarn=*/true));
@@ -1644,6 +1683,7 @@ ncclResult_t ncclTopoGetLocalNet(struct ncclTopoSystem* system, int rank, int ch
     WARN("Could not find any local path from gpu %d to net.", gpu);
     return ncclInternalError;
   }
+  NCCLCHECK(ncclTopoSaiOrderLocalRailNets(system, localNets, localNetCount));
 
   int netsPerGpu = 0;
   int policyCount = 0;
@@ -1667,7 +1707,8 @@ ncclResult_t ncclTopoGetLocalNet(struct ncclTopoSystem* system, int rank, int ch
   if (isPow2(localNetCount)) net = mirrorBits(net, localNetCount);
   net += channelId%(netsPerGpu);
   int localNetIndex = net%localNetCount;
-  ncclSaiSelectLocalNetByChannel(channelId, localNetCount, &localNetIndex);
+  ncclSaiSelectLocalNetByChannel(
+      system->saiRailByChannel, channelId, localNetCount, &localNetIndex);
   if (id) *id = system->nodes[NET].nodes[localNets[localNetIndex]].id;
   if (dev) *dev = system->nodes[NET].nodes[localNets[localNetIndex]].net.dev;
   return ncclSuccess;
@@ -1685,6 +1726,27 @@ ncclResult_t ncclTopoGetLocalNets(struct ncclTopoSystem* system, int rank, int64
   }
   // Convert index to ids
   for (int n=0; n<*localNetCount; n++) localNets[n] = system->nodes[NET].nodes[localNetIndexes[n]].id;
+  return ncclSuccess;
+}
+
+ncclResult_t ncclTopoGetLocalRailNets(
+    struct ncclTopoSystem* system, int rank,
+    int64_t* localNets, int* localNetCount) {
+  int gpu;
+  NCCLCHECK(ncclTopoRankToIndex(
+      system, rank, &gpu, /*showWarn=*/true));
+  int localNetIndexes[NCCL_TOPO_MAX_NODES];
+  NCCLCHECK(ncclTopoGetLocal(
+      system, GPU, gpu, NET, localNetIndexes, localNetCount, NULL));
+  if (*localNetCount == 0) {
+    WARN("Could not find any local path from gpu %d to net.", gpu);
+    return ncclInternalError;
+  }
+  NCCLCHECK(ncclTopoSaiOrderLocalRailNets(
+      system, localNetIndexes, *localNetCount));
+  for (int n = 0; n < *localNetCount; n++) {
+    localNets[n] = system->nodes[NET].nodes[localNetIndexes[n]].id;
+  }
   return ncclSuccess;
 }
 

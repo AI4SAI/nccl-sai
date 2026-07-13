@@ -10,6 +10,7 @@
 #include "nccl.h"
 #include "nccl_tuner.h"
 #include "device.h"
+#include "sai_profile.h"
 
 #define NCCL_MAX_NET_SIZE (1024*1024*1024L) // Rather than send INT_MAX which is 2G-1, send a power of two.
 
@@ -55,11 +56,53 @@ enum ncclSaiA2aConfigField {
   ncclSaiA2aConfigIslandMinRanks,
   ncclSaiA2aConfigIslandScratchCapBytes,
   ncclSaiA2aConfigP2pFabricSchedule,
+  ncclSaiA2aConfigActivationSource,
+  ncclSaiA2aConfigExplicitControlsPresent,
+  ncclSaiA2aConfigExplicitControlsSignature,
+  ncclSaiA2aConfigAutomaticPolicyMask,
   ncclSaiA2aConfigFieldCount,
 };
 struct ncclSaiA2aConfig {
   int64_t field[ncclSaiA2aConfigFieldCount];
 };
+static inline void ncclSaiA2aApplyAutomaticFallback(
+    struct ncclSaiA2aConfig* config) {
+  if (config == nullptr) return;
+  int64_t automaticPolicyMask = config->field[
+      ncclSaiA2aConfigAutomaticPolicyMask];
+  config->field[ncclSaiA2aConfigEnabled] =
+      ncclSaiA2aPolicyValueAfterAutomaticFallback(
+          config->field[ncclSaiA2aConfigEnabled], automaticPolicyMask,
+          ncclSaiA2aAutomaticBase);
+  config->field[ncclSaiA2aConfigActivationSource] =
+      ncclSaiA2aSourceAfterAutomaticFallback(
+          (int)config->field[ncclSaiA2aConfigActivationSource],
+          automaticPolicyMask);
+  config->field[ncclSaiA2aConfigPlannerEnable] =
+      ncclSaiA2aPolicyValueAfterAutomaticFallback(
+          config->field[ncclSaiA2aConfigPlannerEnable], automaticPolicyMask,
+          ncclSaiA2aAutomaticPlanner);
+  config->field[ncclSaiA2aConfigIslandEnable] =
+      ncclSaiA2aPolicyValueAfterAutomaticFallback(
+          config->field[ncclSaiA2aConfigIslandEnable], automaticPolicyMask,
+          ncclSaiA2aAutomaticIsland);
+  config->field[ncclSaiA2aConfigP2pFabricSchedule] =
+      ncclSaiA2aPolicyValueAfterAutomaticFallback(
+          config->field[ncclSaiA2aConfigP2pFabricSchedule],
+          automaticPolicyMask, ncclSaiA2aAutomaticP2pSchedule);
+  config->field[ncclSaiA2aConfigAutomaticPolicyMask] = 0;
+}
+static inline void ncclSaiA2aApplyCanonicalFallback(
+    struct ncclSaiA2aConfig* config) {
+  if (config == nullptr) return;
+  config->field[ncclSaiA2aConfigEnabled] = 0;
+  config->field[ncclSaiA2aConfigPlannerEnable] = 0;
+  config->field[ncclSaiA2aConfigIslandEnable] = 0;
+  config->field[ncclSaiA2aConfigP2pFabricSchedule] = 0;
+  config->field[ncclSaiA2aConfigActivationSource] =
+      ncclSaiA2aActivationDisabled;
+  config->field[ncclSaiA2aConfigAutomaticPolicyMask] = 0;
+}
 enum ncclSaiFabricGroupIdState {
   ncclSaiFabricGroupIdAbsent = 0,
   ncclSaiFabricGroupIdValid = 1,

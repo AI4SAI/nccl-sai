@@ -20,7 +20,7 @@ Use portable topology classes in public reports:
 Do not publish private domain labels, node lists, switch names, job IDs, or
 private artifact paths.
 
-## Full-Mesh Normalization
+## Expert Full-Mesh Research Boundary
 
 For a direct full-mesh fabric with `E` equal-bandwidth endpoints per group and
 one endpoint-bandwidth edge per group pair, the injection/edge balance point is
@@ -33,7 +33,7 @@ the ideal full-fabric bandwidth result. Fragmented allocations and concurrent
 traffic are separate isolation gates rather than substitutes for a balanced
 complete-group run.
 
-Automatic complete-group algorithms must fail closed when occupancy metadata
+Any expert complete-group algorithm must fail closed when occupancy metadata
 is missing or any group is partial, even if the total endpoint count equals an
 integer number of groups. Fragmented-group performance requires a separate
 occupancy-aware schedule and must not be inferred from group-ID discovery alone.
@@ -42,12 +42,28 @@ occupancy-aware schedule and must not be inferred from group-ID discovery alone.
 
 | Collective/API | Why It Matters | Required Public Gate |
 | --- | --- | --- |
-| `ncclAlltoAll()` | Primary NCCL-SAI optimized path; important for exchange-heavy workloads. | Small and large messages across local, same-domain, cross-domain, and multi-domain classes. |
+| `ncclAlltoAll()` | Expert-only implementation in this release; important for exchange-heavy research but not an automatic runtime capability. | When an AlltoAll claim is made, test small and large messages across local, same-domain, cross-domain, and multi-domain classes. |
 | `ncclAllReduce()` | Dominant data-parallel and solver collective; ring order can expose the slowest fabric segment. | Latency and bandwidth samples across same-domain and multi-domain classes, plus fragmented or concurrent-layout stress when available. |
 | `ncclReduceScatter()` / `ncclAllGather()` | Common in modern distributed training and optimizer pipelines. | Correctness and bandwidth non-regression against upstream behavior. |
 | `ncclBroadcast()` / `ncclReduce()` | Common control and solver phases. | Correctness and latency non-regression. |
 | P2P send/recv | Used directly by some runtimes and internally by collective implementations. | Correctness, fallback, and connection-resource stability at scale. |
 | MPI collectives with GPU buffers | Many scientific applications use MPI rather than NCCL APIs directly. | Verify the site MPI stack separately; do not infer MPI behavior from NCCL-only tests. |
+
+## Transparent Activation Gates
+
+Qualification of the default runtime must additionally prove:
+
+- the normal run has an empty `NCCL_SAI_*` set;
+- a supported physical topology activates rail and local-P2P capability without
+  Slurm identity, partition, hostname, or HCA-string matching;
+- the runtime implementation does not read `SLURM_*` variables for SAI policy;
+- normal zero-variable grouped AlltoAll/P2P remains upstream until a stable
+  hardware-backed fabric-group provider exists;
+- fabricated scheduler metadata cannot activate any SAI path;
+- `NCCL_IB_MERGE_NICS=1` remains runnable through upstream behavior, while
+  rail activation is decided from the resulting NET topology;
+- actual transport is established from `NCCL INFO Channel ... via ...` lines,
+  not from a GDR capability message.
 
 ## Message-Size Gates
 
@@ -75,7 +91,8 @@ Public reports should include:
 - CUDA version and compiled GPU architecture list;
 - benchmark name and message-size range;
 - sanitized topology class and rank count;
-- environment variables that affect NCCL-SAI behavior;
+- confirmation that the normal qualification set no `NCCL_SAI_*`, plus any
+  upstream NCCL controls and expert overrides used by separate comparison runs;
 - explicit rollback knobs.
 
 Public reports should not include:
@@ -87,7 +104,12 @@ Public reports should not include:
 
 ## Release Decision
 
-Treat alltoall optimization as necessary but not sufficient. A publishable
-runtime must also show that common non-alltoall collectives remain correct and
-that transparent defaults do not surprise applications that never call
-`ncclAlltoAll()`.
+AlltoAll optimization is not a default-release gate while stable hardware
+fabric-group identity is unavailable. A publishable runtime must prove the
+automatic rail and local-P2P paths, upstream fallback, and correctness of common
+collectives. Any expert AlltoAll performance claim is a separate qualification
+and must not be presented as transparent default behavior.
+
+`NCCL_IB_MERGE_NICS=0` versus `1` performance ordering may be reported only
+from a sustained same-candidate, same-layout A/B. A correctness pass in either
+mode is not a performance comparison.

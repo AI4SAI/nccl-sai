@@ -29,6 +29,10 @@ ncclResult_t ncclGpuGdrSupport(struct ncclComm* comm, int* gdrSupport);
 
 extern ncclNet_t ncclNetIb;
 extern ncclNet_t ncclNetSocket;
+// Internal-IB-only hardware identity used by the fail-closed SAI rail
+// classifier. External network plugins do not opt in implicitly.
+ncclResult_t ncclIbGetSaiRailIdentity(
+    int dev, uint64_t* subnetPrefix, int* valid);
 extern ncclGin_t ncclGinIbGdaki;
 extern ncclGin_t ncclGinIbProxy;
 

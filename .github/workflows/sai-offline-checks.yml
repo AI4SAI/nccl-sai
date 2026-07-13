@@ -3,34 +3,12 @@ name: NCCL-SAI offline checks
 on:
   push:
     paths:
-      - "src/collectives.cc"
-      - "src/enqueue.cc"
-      - "src/graph/connect.cc"
-      - "src/graph/paths.cc"
-      - "src/graph/search.cc"
-      - "src/graph/topo.cc"
-      - "src/include/graph.h"
-      - "src/include/collectives.h"
-      - "src/include/comm.h"
-      - "src/include/sai_profile.h"
-      - "src/init.cc"
-      - "src/transport/p2p.cc"
+      - "src/**"
       - "tools/sai/**"
       - ".github/workflows/sai-offline-checks.yml"
   pull_request:
     paths:
-      - "src/collectives.cc"
-      - "src/enqueue.cc"
-      - "src/graph/connect.cc"
-      - "src/graph/paths.cc"
-      - "src/graph/search.cc"
-      - "src/graph/topo.cc"
-      - "src/include/graph.h"
-      - "src/include/collectives.h"
-      - "src/include/comm.h"
-      - "src/include/sai_profile.h"
-      - "src/init.cc"
-      - "src/transport/p2p.cc"
+      - "src/**"
       - "tools/sai/**"
       - ".github/workflows/sai-offline-checks.yml"
 
@@ -47,9 +25,35 @@ jobs:
           python-version: "3.11"
       - name: Verify AlltoAll schedules and data mapping
         run: python3 tools/sai/verify_a2a_algorithms.py --full-scale
-      - name: Verify SAI profile activation
+      - name: Verify SAI activation helpers
         run: |
           g++ -std=c++11 -Wall -Wextra -Werror -Isrc/include \
             tools/sai/test_profile_activation.cc \
             -o "$RUNNER_TEMP/test_profile_activation"
           "$RUNNER_TEMP/test_profile_activation"
+      - name: Reject external SAI identity providers
+        run: |
+          if git grep -nE 'SLURM_' -- src tools; then
+            echo 'SAI runtime policy must not depend on scheduler identity' >&2
+            exit 1
+          fi
+          if git grep -nE '(ib_map\.d|sai_config)' -- src tools; then
+            echo 'SAI runtime policy must not use site configuration paths as identity' >&2
+            exit 1
+          fi
+          if git grep -nE 'SAI_RAIL_BY_CHANNEL' -- src tools; then
+            echo 'automatic rail selection must not depend on the legacy activation variable' >&2
+            exit 1
+          fi
+          mapfile -t sai_policy_files < <(
+            git grep -liE '(nccl[^[:space:]]*sai|NCCL_SAI)' -- src tools
+          )
+          if [ "${#sai_policy_files[@]}" -eq 0 ]; then
+            echo 'SAI identity guard did not discover any policy files' >&2
+            exit 1
+          fi
+          if grep -nE '(gethostname\(|getHostName\(|getenv\("HOSTNAME"\)|ncclGetEnv\("HOSTNAME"\))' \
+            "${sai_policy_files[@]}"; then
+            echo 'SAI runtime policy must not use hostname identity' >&2
+            exit 1
+          fi

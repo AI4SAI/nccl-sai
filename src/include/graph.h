@@ -18,6 +18,8 @@
 ncclResult_t ncclTopoCudaPath(int cudaDev, char** path);
 
 struct ncclTopoSystem;
+struct ncclSaiRailInfo;
+struct ncclSaiLocalP2pInfo;
 // Build the topology
 ncclResult_t ncclTopoGetSystem(struct ncclComm* comm, struct ncclTopoSystem** system, const char* dumpXmlFile=NULL);
 ncclResult_t ncclTopoSortSystem(struct ncclTopoSystem* system);
@@ -47,6 +49,17 @@ ncclResult_t ncclTopoNeedFlush(struct ncclComm* comm, int64_t netId, int netDev,
 ncclResult_t ncclTopoIsGdrAvail(struct ncclTopoSystem* system, int rank, bool *avail);
 ncclResult_t ncclTopoCheckNet(struct ncclTopoSystem* system, int rank1, int rank2, int* net);
 ncclResult_t ncclTopoSaiLocalP2pSysEligible(struct ncclComm* comm, struct ncclTopoSystem* system, int rank1, int rank2, int* eligible);
+ncclResult_t ncclTopoSaiGetLocalP2pInfo(
+    struct ncclComm* comm, struct ncclTopoSystem* system,
+    struct ncclSaiLocalP2pInfo* info);
+ncclResult_t ncclTopoSaiGetRailInfo(
+    struct ncclComm* comm, struct ncclTopoSystem* system,
+    struct ncclSaiRailInfo* info);
+bool ncclTopoSaiFullMeshTopologyEligible(struct ncclComm* comm);
+void ncclTopoSaiSetRailByChannel(struct ncclTopoSystem* system, bool enabled);
+bool ncclTopoSaiRailByChannelEnabled(struct ncclTopoSystem* system);
+void ncclTopoSaiSetLocalP2pSys(struct ncclTopoSystem* system, bool enabled);
+bool ncclTopoSaiLocalP2pSysEnabled(struct ncclTopoSystem* system);
 int ncclPxnDisable(struct ncclComm* comm);
 ncclResult_t ncclTopoGetPxnRanks(struct ncclComm* comm, int** intermediateRanks, int* nranks);
 ncclResult_t ncclGetLocalCpu(struct ncclTopoSystem* system, int gpu, int* retCpu);
@@ -75,6 +88,9 @@ ncclResult_t ncclTopoGetNetCount(struct ncclTopoSystem* system, int* count);
 ncclResult_t ncclTopoGetNvsCount(struct ncclTopoSystem* system, int* count);
 ncclResult_t ncclTopoGetLocalNet(struct ncclTopoSystem* system, int rank, int channelId, int64_t* id, int* dev);
 ncclResult_t ncclTopoGetLocalNets(struct ncclTopoSystem* system, int rank, int64_t* localNets, int* localNetCount);
+ncclResult_t ncclTopoGetLocalRailNets(
+    struct ncclTopoSystem* system, int rank,
+    int64_t* localNets, int* localNetCount);
 ncclResult_t ncclTopoGetLocalGpu(struct ncclTopoSystem* system, int64_t netId, int* gpuIndex);
 ncclResult_t getLocalNetCountByBw(struct ncclTopoSystem* system, int gpu, int *count);
 

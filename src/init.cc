@@ -1209,7 +1209,9 @@ static ncclResult_t ncclP2pSchedule(struct ncclComm* comm, int groupSize) {
         nodeRanks[n].localRanks % groupSize == 0;
   }
   bool saiScheduleRequested = comm->saiA2a.configConsistent &&
-      comm->saiA2a.config.field[ncclSaiA2aConfigP2pFabricSchedule] != 0;
+      ncclSaiP2pFabricScheduleRequested(
+          comm->saiA2a.config.field[ncclSaiA2aConfigEnabled] != 0,
+          comm->saiA2a.config.field[ncclSaiA2aConfigP2pFabricSchedule] != 0);
   bool saiCompleteScheduleAllowed = validSaiGroupNodes && ncclSaiP2pFabricScheduleAllowed(
       comm->nNodes, saiGroupNodes,
       comm->saiA2a.config.field[ncclSaiA2aConfigMultigroupEnable],
@@ -1427,6 +1429,7 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     struct ncclTopoRanks topoRanks;
     struct ncclSaiA2aConfig saiA2aConfig;
     struct ncclSaiFabricGroupInfo saiFabricGroup;
+    struct ncclSaiRailInfo saiRailInfo;
     uint64_t saiIslandScratchReserveBytes;
     int64_t p2pScheduleGroupSize;
     int saiIslandScratchReady;
@@ -1435,6 +1438,7 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     int localRanks;
   };
 
+  struct ncclSaiLocalP2pInfo saiLocalP2pInfo[8];
   int nChannelsOrig;
   struct allGatherInfo *allGather3Data = NULL;
   struct ncclTopoRanks** allTopoRanks = NULL;
@@ -1450,7 +1454,11 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   int p2pLevel = -1;
   int p2pScheduleGroupSize = 0;
   bool raggedBuildStatusRequired = false;
+  bool saiAutomaticConfigFallback = false;
+  bool saiConfigMismatchFallback = false;
+  bool saiExplicitConfigConsistent = true;
   int saiFabricValidRanks = 0, saiFabricAbsentRanks = 0, saiFabricInvalidRanks = 0;
+  int saiRailEligibleRanks = 0;
   size_t saiIslandScratchReserveBytes = 0;
   void* saiIslandScratch = nullptr;
 
@@ -1551,8 +1559,53 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
 
   // Topo detection / System graph creation
   NCCLCHECKGOTO(ncclTopoGetSystem(comm, &comm->topo), ret, fail);
-  // Compute paths between GPUs and NICs
+  // Compute an upstream-only path baseline first. The local two-island P2P
+  // relaxation is resolved communicator-wide before the post-trim recompute.
+  ncclTopoSaiSetLocalP2pSys(comm->topo, false);
   NCCLCHECKGOTO(ncclTopoComputePaths(comm->topo, comm), ret, fail);
+  if (nranks == 8) {
+    memset(saiLocalP2pInfo, 0, sizeof(saiLocalP2pInfo));
+    NCCLCHECKGOTO(ncclTopoSaiGetLocalP2pInfo(
+        comm, comm->topo, saiLocalP2pInfo+rank), ret, fail);
+    NCCLCHECKGOTO(bootstrapAllGather(
+        comm->bootstrap, saiLocalP2pInfo, sizeof(*saiLocalP2pInfo)), ret, fail);
+    bool localP2pPolicyConsistent = true;
+    bool localP2pTopologyConsistent = true;
+    bool localP2pAllEligible = true;
+    int localP2pEligibleRanks = 0;
+    for (int r = 0; r < nranks; r++) {
+      if (saiLocalP2pInfo[r].eligible != 0) localP2pEligibleRanks++;
+      else localP2pAllEligible = false;
+      if (saiLocalP2pInfo[r].policySignature !=
+          saiLocalP2pInfo[0].policySignature) localP2pPolicyConsistent = false;
+      if (saiLocalP2pInfo[r].topologyClass !=
+          saiLocalP2pInfo[0].topologyClass) localP2pTopologyConsistent = false;
+    }
+    int localP2pConsensus = ncclSaiResolveLocalP2pConsensus(
+        localP2pPolicyConsistent, localP2pAllEligible,
+        localP2pTopologyConsistent);
+    if (localP2pConsensus == ncclSaiLocalP2pConsensusReject) {
+      if (rank == 0) {
+        WARN("NCCL-SAI local P2P policy differs across ranks");
+      }
+      ret = ncclInvalidUsage;
+      goto fail;
+    }
+    bool localP2pEnabled =
+        localP2pConsensus == ncclSaiLocalP2pConsensusEnabled;
+    ncclTopoSaiSetLocalP2pSys(comm->topo, localP2pEnabled);
+    if (rank == 0) {
+      INFO(NCCL_INIT|NCCL_P2P,
+        "NCCL-SAI automatic local P2P policy: enabled %d eligibleRanks %d/%d",
+        localP2pEnabled ? 1 : 0, localP2pEligibleRanks, nranks);
+    }
+    // The upstream baseline may have marked cross-island GPU paths as NET
+    // when both P2P and SHM were unavailable. Recompute with the agreed policy
+    // before trimming so an eligible second island is not discarded from the
+    // topology. The normal post-trim recompute below remains the final path
+    // construction pass.
+    NCCLCHECKGOTO(ncclTopoComputePaths(comm->topo, comm), ret, fail);
+  }
   // Remove inaccessible GPUs and unused NICs
   NCCLCHECKGOTO(ncclTopoTrimSystem(comm->topo, comm), ret, fail);
   // Recompute paths after trimming
@@ -1659,6 +1712,8 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   allGather3Data[rank].cpuVendor = comm->cpuVendor;
   ncclSaiA2aGetConfig(comm, &allGather3Data[rank].saiA2aConfig);
   ncclSaiA2aGetFabricGroupInfo(&allGather3Data[rank].saiFabricGroup);
+  NCCLCHECKGOTO(ncclTopoSaiGetRailInfo(
+      comm, comm->topo, &allGather3Data[rank].saiRailInfo), ret, fail);
   allGather3Data[rank].p2pScheduleGroupSize = ncclParamGroupSize();
   saiIslandScratchReserveBytes = 0;
   allGather3Data[rank].saiIslandScratchReady = ncclSaiA2aAllocIslandScratch(
@@ -1671,6 +1726,49 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
 
   NCCLCHECKGOTO(bootstrapAllGather(comm->bootstrap, allGather3Data, sizeof(*allGather3Data)), ret, fail);
 
+  ncclTopoSaiSetRailByChannel(comm->topo, true);
+  for (int r = 0; r < nranks; r++) {
+    const struct ncclSaiRailInfo* info = &allGather3Data[r].saiRailInfo;
+    if (info->eligible != 0) saiRailEligibleRanks++;
+    if (info->eligible == 0 ||
+        info->policySignature != allGather3Data[0].saiRailInfo.policySignature ||
+        info->topologyClass != allGather3Data[0].saiRailInfo.topologyClass ||
+        info->railSubnet[0] !=
+            allGather3Data[0].saiRailInfo.railSubnet[0] ||
+        info->railSubnet[1] !=
+            allGather3Data[0].saiRailInfo.railSubnet[1]) {
+      ncclTopoSaiSetRailByChannel(comm->topo, false);
+    }
+  }
+  if (rank == 0) {
+    INFO(NCCL_INIT|NCCL_ENV,
+      "NCCL-SAI automatic dual-rail policy: enabled %d eligibleRanks %d/%d "
+      "port1Subnet 0x%lx port2Subnet 0x%lx",
+      ncclTopoSaiRailByChannelEnabled(comm->topo) ? 1 : 0,
+      saiRailEligibleRanks, nranks,
+      (unsigned long)allGather3Data[0].saiRailInfo.railSubnet[0],
+      (unsigned long)allGather3Data[0].saiRailInfo.railSubnet[1]);
+  }
+
+  for (int r = 1; r < nranks; r++) {
+    if (allGather3Data[0].saiA2aConfig.field[
+            ncclSaiA2aConfigExplicitControlsPresent] !=
+            allGather3Data[r].saiA2aConfig.field[
+            ncclSaiA2aConfigExplicitControlsPresent] ||
+        allGather3Data[0].saiA2aConfig.field[
+            ncclSaiA2aConfigExplicitControlsSignature] !=
+            allGather3Data[r].saiA2aConfig.field[
+            ncclSaiA2aConfigExplicitControlsSignature]) {
+      saiExplicitConfigConsistent = false;
+      break;
+    }
+  }
+  if (!saiExplicitConfigConsistent) {
+    WARN("NCCL-SAI explicit configuration differs across ranks");
+    ret = ncclInvalidUsage;
+    goto fail;
+  }
+
   comm->saiA2a.configConsistent = true;
   for (int r = 1; r < nranks; r++) {
     if (memcmp(allGather3Data[0].saiA2aConfig.field, allGather3Data[r].saiA2aConfig.field,
@@ -1680,11 +1778,46 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     }
   }
   if (!comm->saiA2a.configConsistent) {
-    WARN("NCCL-SAI configuration differs across ranks");
-    ret = ncclInvalidUsage;
-    goto fail;
+    // Rank-local automatic detection is an intersection, not an assertion.
+    // Any disagreement disables the SAI schedule everywhere while preserving
+    // communicator initialization and upstream behavior.
+    if (rank == 0) {
+      INFO(NCCL_INIT|NCCL_ENV,
+        "NCCL-SAI automatic AlltoAll policy disabled: rank-local capabilities differ");
+    }
+    saiAutomaticConfigFallback = true;
+    saiConfigMismatchFallback = true;
+    comm->saiA2a.configConsistent = true;
+    for (int r = 0; r < nranks; r++) {
+      allGather3Data[r].saiIslandScratchReady = 0;
+    }
   }
-  comm->saiA2a.config = allGather3Data[rank].saiA2aConfig;
+  if (!saiConfigMismatchFallback && comm->saiA2a.configConsistent &&
+      !ncclTopoSaiRailByChannelEnabled(comm->topo) &&
+      allGather3Data[0].saiA2aConfig.field[
+          ncclSaiA2aConfigAutomaticPolicyMask] != 0) {
+    if (rank == 0) {
+      INFO(NCCL_INIT|NCCL_ENV,
+        "NCCL-SAI automatic fabric policies disabled: dual-rail policy is unavailable");
+    }
+    saiAutomaticConfigFallback = true;
+    int64_t automaticPolicyMask = allGather3Data[0].saiA2aConfig.field[
+        ncclSaiA2aConfigAutomaticPolicyMask];
+    if ((automaticPolicyMask &
+        (ncclSaiA2aAutomaticBase | ncclSaiA2aAutomaticIsland)) != 0) {
+      for (int r = 0; r < nranks; r++) {
+        allGather3Data[r].saiIslandScratchReady = 0;
+      }
+    }
+  }
+  comm->saiA2a.config = saiConfigMismatchFallback ?
+      allGather3Data[0].saiA2aConfig :
+      allGather3Data[rank].saiA2aConfig;
+  if (saiConfigMismatchFallback) {
+    ncclSaiA2aApplyCanonicalFallback(&comm->saiA2a.config);
+  } else if (saiAutomaticConfigFallback) {
+    ncclSaiA2aApplyAutomaticFallback(&comm->saiA2a.config);
+  }
   comm->saiA2a.islandScratchReady = true;
   for (int r = 0; r < nranks; r++) {
     if (allGather3Data[r].saiIslandScratchReady == 0 ||
@@ -1848,8 +1981,7 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
 
   p2pScheduleGroupSize = ncclP2pScheduleGroupSize(
       comm, allGather3Data[rank].p2pScheduleGroupSize);
-  if (comm->saiA2a.config.field[ncclSaiA2aConfigEnabled] != 0 ||
-      comm->saiA2a.config.field[ncclSaiA2aConfigP2pFabricSchedule] != 0) {
+  if (comm->saiA2a.config.field[ncclSaiA2aConfigEnabled] != 0) {
     if (p2pScheduleGroupSize <= 0) {
       WARN("NCCL-SAI invalid effective P2P schedule group size");
       ret = ncclInvalidUsage;

@@ -1294,8 +1294,9 @@ ncclResult_t ncclTopoGetNetDev(struct ncclComm* comm, int rank, struct ncclTopoG
       bool railPolicySelected = false;
 
       if (ncclSaiGraphRailByChannelEnabled(
+              comm->topo->saiRailByChannel,
               ncclParamCrossNic(), graph->collNet)) {
-        NCCLCHECK(ncclTopoGetLocalNets(
+        NCCLCHECK(ncclTopoGetLocalRailNets(
             comm->topo, rank, localNets, &localNetCount));
         for (int n = 0; n < localNetCount; n++) {
           if (localNets[n] == graphNetId) graphNetIsLocal = true;
@@ -1306,7 +1307,8 @@ ncclResult_t ncclTopoGetNetDev(struct ncclComm* comm, int rank, struct ncclTopoG
         // network device and proxy rank.
         int64_t selectedNetId = graphNetId;
         railPolicySelected = ncclSaiSelectGraphNetByChannel(
-            channelId, localNets, localNetCount, &selectedNetId);
+            comm->topo->saiRailByChannel, channelId,
+            localNets, localNetCount, &selectedNetId);
         if (railPolicySelected) {
           netId = selectedNetId;
         }

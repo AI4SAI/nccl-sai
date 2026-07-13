@@ -36,6 +36,7 @@ static ncclResult_t getPath(struct ncclTopoSystem* system, struct ncclTopoNode* 
 }
 
 NCCL_PARAM(NvbDisable, "NVB_DISABLE", 0);
+extern int64_t ncclParamCrossNic();
 
 static ncclResult_t ncclTopoSetPaths(struct ncclTopoNode* baseNode, struct ncclTopoSystem* system) {
   if (baseNode->paths[baseNode->type] == NULL) {
@@ -280,24 +281,356 @@ static int ncclSaiFindParent(int* parent, int x) {
   return x;
 }
 
-static void ncclSaiUnionParent(int* parent, int a, int b) {
-  int pa = ncclSaiFindParent(parent, a);
-  int pb = ncclSaiFindParent(parent, b);
-  if (pa != pb) parent[pb] = pa;
-}
-
-static bool ncclSaiLocalP2pSysEnabled() {
+static bool ncclSaiLocalP2pSysPolicyRequested() {
+  if (ncclSaiGloballyDisabled()) return false;
   int64_t enabled = ncclParamSaiLocalP2pSysEnable();
   if (enabled == 0) return false;
   if (enabled > 0) return true;
-  return ncclSaiFabricProfileEnabled();
+  return true;
+}
+
+static uint64_t ncclSaiTopologyHashValue(uint64_t hash, uint64_t value) {
+  for (int byte = 0; byte < 8; byte++) {
+    hash ^= (unsigned char)(value >> (byte * 8));
+    hash *= UINT64_C(1099511628211);
+  }
+  return hash;
+}
+
+static uint64_t ncclSaiTopologyHashFloat(uint64_t hash, float value) {
+  uint32_t bits = 0;
+  memcpy(&bits, &value, sizeof(bits));
+  return ncclSaiTopologyHashValue(hash, bits);
+}
+
+static bool ncclSaiFourGpuIslandPartition(
+    struct ncclTopoSystem* system, int* parent, int* nCompsOut,
+    float* nvBwOut) {
+  if (system == NULL || parent == NULL || nCompsOut == NULL ||
+      nvBwOut == NULL) return false;
+  const int nGpus = system->nodes[GPU].count;
+  if (nGpus < 4 || nGpus > 16 || nGpus % 4 != 0) return false;
+
+  uint64_t peerMasks[16] = { 0 };
+  float nvBw[16][16] = { { 0 } };
+  for (int i = 0; i < nGpus; i++) {
+    if (system->nodes[GPU].nodes[i].gpu.cudaCompCap != 70) return false;
+    struct ncclTopoNode* gpu = system->nodes[GPU].nodes+i;
+    for (int l = 0; l < gpu->nlinks; l++) {
+      struct ncclTopoLink* link = gpu->links+l;
+      if (link->type != LINK_NVL || link->remNode == NULL ||
+          link->remNode->type != GPU) continue;
+      ptrdiff_t peer = link->remNode - system->nodes[GPU].nodes;
+      if (peer < 0 || peer >= nGpus || peer == i || link->bw <= 0 ||
+          (peerMasks[i] & (UINT64_C(1) << peer)) != 0) return false;
+      peerMasks[i] |= UINT64_C(1) << peer;
+      nvBw[i][peer] = link->bw;
+    }
+  }
+  if (!ncclSaiFourGpuCliqueMasks(nGpus, peerMasks)) return false;
+  for (int i = 0; i < nGpus; i++) {
+    parent[i] = ncclSaiFirstSet64(peerMasks[i] | (UINT64_C(1) << i));
+    if (parent[i] < 0) return false;
+  }
+  const int nComps = nGpus / 4;
+
+  float referenceNvBw = 0;
+  for (int first = 0; first < nGpus; first++) {
+    for (int second = first+1; second < nGpus; second++) {
+      if (parent[first] != parent[second]) continue;
+      if (nvBw[first][second] <= 0 ||
+          nvBw[first][second] != nvBw[second][first]) return false;
+      if (referenceNvBw == 0) referenceNvBw = nvBw[first][second];
+      else if (referenceNvBw != nvBw[first][second]) return false;
+    }
+  }
+  if (referenceNvBw <= 0) return false;
+
+  // Bind each NVLink island to one physical CPU locality domain. This is based
+  // on GPU/PCI/CPU hardware paths, not on the GPU->GPU path type that NCCL may
+  // later rewrite to NET when P2P/SHM policy is evaluated.
+  int compCpu[NCCL_TOPO_MAX_NODES];
+  for (int i = 0; i < NCCL_TOPO_MAX_NODES; i++) compCpu[i] = -1;
+  for (int i = 0; i < nGpus; i++) {
+    int cpu = -1;
+    if (ncclGetLocalCpu(system, i, &cpu) != ncclSuccess || cpu < 0 ||
+        cpu >= system->nodes[CPU].count) return false;
+    int root = ncclSaiFindParent(parent, i);
+    if (compCpu[root] == -1) compCpu[root] = cpu;
+    else if (compCpu[root] != cpu) return false;
+  }
+  for (int first = 0; first < nGpus; first++) {
+    if (compCpu[first] < 0) continue;
+    for (int second = first+1; second < nGpus; second++) {
+      if (compCpu[second] >= 0 && compCpu[first] == compCpu[second]) {
+        return false;
+      }
+    }
+  }
+
+  *nCompsOut = nComps;
+  *nvBwOut = referenceNvBw;
+  return true;
+}
+
+static bool ncclSaiDualPortIslandTopology(
+    struct ncclTopoSystem* system, uint64_t* topologyClass) {
+  if (system == NULL || topologyClass == NULL) return false;
+
+  int parent[NCCL_TOPO_MAX_NODES];
+  int nComps = 0;
+  float referenceNvBw = 0;
+  if (!ncclSaiFourGpuIslandPartition(
+      system, parent, &nComps, &referenceNvBw)) return false;
+  if (nComps != system->nodes[GPU].count / 4 ||
+      system->nodes[NET].count != 8) return false;
+
+  // The unmerged fabric class is four dual-port adapters. Port identity is
+  // the rail identity; NET enumeration order is deliberately irrelevant.
+  struct ncclSaiNetEndpointShape endpointShape[8];
+  int adapterGroup[8];
+  for (int n = 0; n < system->nodes[NET].count; n++) {
+    struct ncclTopoNode* net = system->nodes[NET].nodes+n;
+    endpointShape[n].asic = net->net.asic;
+    endpointShape[n].pciId = net->net.pciId;
+    endpointShape[n].port = net->net.port;
+    endpointShape[n].bw = net->net.bw;
+    endpointShape[n].latency = net->net.latency;
+    endpointShape[n].maxChannels = net->net.maxChannels;
+    endpointShape[n].gdrSupport = net->net.gdrSupport;
+    endpointShape[n].collSupport = net->net.collSupport;
+  }
+  if (!ncclSaiSymmetricDualPortAdapters(
+      endpointShape, system->nodes[NET].count, adapterGroup)) return false;
+
+  int compNetPort1[NCCL_TOPO_MAX_NODES];
+  int compNetPort2[NCCL_TOPO_MAX_NODES];
+  for (int i = 0; i < NCCL_TOPO_MAX_NODES; i++) {
+    compNetPort1[i] = -1;
+    compNetPort2[i] = -1;
+  }
+
+  const int nGpus = system->nodes[GPU].count;
+  int referencePathType = -1;
+  float referencePathBw = 0;
+  for (int g = 0; g < nGpus; g++) {
+    int localNets[NCCL_TOPO_MAX_NODES];
+    int localNetCount = 0;
+    if (ncclTopoGetLocal(system, GPU, g, NET, localNets,
+        &localNetCount, NULL) != ncclSuccess || localNetCount != 2) return false;
+
+    struct ncclTopoNode* net0 = system->nodes[NET].nodes+localNets[0];
+    struct ncclTopoNode* net1 = system->nodes[NET].nodes+localNets[1];
+    if (adapterGroup[localNets[0]] != adapterGroup[localNets[1]] ||
+        net0->net.gdrSupport == 0 || net1->net.gdrSupport == 0) return false;
+    int port1Index = -1;
+    int port2Index = -1;
+    if (!ncclSaiOrderDualPortRails(
+        net0->net.port, net1->net.port, &port1Index, &port2Index)) return false;
+    int port1 = localNets[port1Index];
+    int port2 = localNets[port2Index];
+
+    struct ncclTopoNode* gpu = system->nodes[GPU].nodes+g;
+    struct ncclTopoLinkList* path1 = gpu->paths[NET]+port1;
+    struct ncclTopoLinkList* path2 = gpu->paths[NET]+port2;
+    if (path1->type > PATH_PXB || path2->type > PATH_PXB ||
+        path1->type != path2->type || path1->bw != path2->bw) return false;
+    if (referencePathType == -1) {
+      referencePathType = path1->type;
+      referencePathBw = path1->bw;
+    } else if (referencePathType != path1->type ||
+        referencePathBw != path1->bw) {
+      return false;
+    }
+
+    int root = ncclSaiFindParent(parent, g);
+    if (compNetPort1[root] == -1) {
+      compNetPort1[root] = port1;
+      compNetPort2[root] = port2;
+    } else if (compNetPort1[root] != port1 || compNetPort2[root] != port2) {
+      return false;
+    }
+  }
+
+  for (int first = 0; first < nGpus; first++) {
+    if (compNetPort1[first] < 0) continue;
+    for (int second = first+1; second < nGpus; second++) {
+      if (compNetPort1[second] < 0) continue;
+      if (compNetPort1[first] == compNetPort1[second] ||
+          compNetPort2[first] == compNetPort2[second]) return false;
+    }
+  }
+
+  uint64_t topologyHash = UINT64_C(14695981039346656037);
+  static const char topologyDomain[] = "nccl-sai:dual-port-topology:v2";
+  for (size_t i = 0; i < sizeof(topologyDomain) - 1; i++) {
+    topologyHash ^= (unsigned char)topologyDomain[i];
+    topologyHash *= UINT64_C(1099511628211);
+  }
+  topologyHash = ncclSaiTopologyHashValue(topologyHash, nGpus);
+  topologyHash = ncclSaiTopologyHashValue(topologyHash, nComps);
+  topologyHash = ncclSaiTopologyHashFloat(topologyHash, referenceNvBw);
+  topologyHash = ncclSaiTopologyHashFloat(topologyHash, endpointShape[0].bw);
+  topologyHash = ncclSaiTopologyHashFloat(
+      topologyHash, endpointShape[0].latency);
+  topologyHash = ncclSaiTopologyHashValue(
+      topologyHash, endpointShape[0].maxChannels);
+  topologyHash = ncclSaiTopologyHashValue(
+      topologyHash, endpointShape[0].gdrSupport);
+  topologyHash = ncclSaiTopologyHashValue(
+      topologyHash, endpointShape[0].collSupport);
+  topologyHash = ncclSaiTopologyHashValue(topologyHash, referencePathType);
+  topologyHash = ncclSaiTopologyHashFloat(topologyHash, referencePathBw);
+  *topologyClass = topologyHash;
+  return true;
+}
+
+ncclResult_t ncclTopoSaiGetRailInfo(
+    struct ncclComm* comm, struct ncclTopoSystem* system,
+    struct ncclSaiRailInfo* info) {
+  if (info == NULL) return ncclInvalidArgument;
+  memset(info, 0, sizeof(*info));
+
+  uint64_t topologyClass = 0;
+  bool topologyEligible = ncclSaiDualPortIslandTopology(
+      system, &topologyClass);
+  uint64_t railSubnet[2] = {0, 0};
+  if (comm == NULL || comm->ncclNet != &ncclNetIb) return ncclSuccess;
+  for (int n = 0; topologyEligible && n < system->nodes[NET].count; n++) {
+    struct ncclTopoNode* net = system->nodes[NET].nodes+n;
+    uint64_t subnetPrefix = 0;
+    int valid = 0;
+    NCCLCHECK(ncclIbGetSaiRailIdentity(
+        net->net.dev, &subnetPrefix, &valid));
+    if (valid == 0 || !ncclSaiAccumulateRailSubnet(
+        net->net.port, subnetPrefix, railSubnet)) {
+      topologyEligible = false;
+    }
+  }
+  if (!ncclSaiRailSubnetsComplete(railSubnet)) topologyEligible = false;
+  enum netDevsPolicy netPolicy = NETDEVS_POLICY_UNDEF;
+  NCCLCHECK(ncclTopoGetNetDevsPolicy(&netPolicy, NULL));
+  if (netPolicy != NETDEVS_POLICY_AUTO) return ncclSuccess;
+  if (!ncclSaiRailByChannelRequested(
+      topologyEligible, (int)ncclParamCrossNic())) return ncclSuccess;
+
+  info->policySignature = ncclSaiRailPolicySignature();
+  info->topologyClass = topologyClass;
+  info->railSubnet[0] = railSubnet[0];
+  info->railSubnet[1] = railSubnet[1];
+  info->eligible = 1;
+  return ncclSuccess;
+}
+
+bool ncclTopoSaiFullMeshTopologyEligible(struct ncclComm* comm) {
+  if (comm == NULL || comm->topo == NULL || comm->peerInfo == NULL) return false;
+  int hostRanks = 0;
+  uint64_t hostHash = comm->peerInfo[comm->rank].hostHash;
+  for (int r = 0; r < comm->nRanks; r++) {
+    if (comm->peerInfo[r].hostHash == hostHash) hostRanks++;
+  }
+  if (hostRanks != 4) return false;
+  if (comm->topo->nodes[GPU].count != 4) return false;
+  uint64_t topologyClass = 0;
+  return ncclSaiDualPortIslandTopology(comm->topo, &topologyClass);
+}
+
+ncclResult_t ncclTopoSaiGetLocalP2pInfo(
+    struct ncclComm* comm, struct ncclTopoSystem* system,
+    struct ncclSaiLocalP2pInfo* info) {
+  if (info == NULL) return ncclInvalidArgument;
+  memset(info, 0, sizeof(*info));
+  info->policySignature = ncclSaiLocalP2pPolicySignature();
+
+  if (!ncclSaiLocalP2pSysPolicyRequested() || comm == NULL ||
+      system == NULL || comm->MNNVL || comm->peerInfo == NULL ||
+      comm->nRanks != 8 || system->nodes[GPU].count != 8) {
+    return ncclSuccess;
+  }
+  int p2pLevel = PATH_PXB;
+  NCCLCHECK(ncclGetUserP2pLevel(&p2pLevel));
+  if (!ncclSaiLocalP2pAutomaticLevelAllowed(
+      ncclTopoUserP2pLevel, -2, PATH_NVL)) return ncclSuccess;
+
+  uint64_t hostHash = comm->peerInfo[0].hostHash;
+  dev_t shmDev = comm->peerInfo[0].shmDev;
+  for (int r = 1; r < comm->nRanks; r++) {
+    if (comm->peerInfo[r].hostHash != hostHash ||
+        comm->peerInfo[r].shmDev != shmDev) return ncclSuccess;
+  }
+
+  int parent[NCCL_TOPO_MAX_NODES];
+  int nComps = 0;
+  float islandNvBw = 0;
+  if (!ncclSaiFourGpuIslandPartition(
+      system, parent, &nComps, &islandNvBw) ||
+      nComps != 2) return ncclSuccess;
+
+  int gpuIndex[8];
+  bool seenGpu[8] = { false };
+  for (int r = 0; r < comm->nRanks; r++) {
+    ncclResult_t result = ncclTopoRankToIndex(
+        system, r, gpuIndex+r, /*showWarn=*/false);
+    if (result == ncclInternalError) return ncclSuccess;
+    NCCLCHECK(result);
+    if (gpuIndex[r] < 0 || gpuIndex[r] >= 8 || seenGpu[gpuIndex[r]]) {
+      return ncclSuccess;
+    }
+    seenGpu[gpuIndex[r]] = true;
+  }
+
+  // The policy raises cross-island paths from SYS to P2P. Require the actual
+  // NVML read/write capability for every such directed GPU pair before any
+  // rank can vote the policy eligible. This keeps the communicator-wide vote
+  // tied to hardware capability rather than to the graph shape alone.
+  if (ncclNvmlEnsureInitialized() != ncclSuccess) return ncclSuccess;
+
+  uint64_t crossIslandRankPairs = 0;
+  int pairBit = 0;
+  for (int first = 0; first < comm->nRanks; first++) {
+    int firstRoot = ncclSaiFindParent(parent, gpuIndex[first]);
+    for (int second = first+1; second < comm->nRanks; second++) {
+      int secondRoot = ncclSaiFindParent(parent, gpuIndex[second]);
+      if (firstRoot != secondRoot) {
+        int firstDev = system->nodes[GPU].nodes[gpuIndex[first]].gpu.dev;
+        int secondDev = system->nodes[GPU].nodes[gpuIndex[second]].gpu.dev;
+        if (firstDev < 0 || firstDev >= ncclNvmlDeviceCount ||
+            secondDev < 0 || secondDev >= ncclNvmlDeviceCount ||
+            ncclNvmlDevicePairs[firstDev][secondDev].p2pStatusRead !=
+                NVML_P2P_STATUS_OK ||
+            ncclNvmlDevicePairs[firstDev][secondDev].p2pStatusWrite !=
+                NVML_P2P_STATUS_OK ||
+            ncclNvmlDevicePairs[secondDev][firstDev].p2pStatusRead !=
+                NVML_P2P_STATUS_OK ||
+            ncclNvmlDevicePairs[secondDev][firstDev].p2pStatusWrite !=
+                NVML_P2P_STATUS_OK) {
+          return ncclSuccess;
+        }
+        crossIslandRankPairs |= UINT64_C(1) << pairBit;
+      }
+      pairBit++;
+    }
+  }
+  uint64_t topologyHash = UINT64_C(14695981039346656037);
+  static const char topologyDomain[] = "nccl-sai:local-p2p-topology:v2";
+  for (size_t i = 0; i < sizeof(topologyDomain) - 1; i++) {
+    topologyHash ^= (unsigned char)topologyDomain[i];
+    topologyHash *= UINT64_C(1099511628211);
+  }
+  topologyHash = ncclSaiTopologyHashValue(topologyHash, nComps);
+  topologyHash = ncclSaiTopologyHashFloat(topologyHash, islandNvBw);
+  topologyHash = ncclSaiTopologyHashValue(
+      topologyHash, crossIslandRankPairs);
+  info->topologyClass = topologyHash;
+  info->eligible = 1;
+  return ncclSuccess;
 }
 
 ncclResult_t ncclTopoSaiLocalP2pSysEligible(struct ncclComm* comm, struct ncclTopoSystem* system, int rank1, int rank2, int* eligible) {
   if (eligible == NULL) return ncclInvalidArgument;
   *eligible = 0;
-  if (!ncclSaiLocalP2pSysEnabled()) return ncclSuccess;
-  if (comm == NULL || system == NULL) return ncclSuccess;
+  if (!ncclTopoSaiLocalP2pSysEnabled(system)) return ncclSuccess;
+  if (comm == NULL || system == NULL || comm->MNNVL) return ncclSuccess;
   if (comm->nRanks != 8 || comm->peerInfo == NULL) return ncclSuccess;
   if (rank1 < 0 || rank1 >= comm->nRanks || rank2 < 0 || rank2 >= comm->nRanks) return ncclSuccess;
 
@@ -314,35 +647,20 @@ ncclResult_t ncclTopoSaiLocalP2pSysEligible(struct ncclComm* comm, struct ncclTo
     NCCLCHECK(ret);
   }
 
-  int parent[8];
-  for (int i = 0; i < comm->nRanks; i++) parent[i] = i;
-  for (int i = 0; i < comm->nRanks; i++) {
-    struct ncclTopoNode* gpu = system->nodes[GPU].nodes+gpuIndex[i];
-    for (int j = i+1; j < comm->nRanks; j++) {
-      int type = gpu->paths[GPU][gpuIndex[j]].type;
-      if (type <= PATH_NVB) ncclSaiUnionParent(parent, i, j);
-    }
-  }
-
-  int compCount[8] = { 0 };
+  int parent[NCCL_TOPO_MAX_NODES];
   int nComps = 0;
-  for (int i = 0; i < comm->nRanks; i++) {
-    int root = ncclSaiFindParent(parent, i);
-    if (compCount[root] == 0) nComps++;
-    compCount[root]++;
-  }
-  if (nComps != 2) return ncclSuccess;
-  for (int i = 0; i < comm->nRanks; i++) {
-    if (compCount[i] != 0 && compCount[i] != 4) return ncclSuccess;
-  }
+  float islandNvBw = 0;
+  if (!ncclSaiFourGpuIslandPartition(
+      system, parent, &nComps, &islandNvBw) ||
+      nComps != 2) return ncclSuccess;
 
-  int root1 = ncclSaiFindParent(parent, rank1);
-  int root2 = ncclSaiFindParent(parent, rank2);
+  int root1 = ncclSaiFindParent(parent, gpuIndex[rank1]);
+  int root2 = ncclSaiFindParent(parent, gpuIndex[rank2]);
   if (root1 == root2) return ncclSuccess;
 
   struct ncclTopoNode* gpu1 = system->nodes[GPU].nodes+gpuIndex[rank1];
   int crossType = gpu1->paths[GPU][gpuIndex[rank2]].type;
-  if (crossType > PATH_NVB && crossType <= PATH_SYS) {
+  if (crossType == PATH_SYS) {
     *eligible = 1;
     if (ncclParamSaiLocalP2pSysTrace() && comm->rank == 0) {
       INFO(NCCL_INIT|NCCL_P2P, "SAI local P2P SYS enabled for single-host two-island communicator: rank %d <-> rank %d path %s",
@@ -409,8 +727,11 @@ ncclResult_t ncclTopoCheckP2p(struct ncclComm* comm, struct ncclTopoSystem* syst
 
   // User override
   NCCLCHECK(ncclGetUserP2pLevel(&p2pLevel));
-  // Standard NCCL user controls take precedence over the profile default.
-  if (ncclTopoUserP2pLevel == -2 && p2pLevel < PATH_SYS) {
+  // An unset level or the site's NVLink-only baseline may admit this strict
+  // hardware-qualified exception. Every other explicit upstream level,
+  // including NCCL_P2P_DISABLE=1 resolving to PATH_LOC, retains precedence.
+  if (ncclSaiLocalP2pAutomaticLevelAllowed(
+      ncclTopoUserP2pLevel, -2, PATH_NVL) && p2pLevel < PATH_SYS) {
     int saiLocalP2pSys = 0;
     NCCLCHECK(ncclTopoSaiLocalP2pSysEligible(comm, system, rank1, rank2, &saiLocalP2pSys));
     if (saiLocalP2pSys) p2pLevel = PATH_SYS;

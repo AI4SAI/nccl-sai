@@ -1,9 +1,9 @@
 # MoE EP And Scientific Application Notes
 
-NCCL-SAI starts from `ncclAlltoAll()`, but SAI application performance is a
-full-stack problem. Public guidance should distinguish direct NCCL users, MPI
-applications with GPU buffers, and applications whose dominant communication is
-halo exchange, reductions, or solver-specific patterns.
+NCCL-SAI includes expert AlltoAll research, but SAI application performance is
+a full-stack problem. Public guidance should distinguish direct NCCL users,
+MPI applications with GPU buffers, and applications whose dominant
+communication is halo exchange, reductions, or solver-specific patterns.
 
 ## MoE Expert Parallelism
 
@@ -11,9 +11,10 @@ Large MoE training systems usually avoid one global all-to-all across every
 rank. Common strategies include limiting expert-parallel groups, using
 hierarchical dispatch, overlapping token exchange with compute, batching small
 messages, reusing communicators, and relying on runtime libraries that manage
-connection pressure. NCCL-SAI alltoall work is relevant to this class of
-traffic, but public claims should state the communicator size and topology
-class instead of implying that one microbenchmark covers all MoE runtimes.
+connection pressure. NCCL-SAI AlltoAll research is relevant to this class of
+traffic, but it is not a transparent release capability. Public claims should
+state the communicator size, topology class, and explicit expert configuration
+instead of implying that one microbenchmark covers all MoE runtimes.
 
 ## Scientific Applications
 
@@ -36,7 +37,7 @@ Prefer optimizations that are invisible to application source code:
 - packaged NCCL-SAI runtime with conservative defaults;
 - site MPI/UCX/UCC settings that preserve CUDA-aware behavior;
 - topology-aware rank ordering and scheduler placement;
-- documented environment overrides for expert users;
+- separately documented environment overrides for controlled expert research;
 - optional PMPI/NCCL observation tools that can be used without recompiling
   closed-source applications.
 

@@ -6,6 +6,7 @@
 
 #include "collectives.h"
 #include "enqueue.h"
+#include "graph.h"
 #include "nccl.h"
 #include "nvtx_payload_schemas.h"
 #include "param.h"
@@ -30,6 +31,55 @@ NCCL_PARAM(SaiA2aIslandMinRanks, "SAI_A2A_ISLAND_MIN_RANKS", NCCL_SAI_A2A_ISLAND
 NCCL_PARAM(SaiA2aIslandScratchCapBytes, "SAI_A2A_ISLAND_SCRATCH_CAP_BYTES", 64 * 1024 * 1024);
 
 extern int64_t ncclParamSaiP2pFabricGroupSchedule();
+
+// Only controls that can change grouped AlltoAll/P2P scheduling belong in this
+// signature. Local-P2P policy has its own communicator-wide signature and must
+// not turn an otherwise unrelated AlltoAll configuration into invalid usage.
+static const char* const saiA2aExplicitControlNames[] = {
+    "NCCL_SAI_DISABLE",
+    "NCCL_SAI_FABRIC_PROFILE",
+    "NCCL_SAI_A2A_ENABLE",
+    "NCCL_SAI_A2A_PLANNER_ENABLE",
+    "NCCL_SAI_A2A_PLANNER_ROUNDS",
+    "NCCL_SAI_A2A_GROUP_NODES",
+    "NCCL_SAI_A2A_MULTIGROUP_ENABLE",
+    "NCCL_SAI_A2A_MIN_PEER_BYTES",
+    "NCCL_SAI_A2A_MIN_RANKS",
+    "NCCL_SAI_A2A_ISLAND_ENABLE",
+    "NCCL_SAI_A2A_ISLAND_SIZE",
+    "NCCL_SAI_A2A_ISLAND_MAX_PEER_BYTES",
+    "NCCL_SAI_A2A_ISLAND_MIN_RANKS",
+    "NCCL_SAI_A2A_ISLAND_SCRATCH_CAP_BYTES",
+    "NCCL_SAI_P2P_FABRIC_GROUP_SCHEDULE",
+};
+
+static bool saiA2aExplicitControlPresent() {
+  for (size_t i = 0;
+       i < sizeof(saiA2aExplicitControlNames) /
+           sizeof(saiA2aExplicitControlNames[0]);
+       i++) {
+    if (ncclGetEnv(saiA2aExplicitControlNames[i]) != nullptr) return true;
+  }
+  return false;
+}
+
+static uint64_t saiA2aExplicitControlSignature() {
+  uint64_t hash = UINT64_C(14695981039346656037);
+  static const char domain[] = "nccl-sai:explicit-controls:v1";
+  hash = ncclSaiHashString(hash, domain);
+  if (ncclSaiGloballyDisabled()) {
+    return ncclSaiHashString(hash, "canonical-disabled");
+  }
+  for (size_t i = 0;
+       i < sizeof(saiA2aExplicitControlNames) /
+           sizeof(saiA2aExplicitControlNames[0]);
+       i++) {
+    hash = ncclSaiHashString(hash, saiA2aExplicitControlNames[i]);
+    hash = ncclSaiHashString(
+        hash, ncclGetEnv(saiA2aExplicitControlNames[i]));
+  }
+  return hash;
+}
 
 const char* ncclFuncToString(ncclFunc_t fn) {
   switch (fn) {
@@ -98,17 +148,17 @@ const char* ncclProtoToString(int proto) {
   }
 }
 
-static bool saiA2aFabricEnabled() {
-  int64_t enabled = ncclParamSaiA2aEnable();
+static bool saiA2aFabricEnabled(int64_t enabled, bool fullMeshProfile) {
+  if (ncclSaiGloballyDisabled() || !fullMeshProfile) return false;
   if (enabled == 0) return false;
-  if (enabled > 0) return true;
-  return ncclSaiFabricProfileEnabled();
+  return true;
 }
 
 void ncclSaiA2aGetFabricGroupInfo(struct ncclSaiFabricGroupInfo* info) {
   if (info == nullptr) return;
   info->id = 0;
   info->state = ncclSaiFabricGroupIdAbsent;
+  if (ncclSaiGloballyDisabled()) return;
   const char* value = ncclGetEnv("NCCL_SAI_FABRIC_GROUP_ID");
   if (value != nullptr) {
     if (!ncclSaiParseFabricGroupId(value, &info->id)) {
@@ -118,35 +168,60 @@ void ncclSaiA2aGetFabricGroupInfo(struct ncclSaiFabricGroupInfo* info) {
     info->state = ncclSaiFabricGroupIdValid;
     return;
   }
-  if (ncclSaiFullMeshProfileEnabled() && ncclSaiSlurmFabricGroupId(
-      ncclGetEnv("SLURM_TOPOLOGY_ADDR"),
-      ncclGetEnv("SLURM_TOPOLOGY_ADDR_PATTERN"), &info->id)) {
-    info->state = ncclSaiFabricGroupIdValid;
-  }
 }
 
 void ncclSaiA2aGetConfig(struct ncclComm* comm, struct ncclSaiA2aConfig* config) {
   if (config == nullptr) return;
-  (void)comm;
   memset(config, 0, sizeof(*config));
-  bool fullMeshProfile = ncclSaiFullMeshProfileEnabled();
-  bool a2aEnabled = saiA2aFabricEnabled();
+  if (ncclSaiGloballyDisabled()) {
+    config->field[ncclSaiA2aConfigVersion] = NCCL_SAI_INIT_SCHEMA_TAG;
+    config->field[ncclSaiA2aConfigActivationSource] =
+        ncclSaiA2aActivationDisabled;
+    config->field[ncclSaiA2aConfigExplicitControlsPresent] =
+        saiA2aExplicitControlPresent() ? 1 : 0;
+    config->field[ncclSaiA2aConfigExplicitControlsSignature] =
+        (int64_t)saiA2aExplicitControlSignature();
+    return;
+  }
+  bool topologyEligible = ncclTopoSaiFullMeshTopologyEligible(comm);
+  bool explicitFullMeshProfile =
+      ncclSaiFullMeshProfileEnabled() && topologyEligible;
+  // NCCL 2.28 has no stable cross-node hardware identity for the physical
+  // fabric group. Do not infer it from scheduler metadata, rank order, host
+  // names, or HCA strings. Grouped AlltoAll remains an explicit expert path
+  // until a hardware-backed provider exists; transparent runtime behavior
+  // stays upstream and allocates no SAI scratch.
+  bool automaticFullMeshProfile = false;
+  bool fullMeshProfile = explicitFullMeshProfile || automaticFullMeshProfile;
+  int64_t a2aEnable = ncclParamSaiA2aEnable();
+  bool a2aEnabled = saiA2aFabricEnabled(a2aEnable, fullMeshProfile);
   bool fullMeshDefaults = fullMeshProfile && a2aEnabled;
+  int64_t automaticPolicyMask = 0;
   config->field[ncclSaiA2aConfigVersion] = NCCL_SAI_INIT_SCHEMA_TAG;
   config->field[ncclSaiA2aConfigEnabled] = a2aEnabled ? 1 : 0;
   int64_t plannerEnable = ncclParamSaiA2aPlannerEnable();
+  const int64_t plannerEnableConfigured = plannerEnable;
   int64_t plannerRounds = ncclParamSaiA2aPlannerRounds();
   int64_t groupNodes = ncclParamSaiA2aGroupNodes();
   int64_t multigroupEnable = ncclParamSaiA2aMultigroupEnable();
   int64_t minPeerBytes = ncclParamSaiA2aMinPeerBytes();
   int64_t minRanks = ncclParamSaiA2aMinRanks();
   int64_t islandEnable = ncclParamSaiA2aIslandEnable();
+  const int64_t islandEnableConfigured = islandEnable;
   int64_t islandSize = ncclParamSaiA2aIslandSize();
   int64_t islandMaxPeerBytes = ncclParamSaiA2aIslandMaxPeerBytes();
   int64_t islandMinRanks = ncclParamSaiA2aIslandMinRanks();
   int64_t islandScratchCapBytes = ncclParamSaiA2aIslandScratchCapBytes();
   int64_t p2pFabricSchedule = ncclParamSaiP2pFabricGroupSchedule();
-  if (plannerEnable < 0) plannerEnable = fullMeshDefaults ? 1 : 0;
+  const int64_t p2pFabricScheduleConfigured = p2pFabricSchedule;
+  if (plannerEnable < 0) {
+    plannerEnable = fullMeshDefaults ? 1 : 0;
+    if (ncclSaiA2aDefaultPolicyIsAutomatic(
+        plannerEnableConfigured, plannerEnable != 0,
+        automaticFullMeshProfile)) {
+      automaticPolicyMask |= ncclSaiA2aAutomaticPlanner;
+    }
+  }
   bool autoPlannerRounds = plannerRounds == -1 && fullMeshDefaults;
   if (!autoPlannerRounds && (plannerRounds < 1 || plannerRounds > INT_MAX)) plannerRounds = 4;
   int64_t defaultGroupNodes = fullMeshProfile ? 16 : 4;
@@ -154,12 +229,26 @@ void ncclSaiA2aGetConfig(struct ncclComm* comm, struct ncclSaiA2aConfig* config)
   if (groupNodes < 1 || groupNodes > INT_MAX) groupNodes = defaultGroupNodes;
   if (minPeerBytes < 0) minPeerBytes = 0;
   if (minRanks < 0) minRanks = 0;
-  if (islandEnable < 0) islandEnable = fullMeshDefaults ? 1 : 0;
+  if (islandEnable < 0) {
+    islandEnable = fullMeshDefaults ? 1 : 0;
+    if (ncclSaiA2aDefaultPolicyIsAutomatic(
+        islandEnableConfigured, islandEnable != 0,
+        automaticFullMeshProfile)) {
+      automaticPolicyMask |= ncclSaiA2aAutomaticIsland;
+    }
+  }
   if (islandSize < 2 || islandSize > INT_MAX) islandSize = 4;
   if (islandMaxPeerBytes < 0) islandMaxPeerBytes = 0;
   if (islandMinRanks < 0) islandMinRanks = 0;
   if (islandScratchCapBytes < 0) islandScratchCapBytes = 0;
-  if (p2pFabricSchedule < 0) p2pFabricSchedule = fullMeshDefaults ? 1 : 0;
+  if (p2pFabricSchedule < 0) {
+    p2pFabricSchedule = fullMeshDefaults ? 1 : 0;
+    if (ncclSaiA2aDefaultPolicyIsAutomatic(
+        p2pFabricScheduleConfigured, p2pFabricSchedule != 0,
+        automaticFullMeshProfile)) {
+      automaticPolicyMask |= ncclSaiA2aAutomaticP2pSchedule;
+    }
+  }
   config->field[ncclSaiA2aConfigPlannerEnable] = plannerEnable != 0 ? 1 : 0;
   config->field[ncclSaiA2aConfigPlannerRounds] = plannerRounds;
   config->field[ncclSaiA2aConfigGroupNodes] = groupNodes;
@@ -172,7 +261,21 @@ void ncclSaiA2aGetConfig(struct ncclComm* comm, struct ncclSaiA2aConfig* config)
   config->field[ncclSaiA2aConfigIslandMaxPeerBytes] = islandMaxPeerBytes;
   config->field[ncclSaiA2aConfigIslandMinRanks] = islandMinRanks;
   config->field[ncclSaiA2aConfigIslandScratchCapBytes] = islandScratchCapBytes;
-  config->field[ncclSaiA2aConfigP2pFabricSchedule] = p2pFabricSchedule != 0 ? 1 : 0;
+  config->field[ncclSaiA2aConfigP2pFabricSchedule] =
+      ncclSaiP2pFabricScheduleRequested(
+          a2aEnabled, p2pFabricSchedule != 0) ? 1 : 0;
+  config->field[ncclSaiA2aConfigActivationSource] =
+      ncclSaiA2aActivationSourceFor(
+          a2aEnabled, a2aEnable, explicitFullMeshProfile);
+  if (config->field[ncclSaiA2aConfigActivationSource] ==
+      ncclSaiA2aActivationAutomatic) {
+    automaticPolicyMask |= ncclSaiA2aAutomaticBase;
+  }
+  config->field[ncclSaiA2aConfigExplicitControlsPresent] =
+      saiA2aExplicitControlPresent() ? 1 : 0;
+  config->field[ncclSaiA2aConfigExplicitControlsSignature] =
+      (int64_t)saiA2aExplicitControlSignature();
+  config->field[ncclSaiA2aConfigAutomaticPolicyMask] = automaticPolicyMask;
 }
 
 static void saiA2aSetReason(const char** reasonOut, const char* reason) {
