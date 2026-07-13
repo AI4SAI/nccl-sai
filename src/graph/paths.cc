@@ -303,18 +303,73 @@ static uint64_t ncclSaiTopologyHashFloat(uint64_t hash, float value) {
   return ncclSaiTopologyHashValue(hash, bits);
 }
 
+enum ncclSaiRailProbeRejectStage {
+  ncclSaiRailProbeAccepted = 0,
+  ncclSaiRailProbeInvalidInput,
+  ncclSaiRailProbeGpuCount,
+  ncclSaiRailProbeGpuCapability,
+  ncclSaiRailProbeNvlinkShape,
+  ncclSaiRailProbeNvlinkClique,
+  ncclSaiRailProbeNvlinkBandwidth,
+  ncclSaiRailProbeCpuLocality,
+  ncclSaiRailProbeNetCount,
+  ncclSaiRailProbeEndpointShape,
+  ncclSaiRailProbeLocalNetCount,
+  ncclSaiRailProbeLocalNetAdapter,
+  ncclSaiRailProbeRailPort,
+  ncclSaiRailProbeLocalPathPair,
+  ncclSaiRailProbeGlobalPathShape,
+  ncclSaiRailProbeIslandNetBinding,
+  ncclSaiRailProbeIslandNetUniqueness,
+  ncclSaiRailProbeSubnetIdentity,
+  ncclSaiRailProbeSubnetPair,
+};
+
+struct ncclSaiRailProbeDiagnostic {
+  int stage;
+  int index;
+  int value0;
+  int value1;
+  float bw0;
+  float bw1;
+};
+
+static bool ncclSaiRejectRailProbe(
+    struct ncclSaiRailProbeDiagnostic* diagnostic, int stage, int index = -1,
+    int value0 = 0, int value1 = 0, float bw0 = 0, float bw1 = 0) {
+  if (diagnostic != NULL && diagnostic->stage == ncclSaiRailProbeAccepted) {
+    diagnostic->stage = stage;
+    diagnostic->index = index;
+    diagnostic->value0 = value0;
+    diagnostic->value1 = value1;
+    diagnostic->bw0 = bw0;
+    diagnostic->bw1 = bw1;
+  }
+  return false;
+}
+
 static bool ncclSaiFourGpuIslandPartition(
     struct ncclTopoSystem* system, int* parent, int* nCompsOut,
-    float* nvBwOut) {
+    float* nvBwOut, struct ncclSaiRailProbeDiagnostic* diagnostic) {
   if (system == NULL || parent == NULL || nCompsOut == NULL ||
-      nvBwOut == NULL) return false;
+      nvBwOut == NULL) {
+    return ncclSaiRejectRailProbe(
+        diagnostic, ncclSaiRailProbeInvalidInput);
+  }
   const int nGpus = system->nodes[GPU].count;
-  if (nGpus < 4 || nGpus > 16 || nGpus % 4 != 0) return false;
+  if (nGpus < 4 || nGpus > 16 || nGpus % 4 != 0) {
+    return ncclSaiRejectRailProbe(
+        diagnostic, ncclSaiRailProbeGpuCount, -1, nGpus);
+  }
 
   uint64_t peerMasks[16] = { 0 };
   float nvBw[16][16] = { { 0 } };
   for (int i = 0; i < nGpus; i++) {
-    if (system->nodes[GPU].nodes[i].gpu.cudaCompCap != 70) return false;
+    if (system->nodes[GPU].nodes[i].gpu.cudaCompCap != 70) {
+      return ncclSaiRejectRailProbe(
+          diagnostic, ncclSaiRailProbeGpuCapability, i,
+          system->nodes[GPU].nodes[i].gpu.cudaCompCap);
+    }
     struct ncclTopoNode* gpu = system->nodes[GPU].nodes+i;
     for (int l = 0; l < gpu->nlinks; l++) {
       struct ncclTopoLink* link = gpu->links+l;
@@ -322,15 +377,25 @@ static bool ncclSaiFourGpuIslandPartition(
           link->remNode->type != GPU) continue;
       ptrdiff_t peer = link->remNode - system->nodes[GPU].nodes;
       if (peer < 0 || peer >= nGpus || peer == i || link->bw <= 0 ||
-          (peerMasks[i] & (UINT64_C(1) << peer)) != 0) return false;
+          (peerMasks[i] & (UINT64_C(1) << peer)) != 0) {
+        return ncclSaiRejectRailProbe(
+            diagnostic, ncclSaiRailProbeNvlinkShape, i, (int)peer,
+            gpu->nlinks, link->bw);
+      }
       peerMasks[i] |= UINT64_C(1) << peer;
       nvBw[i][peer] = link->bw;
     }
   }
-  if (!ncclSaiFourGpuCliqueMasks(nGpus, peerMasks)) return false;
+  if (!ncclSaiFourGpuCliqueMasks(nGpus, peerMasks)) {
+    return ncclSaiRejectRailProbe(
+        diagnostic, ncclSaiRailProbeNvlinkClique, -1, nGpus);
+  }
   for (int i = 0; i < nGpus; i++) {
     parent[i] = ncclSaiFirstSet64(peerMasks[i] | (UINT64_C(1) << i));
-    if (parent[i] < 0) return false;
+    if (parent[i] < 0) {
+      return ncclSaiRejectRailProbe(
+          diagnostic, ncclSaiRailProbeNvlinkClique, i, parent[i]);
+    }
   }
   const int nComps = nGpus / 4;
 
@@ -339,12 +404,24 @@ static bool ncclSaiFourGpuIslandPartition(
     for (int second = first+1; second < nGpus; second++) {
       if (parent[first] != parent[second]) continue;
       if (nvBw[first][second] <= 0 ||
-          nvBw[first][second] != nvBw[second][first]) return false;
+          nvBw[first][second] != nvBw[second][first]) {
+        return ncclSaiRejectRailProbe(
+            diagnostic, ncclSaiRailProbeNvlinkBandwidth, first, second, 0,
+            nvBw[first][second], nvBw[second][first]);
+      }
       if (referenceNvBw == 0) referenceNvBw = nvBw[first][second];
-      else if (referenceNvBw != nvBw[first][second]) return false;
+      else if (referenceNvBw != nvBw[first][second]) {
+        return ncclSaiRejectRailProbe(
+            diagnostic, ncclSaiRailProbeNvlinkBandwidth, first, second, 0,
+            referenceNvBw, nvBw[first][second]);
+      }
     }
   }
-  if (referenceNvBw <= 0) return false;
+  if (referenceNvBw <= 0) {
+    return ncclSaiRejectRailProbe(
+        diagnostic, ncclSaiRailProbeNvlinkBandwidth, -1, 0, 0,
+        referenceNvBw);
+  }
 
   // Bind each NVLink island to one physical CPU locality domain. This is based
   // on GPU/PCI/CPU hardware paths, not on the GPU->GPU path type that NCCL may
@@ -354,16 +431,25 @@ static bool ncclSaiFourGpuIslandPartition(
   for (int i = 0; i < nGpus; i++) {
     int cpu = -1;
     if (ncclGetLocalCpu(system, i, &cpu) != ncclSuccess || cpu < 0 ||
-        cpu >= system->nodes[CPU].count) return false;
+        cpu >= system->nodes[CPU].count) {
+      return ncclSaiRejectRailProbe(
+          diagnostic, ncclSaiRailProbeCpuLocality, i, cpu,
+          system->nodes[CPU].count);
+    }
     int root = ncclSaiFindParent(parent, i);
     if (compCpu[root] == -1) compCpu[root] = cpu;
-    else if (compCpu[root] != cpu) return false;
+    else if (compCpu[root] != cpu) {
+      return ncclSaiRejectRailProbe(
+          diagnostic, ncclSaiRailProbeCpuLocality, i, compCpu[root], cpu);
+    }
   }
   for (int first = 0; first < nGpus; first++) {
     if (compCpu[first] < 0) continue;
     for (int second = first+1; second < nGpus; second++) {
       if (compCpu[second] >= 0 && compCpu[first] == compCpu[second]) {
-        return false;
+        return ncclSaiRejectRailProbe(
+            diagnostic, ncclSaiRailProbeCpuLocality, first, second,
+            compCpu[first]);
       }
     }
   }
@@ -374,16 +460,25 @@ static bool ncclSaiFourGpuIslandPartition(
 }
 
 static bool ncclSaiDualPortIslandTopology(
-    struct ncclTopoSystem* system, uint64_t* topologyClass) {
-  if (system == NULL || topologyClass == NULL) return false;
+    struct ncclTopoSystem* system, uint64_t* topologyClass,
+    struct ncclSaiRailProbeDiagnostic* diagnostic = NULL) {
+  if (diagnostic != NULL) memset(diagnostic, 0, sizeof(*diagnostic));
+  if (system == NULL || topologyClass == NULL) {
+    return ncclSaiRejectRailProbe(
+        diagnostic, ncclSaiRailProbeInvalidInput);
+  }
 
   int parent[NCCL_TOPO_MAX_NODES];
   int nComps = 0;
   float referenceNvBw = 0;
   if (!ncclSaiFourGpuIslandPartition(
-      system, parent, &nComps, &referenceNvBw)) return false;
+      system, parent, &nComps, &referenceNvBw, diagnostic)) return false;
   if (nComps != system->nodes[GPU].count / 4 ||
-      system->nodes[NET].count != 8) return false;
+      system->nodes[NET].count != 8) {
+    return ncclSaiRejectRailProbe(
+        diagnostic, ncclSaiRailProbeNetCount, -1,
+        system->nodes[GPU].count, system->nodes[NET].count);
+  }
 
   // The unmerged fabric class is four dual-port adapters. Port identity is
   // the rail identity; NET enumeration order is deliberately irrelevant.
@@ -401,7 +496,11 @@ static bool ncclSaiDualPortIslandTopology(
     endpointShape[n].collSupport = net->net.collSupport;
   }
   if (!ncclSaiSymmetricDualPortAdapters(
-      endpointShape, system->nodes[NET].count, adapterGroup)) return false;
+      endpointShape, system->nodes[NET].count, adapterGroup)) {
+    return ncclSaiRejectRailProbe(
+        diagnostic, ncclSaiRailProbeEndpointShape, -1,
+        system->nodes[NET].count);
+  }
 
   int compNetPort1[NCCL_TOPO_MAX_NODES];
   int compNetPort2[NCCL_TOPO_MAX_NODES];
@@ -417,16 +516,28 @@ static bool ncclSaiDualPortIslandTopology(
     int localNets[NCCL_TOPO_MAX_NODES];
     int localNetCount = 0;
     if (ncclTopoGetLocal(system, GPU, g, NET, localNets,
-        &localNetCount, NULL) != ncclSuccess || localNetCount != 2) return false;
+        &localNetCount, NULL) != ncclSuccess || localNetCount != 2) {
+      return ncclSaiRejectRailProbe(
+          diagnostic, ncclSaiRailProbeLocalNetCount, g, localNetCount);
+    }
 
     struct ncclTopoNode* net0 = system->nodes[NET].nodes+localNets[0];
     struct ncclTopoNode* net1 = system->nodes[NET].nodes+localNets[1];
     if (adapterGroup[localNets[0]] != adapterGroup[localNets[1]] ||
-        net0->net.gdrSupport == 0 || net1->net.gdrSupport == 0) return false;
+        net0->net.gdrSupport == 0 || net1->net.gdrSupport == 0) {
+      return ncclSaiRejectRailProbe(
+          diagnostic, ncclSaiRailProbeLocalNetAdapter, g,
+          adapterGroup[localNets[0]], adapterGroup[localNets[1]],
+          (float)net0->net.gdrSupport, (float)net1->net.gdrSupport);
+    }
     int port1Index = -1;
     int port2Index = -1;
     if (!ncclSaiOrderDualPortRails(
-        net0->net.port, net1->net.port, &port1Index, &port2Index)) return false;
+        net0->net.port, net1->net.port, &port1Index, &port2Index)) {
+      return ncclSaiRejectRailProbe(
+          diagnostic, ncclSaiRailProbeRailPort, g, net0->net.port,
+          net1->net.port);
+    }
     int port1 = localNets[port1Index];
     int port2 = localNets[port2Index];
 
@@ -434,13 +545,19 @@ static bool ncclSaiDualPortIslandTopology(
     struct ncclTopoLinkList* path1 = gpu->paths[NET]+port1;
     struct ncclTopoLinkList* path2 = gpu->paths[NET]+port2;
     if (path1->type > PATH_PXB || path2->type > PATH_PXB ||
-        path1->type != path2->type || path1->bw != path2->bw) return false;
+        path1->type != path2->type || path1->bw != path2->bw) {
+      return ncclSaiRejectRailProbe(
+          diagnostic, ncclSaiRailProbeLocalPathPair, g, path1->type,
+          path2->type, path1->bw, path2->bw);
+    }
     if (referencePathType == -1) {
       referencePathType = path1->type;
       referencePathBw = path1->bw;
     } else if (referencePathType != path1->type ||
         referencePathBw != path1->bw) {
-      return false;
+      return ncclSaiRejectRailProbe(
+          diagnostic, ncclSaiRailProbeGlobalPathShape, g,
+          referencePathType, path1->type, referencePathBw, path1->bw);
     }
 
     int root = ncclSaiFindParent(parent, g);
@@ -448,7 +565,10 @@ static bool ncclSaiDualPortIslandTopology(
       compNetPort1[root] = port1;
       compNetPort2[root] = port2;
     } else if (compNetPort1[root] != port1 || compNetPort2[root] != port2) {
-      return false;
+      return ncclSaiRejectRailProbe(
+          diagnostic, ncclSaiRailProbeIslandNetBinding, g,
+          compNetPort1[root], port1, (float)compNetPort2[root],
+          (float)port2);
     }
   }
 
@@ -457,7 +577,11 @@ static bool ncclSaiDualPortIslandTopology(
     for (int second = first+1; second < nGpus; second++) {
       if (compNetPort1[second] < 0) continue;
       if (compNetPort1[first] == compNetPort1[second] ||
-          compNetPort2[first] == compNetPort2[second]) return false;
+          compNetPort2[first] == compNetPort2[second]) {
+        return ncclSaiRejectRailProbe(
+            diagnostic, ncclSaiRailProbeIslandNetUniqueness, first, second,
+            compNetPort1[first], compNetPort2[first]);
+      }
     }
   }
 
@@ -492,8 +616,9 @@ ncclResult_t ncclTopoSaiGetRailInfo(
   memset(info, 0, sizeof(*info));
 
   uint64_t topologyClass = 0;
+  struct ncclSaiRailProbeDiagnostic diagnostic = {};
   bool topologyEligible = ncclSaiDualPortIslandTopology(
-      system, &topologyClass);
+      system, &topologyClass, &diagnostic);
   uint64_t railSubnet[2] = {0, 0};
   if (comm == NULL || comm->ncclNet != &ncclNetIb) return ncclSuccess;
   for (int n = 0; topologyEligible && n < system->nodes[NET].count; n++) {
@@ -505,9 +630,24 @@ ncclResult_t ncclTopoSaiGetRailInfo(
     if (valid == 0 || !ncclSaiAccumulateRailSubnet(
         net->net.port, subnetPrefix, railSubnet)) {
       topologyEligible = false;
+      ncclSaiRejectRailProbe(
+          &diagnostic, ncclSaiRailProbeSubnetIdentity, n, valid,
+          net->net.port);
     }
   }
-  if (!ncclSaiRailSubnetsComplete(railSubnet)) topologyEligible = false;
+  if (!ncclSaiRailSubnetsComplete(railSubnet)) {
+    topologyEligible = false;
+    ncclSaiRejectRailProbe(
+        &diagnostic, ncclSaiRailProbeSubnetPair, -1,
+        railSubnet[0] != 0, railSubnet[1] != 0);
+  }
+  if (!topologyEligible && comm != NULL) {
+    INFO(NCCL_INIT|NCCL_ENV,
+      "NCCL-SAI rail qualification rejected: rank %d stage %d index %d "
+      "value0 %d value1 %d bw0 %.3f bw1 %.3f",
+      comm->rank, diagnostic.stage, diagnostic.index, diagnostic.value0,
+      diagnostic.value1, diagnostic.bw0, diagnostic.bw1);
+  }
   int automaticNetDevsPolicy = 0;
   NCCLCHECK(ncclTopoGetNetDevsPolicyAutomatic(&automaticNetDevsPolicy));
   if (automaticNetDevsPolicy == 0) return ncclSuccess;
@@ -563,7 +703,7 @@ ncclResult_t ncclTopoSaiGetLocalP2pInfo(
   int nComps = 0;
   float islandNvBw = 0;
   if (!ncclSaiFourGpuIslandPartition(
-      system, parent, &nComps, &islandNvBw) ||
+      system, parent, &nComps, &islandNvBw, NULL) ||
       nComps != 2) return ncclSuccess;
 
   int gpuIndex[8];
@@ -651,7 +791,7 @@ ncclResult_t ncclTopoSaiLocalP2pSysEligible(struct ncclComm* comm, struct ncclTo
   int nComps = 0;
   float islandNvBw = 0;
   if (!ncclSaiFourGpuIslandPartition(
-      system, parent, &nComps, &islandNvBw) ||
+      system, parent, &nComps, &islandNvBw, NULL) ||
       nComps != 2) return ncclSuccess;
 
   int root1 = ncclSaiFindParent(parent, gpuIndex[rank1]);
