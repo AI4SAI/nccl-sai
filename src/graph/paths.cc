@@ -508,9 +508,9 @@ ncclResult_t ncclTopoSaiGetRailInfo(
     }
   }
   if (!ncclSaiRailSubnetsComplete(railSubnet)) topologyEligible = false;
-  enum netDevsPolicy netPolicy = NETDEVS_POLICY_UNDEF;
-  NCCLCHECK(ncclTopoGetNetDevsPolicy(&netPolicy, NULL));
-  if (netPolicy != NETDEVS_POLICY_AUTO) return ncclSuccess;
+  int automaticNetDevsPolicy = 0;
+  NCCLCHECK(ncclTopoGetNetDevsPolicyAutomatic(&automaticNetDevsPolicy));
+  if (automaticNetDevsPolicy == 0) return ncclSuccess;
   if (!ncclSaiRailByChannelRequested(
       topologyEligible, (int)ncclParamCrossNic())) return ncclSuccess;
 

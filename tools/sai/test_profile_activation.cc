@@ -11,7 +11,10 @@
 
 static const char* testProfile = nullptr;
 static const char* testMergeNics = nullptr;
+static const char* testMergeLevel = nullptr;
+static const char* testForceMerge = nullptr;
 static const char* testCrossNic = nullptr;
+static const char* testNetDevsPolicy = nullptr;
 static const char* testHca = nullptr;
 static const char* testSaiDisable = nullptr;
 static const char* testLocalP2pEnable = nullptr;
@@ -21,7 +24,10 @@ static const char* testP2pLevel = nullptr;
 const char* ncclGetEnv(const char* name) {
   if (strcmp(name, "NCCL_SAI_FABRIC_PROFILE") == 0) return testProfile;
   if (strcmp(name, "NCCL_IB_MERGE_NICS") == 0) return testMergeNics;
+  if (strcmp(name, "NCCL_NET_MERGE_LEVEL") == 0) return testMergeLevel;
+  if (strcmp(name, "NCCL_NET_FORCE_MERGE") == 0) return testForceMerge;
   if (strcmp(name, "NCCL_CROSS_NIC") == 0) return testCrossNic;
+  if (strcmp(name, "NCCL_NETDEVS_POLICY") == 0) return testNetDevsPolicy;
   if (strcmp(name, "NCCL_IB_HCA") == 0) return testHca;
   if (strcmp(name, "NCCL_SAI_DISABLE") == 0) return testSaiDisable;
   if (strcmp(name, "NCCL_SAI_LOCAL_P2P_SYS_ENABLE") == 0) return testLocalP2pEnable;
@@ -63,7 +69,7 @@ struct GraphRailActivationCase {
 
 int main() {
   const uint32_t ncclVersion = 22809;
-  if (NCCL_SAI_INIT_SCHEMA_TAG != 0x5bbu) {
+  if (NCCL_SAI_INIT_SCHEMA_TAG != 0x5bcu) {
     fprintf(stderr, "initialization schema tag was not advanced\n");
     return 1;
   }
@@ -243,7 +249,10 @@ int main() {
   testProfile = nullptr;
   testHca = nullptr;
   testMergeNics = nullptr;
+  testMergeLevel = nullptr;
+  testForceMerge = nullptr;
   testCrossNic = nullptr;
+  testNetDevsPolicy = nullptr;
   if (!ncclSaiAutomaticRailCapabilityEnabled(true) ||
       ncclSaiAutomaticRailCapabilityEnabled(false) ||
       !ncclSaiRailByChannelRequested(true, 0)) {
@@ -324,6 +333,256 @@ int main() {
     fprintf(stderr, "invalid rail subnet set was accepted\n");
     return 1;
   }
+
+  struct ncclSaiRailInfo railInfo[2] = {};
+  for (int rank = 0; rank < 2; rank++) {
+    railInfo[rank].policySignature = 0x100;
+    railInfo[rank].topologyClass = 0x200;
+    railInfo[rank].railSubnet[0] = 0x1111;
+    railInfo[rank].railSubnet[1] = 0x2222;
+    railInfo[rank].eligible = 1;
+  }
+  int railEligibleRanks = 0;
+  if (!ncclSaiRailInfoConsensus(railInfo, 2, &railEligibleRanks) ||
+      railEligibleRanks != 2 ||
+      ncclSaiRailInfoConsensus(nullptr, 2, &railEligibleRanks) ||
+      ncclSaiRailInfoConsensus(railInfo, 0, &railEligibleRanks)) {
+    fprintf(stderr, "valid rail consensus failed\n");
+    return 1;
+  }
+  railInfo[1].eligible = 0;
+  if (ncclSaiRailInfoConsensus(railInfo, 2, &railEligibleRanks) ||
+      railEligibleRanks != 1) {
+    fprintf(stderr, "ineligible rail rank was accepted\n");
+    return 1;
+  }
+  railInfo[1].eligible = 1;
+  railInfo[1].topologyClass++;
+  if (ncclSaiRailInfoConsensus(railInfo, 2, &railEligibleRanks)) {
+    fprintf(stderr, "mismatched rail topology was accepted\n");
+    return 1;
+  }
+  railInfo[1].topologyClass = railInfo[0].topologyClass;
+  railInfo[1].railSubnet[1]++;
+  if (ncclSaiRailInfoConsensus(railInfo, 2, &railEligibleRanks)) {
+    fprintf(stderr, "mismatched rail subnet was accepted\n");
+    return 1;
+  }
+
+  struct ncclSaiIbEndpointPreflight ibEndpoints[9] = {};
+  static const char* ibAdapterPaths[5] = {
+    "/sys/devices/pci0000:00/0000:01:00.0",
+    "/sys/devices/pci0000:00/0000:02:00.0",
+    "/sys/devices/pci0000:80/0000:81:00.0",
+    "/sys/devices/pci0000:80/0000:82:00.0",
+    "/sys/devices/pci0000:c0/0000:c1:00.0",
+  };
+  for (int endpoint = 0; endpoint < 9; endpoint++) {
+    ibEndpoints[endpoint].adapterPath = ibAdapterPaths[endpoint / 2];
+    ibEndpoints[endpoint].port = endpoint % 2 + 1;
+    ibEndpoints[endpoint].subnetPrefix =
+        ibEndpoints[endpoint].port == 1 ? 0x1111 : 0x2222;
+    ibEndpoints[endpoint].speed = 100000;
+    ibEndpoints[endpoint].maxQp = 262144;
+    ibEndpoints[endpoint].activeMtu = 5;
+    ibEndpoints[endpoint].provider = 1;
+    ibEndpoints[endpoint].dataDirect = 0;
+    ibEndpoints[endpoint].infiniband = 1;
+  }
+
+  enum ncclSaiIbEndpointMergeMode ibMergeMode =
+      ncclSaiIbEndpointMergeControlMode(
+          true, false, 1, false, false, false, 0, true);
+  if (ibMergeMode != ncclSaiIbEndpointMergeAutomatic ||
+      !ncclSaiIbEndpointLayoutEligible(ibEndpoints, 8) ||
+      ncclSaiIbEndpointLayoutEligible(ibEndpoints, 7)) {
+    fprintf(stderr, "automatic IB endpoint-probe decision failed\n");
+    return 1;
+  }
+
+  ibMergeMode = ncclSaiIbEndpointMergeControlMode(
+      true, true, 0, false, false, false, 2, false);
+  if (ibMergeMode != ncclSaiIbEndpointMergeExplicitDisabled) {
+    fprintf(stderr, "explicit NCCL_IB_MERGE_NICS=0 was not preserved\n");
+    return 1;
+  }
+  ibMergeMode = ncclSaiIbEndpointMergeControlMode(
+      true, true, 1, false, false, false, 0, true);
+  if (ibMergeMode != ncclSaiIbEndpointMergeUpstream) {
+    fprintf(stderr, "explicit NCCL_IB_MERGE_NICS=1 was not preserved\n");
+    return 1;
+  }
+  if (ncclSaiIbEndpointMergeControlMode(
+          true, false, 1, true, false, false, 0, true) !=
+          ncclSaiIbEndpointMergeUpstream ||
+      ncclSaiIbEndpointMergeControlMode(
+          true, false, 1, false, true, false, 0, true) !=
+          ncclSaiIbEndpointMergeUpstream) {
+    fprintf(stderr, "explicit upstream NET fusion controls were not preserved\n");
+    return 1;
+  }
+  ibMergeMode = ncclSaiIbEndpointMergeControlMode(
+      true, false, 1, false, false, true, 0, true);
+  if (ibMergeMode != ncclSaiIbEndpointMergeUpstream) {
+    fprintf(stderr, "NCCL_SAI_DISABLE did not restore upstream IB fusion\n");
+    return 1;
+  }
+  if (ncclSaiIbEndpointMergeControlMode(
+          false, false, 1, false, false, false, 0, true) !=
+          ncclSaiIbEndpointMergeUpstream) {
+    fprintf(stderr, "external NET plugin entered SAI endpoint preflight\n");
+    return 1;
+  }
+  if (ncclSaiIbEndpointMergeControlMode(
+          true, false, 1, false, false, false, 1, true) !=
+          ncclSaiIbEndpointMergeUpstream ||
+      ncclSaiIbEndpointMergeControlMode(
+          true, false, 1, false, false, false, 2, true) !=
+          ncclSaiIbEndpointMergeUpstream) {
+    fprintf(stderr, "nonzero effective NCCL_CROSS_NIC entered endpoint preflight\n");
+    return 1;
+  }
+  if (ncclSaiIbEndpointMergeControlMode(
+          true, false, 1, false, false, false, 0, false) !=
+          ncclSaiIbEndpointMergeUpstream) {
+    fprintf(stderr, "non-AUTO or invalid NETDEVS policy entered endpoint preflight\n");
+    return 1;
+  }
+
+  if (ncclSaiResolveIbEndpointConsensus(
+          true, true, true, true, ncclSaiIbEndpointMergeAutomatic, true) !=
+          ncclSaiIbEndpointConsensusPreserve ||
+      ncclSaiResolveIbEndpointConsensus(
+          true, true, true, true, ncclSaiIbEndpointMergeAutomatic, false) !=
+          ncclSaiIbEndpointConsensusUpstream ||
+      ncclSaiResolveIbEndpointConsensus(
+          true, true, true, true, ncclSaiIbEndpointMergeUpstream, true) !=
+          ncclSaiIbEndpointConsensusUpstream ||
+      ncclSaiResolveIbEndpointConsensus(
+          true, true, true, false, ncclSaiIbEndpointMergeAutomatic, true) !=
+          ncclSaiIbEndpointConsensusUpstream ||
+      ncclSaiResolveIbEndpointConsensus(
+          false, true, true, true, ncclSaiIbEndpointMergeAutomatic, true) !=
+          ncclSaiIbEndpointConsensusReject ||
+      ncclSaiResolveIbEndpointConsensus(
+          true, false, true, true, ncclSaiIbEndpointMergeAutomatic, true) !=
+          ncclSaiIbEndpointConsensusReject ||
+      ncclSaiResolveIbEndpointConsensus(
+          true, true, false, true, ncclSaiIbEndpointMergeAutomatic, true) !=
+          ncclSaiIbEndpointConsensusReject) {
+    fprintf(stderr, "communicator-wide IB endpoint consensus failed\n");
+    return 1;
+  }
+
+  testMergeNics = nullptr;
+  testMergeLevel = nullptr;
+  testForceMerge = nullptr;
+  testCrossNic = nullptr;
+  testNetDevsPolicy = nullptr;
+  testSaiDisable = nullptr;
+  uint64_t endpointPolicySignature = ncclSaiIbEndpointPolicySignature();
+  testMergeNics = "0";
+  if (endpointPolicySignature == ncclSaiIbEndpointPolicySignature()) {
+    fprintf(stderr, "merge-NIC control was absent from endpoint policy signature\n");
+    return 1;
+  }
+  testMergeNics = nullptr;
+  testMergeLevel = "LOC";
+  if (endpointPolicySignature == ncclSaiIbEndpointPolicySignature()) {
+    fprintf(stderr, "merge-level control was absent from endpoint policy signature\n");
+    return 1;
+  }
+  testMergeLevel = nullptr;
+  testForceMerge = "mlx5_0:1,mlx5_0:2";
+  if (endpointPolicySignature == ncclSaiIbEndpointPolicySignature()) {
+    fprintf(stderr, "force-merge control was absent from endpoint policy signature\n");
+    return 1;
+  }
+  testForceMerge = nullptr;
+  testCrossNic = "0";
+  if (endpointPolicySignature == ncclSaiIbEndpointPolicySignature()) {
+    fprintf(stderr, "cross-NIC control was absent from endpoint policy signature\n");
+    return 1;
+  }
+  testCrossNic = nullptr;
+  testNetDevsPolicy = "AUTO";
+  if (endpointPolicySignature == ncclSaiIbEndpointPolicySignature()) {
+    fprintf(stderr, "NET-device policy was absent from endpoint policy signature\n");
+    return 1;
+  }
+  testNetDevsPolicy = nullptr;
+  testSaiDisable = "1";
+  if (endpointPolicySignature == ncclSaiIbEndpointPolicySignature()) {
+    fprintf(stderr, "SAI disable was absent from endpoint policy signature\n");
+    return 1;
+  }
+  testSaiDisable = nullptr;
+
+  if (!ncclSaiIbEndpointLayoutEligible(ibEndpoints, 8) ||
+      ncclSaiIbEndpointLayoutEligible(ibEndpoints, 7) ||
+      ncclSaiIbEndpointLayoutEligible(ibEndpoints, 9)) {
+    fprintf(stderr, "IB endpoint-count eligibility failed\n");
+    return 1;
+  }
+  const char* savedAdapterPath0 = ibEndpoints[0].adapterPath;
+  ibEndpoints[0].adapterPath = nullptr;
+  if (ncclSaiIbEndpointLayoutEligible(ibEndpoints, 8)) {
+    fprintf(stderr, "missing normalized PCI adapter path was accepted\n");
+    return 1;
+  }
+  ibEndpoints[0].adapterPath = "";
+  if (ncclSaiIbEndpointLayoutEligible(ibEndpoints, 8)) {
+    fprintf(stderr, "empty normalized PCI adapter path was accepted\n");
+    return 1;
+  }
+  ibEndpoints[0].adapterPath = savedAdapterPath0;
+  uint64_t savedSubnet = ibEndpoints[1].subnetPrefix;
+  for (int endpoint = 1; endpoint < 8; endpoint += 2) {
+    ibEndpoints[endpoint].subnetPrefix = 0x1111;
+  }
+  if (ncclSaiIbEndpointLayoutEligible(ibEndpoints, 8)) {
+    fprintf(stderr, "single-subnet IB layout was accepted\n");
+    return 1;
+  }
+  for (int endpoint = 1; endpoint < 8; endpoint += 2) {
+    ibEndpoints[endpoint].subnetPrefix = savedSubnet;
+  }
+
+  int savedPort = ibEndpoints[1].port;
+  ibEndpoints[1].port = 1;
+  ibEndpoints[1].subnetPrefix = 0x1111;
+  if (ncclSaiIbEndpointLayoutEligible(ibEndpoints, 8)) {
+    fprintf(stderr, "duplicate IB adapter port was accepted\n");
+    return 1;
+  }
+  ibEndpoints[1].port = savedPort;
+  ibEndpoints[1].subnetPrefix = savedSubnet;
+
+  const char* savedAdapterPath = ibEndpoints[6].adapterPath;
+  ibEndpoints[6].adapterPath = ibEndpoints[4].adapterPath;
+  ibEndpoints[7].adapterPath = ibEndpoints[4].adapterPath;
+  if (ncclSaiIbEndpointLayoutEligible(ibEndpoints, 8)) {
+    fprintf(stderr, "wrong IB adapter count was accepted\n");
+    return 1;
+  }
+  ibEndpoints[6].adapterPath = savedAdapterPath;
+  ibEndpoints[7].adapterPath = savedAdapterPath;
+
+  int savedSpeed = ibEndpoints[7].speed;
+  ibEndpoints[7].speed *= 2;
+  if (ncclSaiIbEndpointLayoutEligible(ibEndpoints, 8)) {
+    fprintf(stderr, "mixed-speed IB layout was accepted\n");
+    return 1;
+  }
+  ibEndpoints[7].speed = savedSpeed;
+
+  int savedMtu = ibEndpoints[7].activeMtu;
+  ibEndpoints[7].activeMtu--;
+  if (ncclSaiIbEndpointLayoutEligible(ibEndpoints, 8)) {
+    fprintf(stderr, "mixed-capability IB layout was accepted\n");
+    return 1;
+  }
+  ibEndpoints[7].activeMtu = savedMtu;
 
   uint64_t cliqueMasks[16] = { 0 };
   for (int gpu = 0; gpu < 16; gpu++) {

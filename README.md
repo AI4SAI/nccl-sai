@@ -52,9 +52,17 @@ For SAI users, the intended runtime mode is drop-in replacement: put the
 NCCL-SAI build's `lib/` directory before the system NCCL in `LD_LIBRARY_PATH`.
 Applications and shared MPI stacks do not set SAI activation variables.
 `NCCL_IB_HCA`, `NCCL_IB_MERGE_NICS`, and `NCCL_CROSS_NIC` retain their upstream
-semantics and may be supplied by ordinary site policy. NCCL-SAI classifies the
-topology those controls actually produce; their strings are not activation
-signals. Legacy
+semantics and may be supplied by ordinary site policy. When
+`NCCL_IB_MERGE_NICS` and the upstream fusion controls are unset, the internal
+IB plugin may start a temporary physical-endpoint probe only after every rank
+agrees on the policy and passes an exact local eight-endpoint,
+four-normalized-adapter/logical-port-`1/2`, two-subnet preflight. This
+preflight also requires effective `NCCL_CROSS_NIC=0` and automatic NET-device
+policy. The full GPU/GDR/path and
+subnet vote must then agree communicator-wide before graph construction; any
+rejection releases the probe topology and rebuilds every rank with upstream
+NIC fusion. Explicit merge `0` or `1`, merge level, and force-merge settings
+keep their upstream behavior. Legacy
 `NCCL_SAI_FABRIC_PROFILE` values remain available for compatibility and expert
 testing of grouped paths, but are not a production prerequisite and do not
 change automatic rail or local-P2P detection. `NCCL_SAI_DISABLE=1` is the global

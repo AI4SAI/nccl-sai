@@ -35,6 +35,22 @@ a different runtime topology and therefore fails the physical dual-port
 predicate naturally. Effective `NCCL_CROSS_NIC=0` is a behavior gate for the
 automatic rail policy, not an identity test.
 
+The internal IB plugin adds a fail-closed preflight only when
+`NCCL_IB_MERGE_NICS`, `NCCL_NET_MERGE_LEVEL`, and `NCCL_NET_FORCE_MERGE` are
+all unset, effective `NCCL_CROSS_NIC=0`, and the NET-device policy is automatic.
+An exact local shape of eight equal-capability IB endpoints, four normalized
+PCI adapter pairs exposing NCCL logical ports `1` and `2`, and two distinct
+port-consistent subnets may start a physical-endpoint probe only after every
+rank reports the same upstream policy and eligible shape. The complete
+GPU/CPU/GDR/path and subnet vote then runs
+before graph construction. Any rejection releases the probe topology and
+rebuilds every rank with upstream default fusion. External network plugins are
+unaffected.
+
+If upstream policy itself naturally leaves eight physical endpoints, the same
+full classifier may qualify that resulting topology without the automatic
+probe. The preflight is an exposure mechanism, not an activation identity.
+
 Scheduler metadata is not used for site identity or automatic fabric-group
 classification. NCCL 2.28 does not expose enough cross-node switch identity to
 prove the physical group from hardware, so normal zero-variable runs keep
@@ -93,12 +109,19 @@ and its network device and proxy rank are recomputed. This keeps both endpoints
 of a channel aligned to the same rail, including when the original graph
 endpoint is not topology-local to the calling rank.
 
-`NCCL_IB_MERGE_NICS=1` is not an error and does not mean the job cannot run.
-When upstream NCCL successfully creates merged virtual devices, the strict
-eight-NET dual-port predicate no longer matches, so automatic dual-rail remains
-off and the upstream merged-NIC path runs.
-No same-candidate sustained `MERGE_NICS=0` versus `1` performance result is
-claimed until that A/B is measured. Nonzero cross-NIC mode, CollNet/NVLS
+With `NCCL_IB_MERGE_NICS` unset, the internal IB preflight above may suppress
+virtual-device fusion temporarily so the strict final predicate can inspect
+all eight physical endpoints. The probe is retained only after an all-rank
+full-topology vote; otherwise all ranks rebuild with upstream fusion. Explicit
+`NCCL_IB_MERGE_NICS=0` keeps the upstream
+no-fusion behavior. Explicit `NCCL_IB_MERGE_NICS=1` is not an error and does not
+mean the job cannot run: upstream NCCL creates merged virtual devices, the
+strict eight-NET predicate no longer matches, and the upstream merged-NIC path
+runs. Explicit `NCCL_NET_MERGE_LEVEL` and `NCCL_NET_FORCE_MERGE` likewise keep
+their upstream semantics. With merge controls unset, `NCCL_SAI_DISABLE=1`
+restores the upstream default fusion behavior.
+No same-candidate sustained unset/explicit-`0`/explicit-`1` performance result
+is claimed until that comparison is measured. Nonzero cross-NIC mode, CollNet/NVLS
 graphs, or any other ineligible layout likewise retains upstream selection.
 An explicit non-`AUTO` `NCCL_NETDEVS_POLICY` also retains upstream selection;
 the automatic rail path does not reinterpret an upstream device-count policy.
@@ -260,6 +283,9 @@ Before publishing a source branch or binary package, validate at least:
   non-regression;
 - fail-closed behavior for missing, invalid, merged, or rank-inconsistent
   hardware inputs and expert metadata;
+- merge-unset automatic endpoint-probe acceptance, preflight-pass/final-reject
+  upstream rebuild, explicit merge `0` and `1`, and explicit
+  merge-level/force-merge upstream behavior;
 - `NCCL_IB_MERGE_NICS=1` correctness on the upstream merged-NIC fallback, with
   performance comparisons reported only after a same-candidate A/B.
 

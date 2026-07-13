@@ -11,6 +11,7 @@
 #include "nccl.h"
 #include "nvmlwrap.h"
 #include "coll_net.h"
+#include "net.h"
 #include "transport.h"
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -1373,7 +1374,8 @@ static ncclResult_t ncclTopoPopulateNics(ncclXml* xml, int startIndex, int endIn
 
 // Calls to network plugin APIs should be protected. This function should be called inside a per-process lock.
 ncclResult_t ncclTopoProcessNet(ncclXml* xml, const char* dumpXmlFile, struct ncclTopoNetInfo* net) {
-  bool usePhysicalDevices = (dumpXmlFile || net->makeVDevice == NULL);
+  bool usePhysicalDevices =
+      dumpXmlFile || net->makeVDevice == NULL || net->usePhysicalDevices;
   int nPhysicalNics, nVirtualNics;
   NCCLCHECK(net->getDevCount(net->netPluginIndex, &nPhysicalNics, &nVirtualNics));
   // List the physical devices in the topo
@@ -1418,7 +1420,7 @@ ncclResult_t ncclTopoGetSystem(struct ncclComm* comm, struct ncclTopoSystem** sy
   int* localRanks = NULL;
   struct ncclXml* rankXml;
   int localRank = -1, nLocalRanks = 0;
-  struct ncclTopoNetInfo netInfo = {0};
+  struct ncclTopoNetInfo netInfo = {};
   NCCLCHECK(xmlAlloc(&xml, NCCL_TOPO_XML_MAX_NODES));
   const char* xmlTopoFile = ncclGetEnv("NCCL_TOPO_FILE");
   if (xmlTopoFile) {
@@ -1471,6 +1473,7 @@ ncclResult_t ncclTopoGetSystem(struct ncclComm* comm, struct ncclTopoSystem** sy
         netInfo.getProperties = comm->ncclCollNet->getProperties;
         netInfo.makeVDevice = comm->ncclCollNet->makeVDevice;
         netInfo.devices = comm->ncclCollNet->devices;
+        netInfo.usePhysicalDevices = false;
         NCCLCHECK(ncclTopoGetFusionEnv(&netInfo.mergeLevel, &netInfo.forceMerge));
         NCCLCHECKGOTO(ncclTopoProcessNet(xml, dumpXmlFile, &netInfo), ret, fail);
       }
@@ -1484,6 +1487,13 @@ ncclResult_t ncclTopoGetSystem(struct ncclComm* comm, struct ncclTopoSystem** sy
       netInfo.getProperties = comm->ncclNet->getProperties;
       netInfo.makeVDevice = comm->ncclNet->makeVDevice;
       netInfo.devices = comm->ncclNet->devices;
+      netInfo.usePhysicalDevices = comm->ncclNet == &ncclNetIb &&
+          comm->saiIbAutoPreservePhysicalEndpoints;
+      if (netInfo.usePhysicalDevices) {
+        INFO(NCCL_NET,
+          "NET/IB : NCCL-SAI communicator consensus is probing eight "
+          "physical dual-rail endpoints");
+      }
       NCCLCHECK(ncclTopoGetFusionEnv(&netInfo.mergeLevel, &netInfo.forceMerge));
       NCCLCHECKGOTO(ncclTopoProcessNet(xml, dumpXmlFile, &netInfo), ret, fail);
   }
@@ -1600,11 +1610,16 @@ ncclResult_t getLocalNetCountByBw(struct ncclTopoSystem* system, int gpu, int *c
 
 static int netDevsPolicyNum = -1;
 static enum netDevsPolicy netDevsPolicy = NETDEVS_POLICY_UNDEF;
+static bool netDevsPolicyAutomatic = true;
 static void getNetDevsPolicyOnce() {
   const char* envStr = ncclGetEnv("NCCL_NETDEVS_POLICY");
   if (envStr) {
+    // An explicit but unrecognized value (including an empty string) falls
+    // back to AUTO upstream, but is not an automatic-policy opt-in for SAI.
+    netDevsPolicyAutomatic = false;
     if (strcasecmp(envStr, "AUTO") == 0) {
       netDevsPolicy = NETDEVS_POLICY_AUTO;
+      netDevsPolicyAutomatic = true;
     } else if (strcasecmp(envStr, "ALL") == 0) {
       netDevsPolicy = NETDEVS_POLICY_ALL;
     } else if (strncasecmp(envStr, "MAX:", strlen("MAX:")) == 0) {
@@ -1631,6 +1646,14 @@ ncclResult_t ncclTopoGetNetDevsPolicy(enum netDevsPolicy* policy, int* policyNum
   }
   if (policy) *policy = netDevsPolicy;
   if (policyNum && netDevsPolicyNum >= 0) *policyNum = netDevsPolicyNum;
+  return ncclSuccess;
+}
+
+ncclResult_t ncclTopoGetNetDevsPolicyAutomatic(int* automatic) {
+  if (automatic == NULL) return ncclInvalidArgument;
+  enum netDevsPolicy policy = NETDEVS_POLICY_UNDEF;
+  NCCLCHECK(ncclTopoGetNetDevsPolicy(&policy, NULL));
+  *automatic = policy == NETDEVS_POLICY_AUTO && netDevsPolicyAutomatic ? 1 : 0;
   return ncclSuccess;
 }
 

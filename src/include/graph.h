@@ -101,6 +101,7 @@ enum netDevsPolicy {
   NETDEVS_POLICY_UNDEF = 0xffffffff
 };
 ncclResult_t ncclTopoGetNetDevsPolicy(enum netDevsPolicy* policy, int* policyNum);
+ncclResult_t ncclTopoGetNetDevsPolicyAutomatic(int* automatic);
 
 // Allows for up to 32 NICs per node on GB200-NVL72
 #define NCCL_TOPO_MAX_NODES 576

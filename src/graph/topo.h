@@ -202,6 +202,7 @@ struct ncclTopoNetInfo {
   // NIC fusion
   int mergeLevel;
   const char* forceMerge;
+  bool usePhysicalDevices;
   // dev count tracking functions (not part of ncclNet)
   ncclResult_t (*getDevCount)(int, int*, int*);
   ncclResult_t (*setVirtDevCount)(int, int);

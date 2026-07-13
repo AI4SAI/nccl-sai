@@ -60,6 +60,15 @@ Qualification of the default runtime must additionally prove:
 - normal zero-variable grouped AlltoAll/P2P remains upstream until a stable
   hardware-backed fabric-group provider exists;
 - fabricated scheduler metadata cannot activate any SAI path;
+- with fusion controls unset, the internal IB plugin preserves physical
+  endpoints only as a temporary communicator-wide probe after the exact
+  eight-endpoint/four-adapter/logical-port-`1/2`/two-subnet preflight passes on
+  every rank;
+- a rejected GPU/GDR/path/subnet vote rebuilds every rank with upstream NIC
+  fusion before graph construction, rather than leaving a mixed physical and
+  merged topology;
+- explicit `NCCL_IB_MERGE_NICS=0/1`, `NCCL_NET_MERGE_LEVEL`, and
+  `NCCL_NET_FORCE_MERGE` retain upstream behavior;
 - `NCCL_IB_MERGE_NICS=1` remains runnable through upstream behavior, while
   rail activation is decided from the resulting NET topology;
 - actual transport is established from `NCCL INFO Channel ... via ...` lines,
@@ -110,6 +119,7 @@ automatic rail and local-P2P paths, upstream fallback, and correctness of common
 collectives. Any expert AlltoAll performance claim is a separate qualification
 and must not be presented as transparent default behavior.
 
-`NCCL_IB_MERGE_NICS=0` versus `1` performance ordering may be reported only
-from a sustained same-candidate, same-layout A/B. A correctness pass in either
+Unset, explicit `NCCL_IB_MERGE_NICS=0`, and explicit
+`NCCL_IB_MERGE_NICS=1` performance ordering may be reported only from a
+sustained same-candidate, same-layout comparison. A correctness pass in any
 mode is not a performance comparison.

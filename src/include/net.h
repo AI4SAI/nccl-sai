@@ -33,6 +33,9 @@ extern ncclNet_t ncclNetSocket;
 // classifier. External network plugins do not opt in implicitly.
 ncclResult_t ncclIbGetSaiRailIdentity(
     int dev, uint64_t* subnetPrefix, int* valid);
+struct ncclSaiIbEndpointPolicyInfo;
+ncclResult_t ncclIbGetSaiEndpointPolicyInfo(
+    struct ncclSaiIbEndpointPolicyInfo* info);
 extern ncclGin_t ncclGinIbGdaki;
 extern ncclGin_t ncclGinIbProxy;
 

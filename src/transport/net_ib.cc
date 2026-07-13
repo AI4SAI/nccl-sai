@@ -11,6 +11,7 @@
 #include "graph.h"
 #include "utils.h"
 #include "param.h"
+#include "sai_profile.h"
 #include "profiler/net_ib.h"
 
 #include <assert.h>
@@ -32,6 +33,8 @@
 #define MAXNAMESIZE (64 + MAXSUFFIXSIZE)
 static char ncclIbIfName[MAX_IF_NAME_SIZE+1];
 static union ncclSocketAddress ncclIbIfAddr;
+
+extern int64_t ncclParamCrossNic();
 
 struct ncclIbMr {
   uintptr_t addr;
@@ -508,6 +511,22 @@ NCCL_PARAM(IbDisable, "IB_DISABLE", 0);
 NCCL_PARAM(IbMergeVfs, "IB_MERGE_VFS", 1);
 NCCL_PARAM(IbMergeNics, "IB_MERGE_NICS", 1);
 
+static ncclResult_t ncclIbSaiEndpointMergeMode(
+    enum ncclSaiIbEndpointMergeMode* mode) {
+  if (mode == nullptr) return ncclInvalidArgument;
+  int automaticNetDevsPolicy = 0;
+  NCCLCHECK(ncclTopoGetNetDevsPolicyAutomatic(
+      &automaticNetDevsPolicy));
+  *mode = ncclSaiIbEndpointMergeControlMode(
+      true, ncclGetEnv("NCCL_IB_MERGE_NICS") != nullptr,
+      (int)ncclParamIbMergeNics(),
+      ncclGetEnv("NCCL_NET_MERGE_LEVEL") != nullptr,
+      ncclGetEnv("NCCL_NET_FORCE_MERGE") != nullptr,
+      ncclSaiGloballyDisabled(), (int)ncclParamCrossNic(),
+      automaticNetDevsPolicy != 0);
+  return ncclSuccess;
+}
+
 // Returns 0 if this is the path of two VFs of the same physical device
 static int ncclIbMatchVfPath(char* path1, char* path2) {
   // Merge multi-port NICs into the same PCI device
@@ -564,6 +583,82 @@ static int ncclIbSpeed(int speed) {
   return ibvSpeeds[firstBitSet(speed, sizeof(ibvSpeeds)/sizeof(int)-1)];
 }
 
+static ncclResult_t ncclIbGetSaiSubnetPrefix(
+    struct ncclIbDev* ibDev, uint64_t* subnetPrefix, int* valid) {
+  if (ibDev == nullptr || subnetPrefix == nullptr || valid == nullptr) {
+    return ncclInvalidArgument;
+  }
+  *subnetPrefix = 0;
+  *valid = 0;
+  if (ibDev->link != IBV_LINK_LAYER_INFINIBAND) return ncclSuccess;
+
+  int gidIndex = 0;
+  ncclResult_t result = ncclIbGetGidIndex(
+      ibDev->context, ibDev->portNum, &ibDev->portAttr, &gidIndex);
+  if (result != ncclSuccess) return ncclSuccess;
+  union ibv_gid gid;
+  result = wrap_ibv_query_gid(
+      ibDev->context, ibDev->portNum, gidIndex, &gid);
+  if (result != ncclSuccess) return ncclSuccess;
+
+  // Routable FLID GIDs include endpoint-specific bits. Use the same local
+  // subnet component as the final rail-identity check.
+  uint64_t prefix = ncclIbExtractLocalSubnetPrefix(
+      gid.global.subnet_prefix);
+  if (prefix == 0) return ncclSuccess;
+  *subnetPrefix = prefix;
+  *valid = 1;
+  return ncclSuccess;
+}
+
+static ncclResult_t ncclIbGetSaiEndpointPreflight(
+    struct ncclSaiIbEndpointPreflight endpoints[8], int* endpointCount) {
+  if (endpoints == nullptr || endpointCount == nullptr) {
+    return ncclInvalidArgument;
+  }
+  *endpointCount = ncclNIbDevs;
+  if (ncclNIbDevs != 8) return ncclSuccess;
+
+  for (int endpoint = 0; endpoint < ncclNIbDevs; endpoint++) {
+    struct ncclIbDev* ibDev = ncclIbDevs + endpoint;
+    std::lock_guard<std::mutex> lock(ibDev->mutex);
+    uint64_t subnetPrefix = 0;
+    int valid = 0;
+    NCCLCHECK(ncclIbGetSaiSubnetPrefix(
+        ibDev, &subnetPrefix, &valid));
+    endpoints[endpoint].adapterPath = ibDev->pciPath;
+    endpoints[endpoint].subnetPrefix = valid ? subnetPrefix : 0;
+    endpoints[endpoint].port = ibDev->portNum + ibDev->realPort;
+    endpoints[endpoint].speed = ibDev->speed;
+    endpoints[endpoint].maxQp = ibDev->maxQp;
+    endpoints[endpoint].activeMtu = ibDev->portAttr.active_mtu;
+    endpoints[endpoint].provider = (int)ibDev->ibProvider;
+    endpoints[endpoint].dataDirect =
+        ibDev->capsProvider.mlx5.dataDirect;
+    endpoints[endpoint].infiniband =
+        ibDev->link == IBV_LINK_LAYER_INFINIBAND ? 1 : 0;
+  }
+  return ncclSuccess;
+}
+
+ncclResult_t ncclIbGetSaiEndpointPolicyInfo(
+    struct ncclSaiIbEndpointPolicyInfo* info) {
+  if (info == nullptr) return ncclInvalidArgument;
+  memset(info, 0, sizeof(*info));
+  enum ncclSaiIbEndpointMergeMode mode;
+  NCCLCHECK(ncclIbSaiEndpointMergeMode(&mode));
+  info->policySignature = ncclSaiIbEndpointPolicySignature();
+  info->mode = (int)mode;
+  if (mode != ncclSaiIbEndpointMergeAutomatic) return ncclSuccess;
+
+  struct ncclSaiIbEndpointPreflight endpoints[8] = {};
+  int endpointCount = 0;
+  NCCLCHECK(ncclIbGetSaiEndpointPreflight(endpoints, &endpointCount));
+  info->layoutEligible =
+      ncclSaiIbEndpointLayoutEligible(endpoints, endpointCount) ? 1 : 0;
+  return ncclSuccess;
+}
+
 // Determine whether RELAXED_ORDERING is enabled and possible
 static int ncclIbRelaxedOrderingCapable(void) {
   int roMode = ncclParamIbPciRelaxedOrdering();
@@ -596,9 +691,13 @@ failure:
 }
 
 ncclResult_t ncclIbMakeVDeviceInternal(int* d, ncclNetVDeviceProps_t* props) {
-  if (ncclParamIbMergeNics() == 0 && props->ndevs > 1) {
-    INFO(NCCL_NET, "NET/IB : Skipping makeVDevice, NCCL_IB_MERGE_NICS=0");
-    return ncclInvalidUsage;
+  if (props->ndevs > 1) {
+    enum ncclSaiIbEndpointMergeMode mergeMode;
+    NCCLCHECK(ncclIbSaiEndpointMergeMode(&mergeMode));
+    if (mergeMode == ncclSaiIbEndpointMergeExplicitDisabled) {
+      INFO(NCCL_NET, "NET/IB : Skipping makeVDevice, NCCL_IB_MERGE_NICS=0");
+      return ncclInvalidUsage;
+    }
   }
 
   if (props->ndevs == 0) {
@@ -982,26 +1081,7 @@ ncclResult_t ncclIbGetSaiRailIdentity(
 
   struct ncclIbDev* ibDev = ncclIbDevs + physDev;
   std::lock_guard<std::mutex> lock(ibDev->mutex);
-  if (ibDev->link != IBV_LINK_LAYER_INFINIBAND) return ncclSuccess;
-
-  int gidIndex = 0;
-  ncclResult_t result = ncclIbGetGidIndex(
-      ibDev->context, ibDev->portNum, &ibDev->portAttr, &gidIndex);
-  if (result != ncclSuccess) return ncclSuccess;
-  union ibv_gid gid;
-  result = wrap_ibv_query_gid(
-      ibDev->context, ibDev->portNum, gidIndex, &gid);
-  if (result != ncclSuccess) return ncclSuccess;
-
-  // Routable FLID GIDs encode a per-endpoint FLID in the upper portion of the
-  // raw prefix. Rail identity is the local subnet component used by the QP
-  // routing logic, not that endpoint-specific FLID.
-  uint64_t prefix = ncclIbExtractLocalSubnetPrefix(
-      gid.global.subnet_prefix);
-  if (prefix == 0) return ncclSuccess;
-  *subnetPrefix = prefix;
-  *valid = 1;
-  return ncclSuccess;
+  return ncclIbGetSaiSubnetPrefix(ibDev, subnetPrefix, valid);
 }
 
 // We need to support NCCL_NET_MAX_REQUESTS for each concurrent receive

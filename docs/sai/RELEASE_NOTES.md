@@ -49,6 +49,18 @@ strings, and merge-variable strings are not activation tests.
 The internal IB transport must report two distinct selected GID subnet
 prefixes, with port 1 and port 2 each communicator-wide consistent; missing or
 inconsistent hardware identity retains upstream selection.
+When `NCCL_IB_MERGE_NICS`, `NCCL_NET_MERGE_LEVEL`, and
+`NCCL_NET_FORCE_MERGE` are all unset, the internal IB plugin performs an exact
+local preflight for eight equal-capability endpoints, four normalized PCI
+adapter pairs exposing NCCL logical ports `1` and `2`, and two port-consistent
+subnets. Only unanimous policy and local eligibility, effective
+`NCCL_CROSS_NIC=0`, and automatic NET-device policy may start a
+temporary physical-endpoint probe. The complete GPU/GDR/path and subnet vote
+runs communicator-wide before graph construction. A rejected probe is freed
+and every rank rebuilds with upstream default fusion. Explicit upstream fusion
+controls retain their normal semantics, and external plugins are unchanged.
+An upstream-produced eight-endpoint topology may independently qualify under
+the same full classifier; the preflight is not an identity signal.
 Effective `NCCL_CROSS_NIC=0` is a rail-behavior gate. Physical port 1 serves
 even channels and physical port 2 serves odd channels; NET enumeration order
 has no rail meaning. Ordinary ring/tree endpoints use the same channel-aligned
@@ -78,6 +90,10 @@ not enable or suppress automatic rail or local-P2P capability detection.
 Rollback and expert controls:
 
 - `NCCL_SAI_DISABLE=1`: globally disable SAI-specific behavior.
+- Upstream merge controls unset: the exact internal-IB preflight may start a
+  communicator-wide physical-endpoint probe. A preflight or full-topology
+  mismatch keeps, or rebuilds with, upstream default fusion. With controls
+  unset, `NCCL_SAI_DISABLE=1` restores that upstream default.
 - Upstream `NCCL_IB_MERGE_NICS=0` normally leaves physical endpoints visible;
   the automatic predicate still decides from the resulting topology.
 - Upstream `NCCL_IB_MERGE_NICS=1` requests merged virtual devices. This mode
@@ -165,8 +181,8 @@ This release does not claim:
 - performance guarantees for every topology, scheduler allocation, or
   concurrent production workload;
 - optimized performance for partially occupied fabric groups;
-- a performance ordering between `NCCL_IB_MERGE_NICS=0` and `1` until a
-  sustained same-candidate A/B is recorded;
+- a performance ordering among unset, explicit `NCCL_IB_MERGE_NICS=0`, and
+  explicit `1` until a sustained same-candidate comparison is recorded;
 - that a `GPU Direct RDMA Enabled` capability message proves the actual
   transport selected by `NCCL INFO Channel` lines;
 - upstream vendor endorsement.

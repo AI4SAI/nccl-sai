@@ -19,7 +19,7 @@
 
 // Keep one schema tag for both the peer-version handshake and the extended
 // initialization all-gather. The low 20 bits remain the upstream NCCL version.
-#define NCCL_SAI_INIT_SCHEMA_TAG 0x5bbu
+#define NCCL_SAI_INIT_SCHEMA_TAG 0x5bcu
 #define NCCL_SAI_PEER_NCCL_VERSION_MASK 0x000fffffu
 #define NCCL_SAI_A2A_ISLAND_MIN_RANKS_DEFAULT 576
 
@@ -206,6 +206,27 @@ struct ncclSaiRailInfo {
   int eligible;
 };
 
+static inline bool ncclSaiRailInfoConsensus(
+    const struct ncclSaiRailInfo* info, int ranks, int* eligibleRanks) {
+  if (eligibleRanks != nullptr) *eligibleRanks = 0;
+  if (info == nullptr || ranks <= 0) return false;
+  bool enabled = true;
+  for (int rank = 0; rank < ranks; rank++) {
+    if (info[rank].eligible != 0) {
+      if (eligibleRanks != nullptr) (*eligibleRanks)++;
+    } else {
+      enabled = false;
+    }
+    if (info[rank].policySignature != info[0].policySignature ||
+        info[rank].topologyClass != info[0].topologyClass ||
+        info[rank].railSubnet[0] != info[0].railSubnet[0] ||
+        info[rank].railSubnet[1] != info[0].railSubnet[1]) {
+      enabled = false;
+    }
+  }
+  return enabled;
+}
+
 static inline bool ncclSaiAccumulateRailSubnet(
     int port, uint64_t subnetPrefix, uint64_t railSubnet[2]) {
   if (railSubnet == nullptr || subnetPrefix == 0 ||
@@ -219,6 +240,149 @@ static inline bool ncclSaiRailSubnetsComplete(
     const uint64_t railSubnet[2]) {
   return railSubnet != nullptr && railSubnet[0] != 0 &&
       railSubnet[1] != 0 && railSubnet[0] != railSubnet[1];
+}
+
+// The internal IB plugin has three endpoint-fusion states. Explicit
+// NCCL_IB_MERGE_NICS=0 keeps the upstream disable behavior, any explicit
+// upstream fusion control keeps upstream behavior, and only a completely
+// unset policy may inspect the hardware for automatic endpoint preservation.
+enum ncclSaiIbEndpointMergeMode {
+  ncclSaiIbEndpointMergeExplicitDisabled = 0,
+  ncclSaiIbEndpointMergeUpstream = 1,
+  ncclSaiIbEndpointMergeAutomatic = 2,
+};
+
+struct ncclSaiIbEndpointPolicyInfo {
+  uint64_t policySignature;
+  int internalIbPlugin;
+  int mode;
+  int layoutEligible;
+};
+
+enum ncclSaiIbEndpointConsensusResult {
+  ncclSaiIbEndpointConsensusReject = -1,
+  ncclSaiIbEndpointConsensusUpstream = 0,
+  ncclSaiIbEndpointConsensusPreserve = 1,
+};
+
+static inline uint64_t ncclSaiIbEndpointPolicySignature() {
+  uint64_t hash = UINT64_C(14695981039346656037);
+  static const char domain[] = "nccl-sai:ib-endpoint-policy:v1";
+  hash = ncclSaiHashString(hash, domain);
+  hash = ncclSaiHashString(hash, ncclGetEnv("NCCL_IB_MERGE_NICS"));
+  hash = ncclSaiHashString(hash, ncclGetEnv("NCCL_NET_MERGE_LEVEL"));
+  hash = ncclSaiHashString(hash, ncclGetEnv("NCCL_NET_FORCE_MERGE"));
+  hash = ncclSaiHashString(hash, ncclGetEnv("NCCL_CROSS_NIC"));
+  hash = ncclSaiHashString(hash, ncclGetEnv("NCCL_NETDEVS_POLICY"));
+  hash = ncclSaiHashString(hash, ncclGetEnv("NCCL_SAI_DISABLE"));
+  return hash;
+}
+
+static inline int ncclSaiResolveIbEndpointConsensus(
+    bool pluginConsistent, bool policyConsistent, bool modeConsistent,
+    bool internalIbPlugin, int mode, bool allLayoutsEligible) {
+  if (!pluginConsistent || !policyConsistent || !modeConsistent) {
+    return ncclSaiIbEndpointConsensusReject;
+  }
+  if (!internalIbPlugin || mode != ncclSaiIbEndpointMergeAutomatic) {
+    return ncclSaiIbEndpointConsensusUpstream;
+  }
+  return allLayoutsEligible ? ncclSaiIbEndpointConsensusPreserve :
+      ncclSaiIbEndpointConsensusUpstream;
+}
+
+static inline enum ncclSaiIbEndpointMergeMode
+ncclSaiIbEndpointMergeControlMode(
+    bool internalIbPlugin, bool mergeNicsExplicit, int mergeNics,
+    bool mergeLevelExplicit, bool forceMergeExplicit, bool saiDisabled,
+    int crossNic, bool automaticNetDevsPolicy) {
+  if (!internalIbPlugin) return ncclSaiIbEndpointMergeUpstream;
+  if (mergeNicsExplicit) {
+    return mergeNics == 0 ? ncclSaiIbEndpointMergeExplicitDisabled :
+        ncclSaiIbEndpointMergeUpstream;
+  }
+  if (mergeLevelExplicit || forceMergeExplicit || saiDisabled) {
+    return ncclSaiIbEndpointMergeUpstream;
+  }
+  if (crossNic != 0 || !automaticNetDevsPolicy) {
+    return ncclSaiIbEndpointMergeUpstream;
+  }
+  return ncclSaiIbEndpointMergeAutomatic;
+}
+
+struct ncclSaiIbEndpointPreflight {
+  const char* adapterPath;
+  uint64_t subnetPrefix;
+  int port;
+  int speed;
+  int maxQp;
+  int activeMtu;
+  int provider;
+  int dataDirect;
+  int infiniband;
+};
+
+// This is intentionally only a cheap local preflight. After communicator-wide
+// agreement it may request a temporary physical-endpoint probe, but the full
+// topology/rank/GDR/path vote must accept that probe or rebuild with upstream
+// NIC fusion.
+static inline bool ncclSaiIbEndpointLayoutEligible(
+    const struct ncclSaiIbEndpointPreflight* endpoints, int endpointCount) {
+  if (endpoints == nullptr || endpointCount != 8) return false;
+
+  uint64_t railSubnet[2] = { 0, 0 };
+  const char* adapterPath[4] = { nullptr, nullptr, nullptr, nullptr };
+  int adapterMembers[4] = { 0, 0, 0, 0 };
+  int adapterPortMask[4] = { 0, 0, 0, 0 };
+  int adapterCount = 0;
+  const struct ncclSaiIbEndpointPreflight* reference = endpoints;
+
+  for (int endpoint = 0; endpoint < endpointCount; endpoint++) {
+    const struct ncclSaiIbEndpointPreflight* shape = endpoints + endpoint;
+    if (shape->adapterPath == nullptr || shape->adapterPath[0] == '\0' ||
+        shape->subnetPrefix == 0 ||
+        (shape->port != 1 && shape->port != 2) || shape->speed <= 0 ||
+        shape->maxQp <= 0 || shape->activeMtu <= 0 ||
+        shape->dataDirect < 0 || shape->dataDirect > 1 ||
+        shape->infiniband != 1 || shape->speed != reference->speed ||
+        shape->maxQp != reference->maxQp ||
+        shape->activeMtu != reference->activeMtu ||
+        shape->provider != reference->provider ||
+        shape->dataDirect != reference->dataDirect ||
+        shape->infiniband != reference->infiniband ||
+        !ncclSaiAccumulateRailSubnet(
+            shape->port, shape->subnetPrefix, railSubnet)) {
+      return false;
+    }
+
+    int adapter = -1;
+    for (int group = 0; group < adapterCount; group++) {
+      if (strcmp(adapterPath[group], shape->adapterPath) == 0) {
+        adapter = group;
+        break;
+      }
+    }
+    if (adapter == -1) {
+      if (adapterCount == 4) return false;
+      adapter = adapterCount++;
+      adapterPath[adapter] = shape->adapterPath;
+    }
+
+    const int portBit = 1 << (shape->port - 1);
+    if ((adapterPortMask[adapter] & portBit) != 0) return false;
+    adapterPortMask[adapter] |= portBit;
+    adapterMembers[adapter]++;
+  }
+
+  if (adapterCount != 4 || !ncclSaiRailSubnetsComplete(railSubnet)) {
+    return false;
+  }
+  for (int adapter = 0; adapter < adapterCount; adapter++) {
+    if (adapterMembers[adapter] != 2 || adapterPortMask[adapter] != 0x3) {
+      return false;
+    }
+  }
+  return true;
 }
 
 static inline uint64_t ncclSaiLocalP2pPolicySignature() {

@@ -506,6 +506,7 @@ struct ncclComm {
   int netPluginIndex;
   int ncclNetVer;
   ncclNetDeviceType netDeviceType;
+  bool saiIbAutoPreservePhysicalEndpoints;
   ncclCollNet_t* ncclCollNet;
   void* collNetContext;
   void* bootstrap;
