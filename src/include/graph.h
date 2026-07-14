@@ -49,6 +49,7 @@ ncclResult_t ncclTopoNeedFlush(struct ncclComm* comm, int64_t netId, int netDev,
 ncclResult_t ncclTopoIsGdrAvail(struct ncclTopoSystem* system, int rank, bool *avail);
 ncclResult_t ncclTopoCheckNet(struct ncclTopoSystem* system, int rank1, int rank2, int* net);
 ncclResult_t ncclTopoSaiLocalP2pSysEligible(struct ncclComm* comm, struct ncclTopoSystem* system, int rank1, int rank2, int* eligible);
+ncclResult_t ncclTopoSaiCollectiveNetEligible(struct ncclComm* comm, struct ncclTopoSystem* system, int rank1, int rank2, int* eligible);
 ncclResult_t ncclTopoSaiGetLocalP2pInfo(
     struct ncclComm* comm, struct ncclTopoSystem* system,
     struct ncclSaiLocalP2pInfo* info);

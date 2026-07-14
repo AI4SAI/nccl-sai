@@ -1119,6 +1119,16 @@ ncclResult_t ncclTopoNeedFlush(struct ncclComm* comm, int64_t netId, int netDev,
 
 NCCL_PARAM(NetDisableIntra, "NET_DISABLE_INTRA", 0);
 
+ncclResult_t ncclTopoSaiCollectiveNetEligible(
+    struct ncclComm* comm, struct ncclTopoSystem* system,
+    int rank1, int rank2, int* eligible) {
+  if (eligible == NULL) return ncclInvalidArgument;
+  *eligible = 0;
+  if (ncclParamNetDisableIntra() == 1) return ncclSuccess;
+  return ncclTopoSaiLocalP2pSysEligible(
+      comm, system, rank1, rank2, eligible);
+}
+
 // Check whether going through the network would be faster than going through P2P/SHM.
 ncclResult_t ncclTopoCheckNet(struct ncclTopoSystem* system, int rank1, int rank2, int* net) {
   if (ncclParamNetDisableIntra() == 1) {

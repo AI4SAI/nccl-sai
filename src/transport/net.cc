@@ -156,6 +156,13 @@ static ncclResult_t canConnect(int* ret, struct ncclComm* comm, struct ncclTopoG
   if (info1->hostHash == info2->hostHash) {
     // If on the same host, check intra-node net is not disabled.
     NCCLCHECK(ncclTopoCheckNet(comm->topo, info1->rank, info2->rank, ret));
+    if (*ret == 0 && graph != nullptr) {
+      int saiCollectiveNet = 0;
+      NCCLCHECK(ncclTopoSaiCollectiveNetEligible(
+          comm, comm->topo, info1->rank, info2->rank,
+          &saiCollectiveNet));
+      if (saiCollectiveNet != 0) *ret = 1;
+    }
   }
   return ncclSuccess;
 }
