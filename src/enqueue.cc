@@ -1198,9 +1198,7 @@ static ncclResult_t scheduleP2pTasksToPlan(
     plan->kernelSpecialized = ncclDevKernelForFuncIsSpecialized[ncclDevFuncId_P2p()];
   }
 
-  int nChannelsMax = ncclSaiP2pOperationChannelsMax(
-      ncclTopoSaiRailByChannelEnabled(comm->topo), comm->nNodes, nRanks,
-      comm->p2pnChannels, comm->p2pnChannelsPerPeer);
+  int nChannelsMax = comm->p2pnChannelsPerPeer;
   int nChannelsMin = nChannelsMax;
   while (nChannelsMin*nRanks > comm->p2pnChannels && nChannelsMin > 1) nChannelsMin /= 2;
 

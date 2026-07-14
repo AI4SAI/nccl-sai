@@ -617,25 +617,6 @@ static inline int ncclSaiP2pNetChannelsPerPeer(
   return railByChannelEnabled && upstreamChannels < 2 ? 2 : upstreamChannels;
 }
 
-// Keep both rail connections available, but do not make every grouped P2P
-// operation consume both of them when a large single-node communicator would
-// place more than four operations on each channel.  NCCL 2.18 used this limit
-// to preserve the sync warp; NCCL 2.28 moved the scale limit into connection
-// setup, where the SAI two-rail floor intentionally overrides it.  Applying
-// the operation limit only to the active SAI rail policy restores the old
-// scheduling property without changing upstream behavior elsewhere.  An
-// eight-rank/two-island communicator remains at two channels per operation.
-static inline int ncclSaiP2pOperationChannelsMax(
-    bool railByChannelEnabled, int nNodes, int nRanks,
-    int p2pChannels, int channelsPerPeer) {
-  int channels = channelsPerPeer;
-  if (!railByChannelEnabled || nNodes != 1 || nRanks <= 0 ||
-      p2pChannels <= 0) return channels;
-  while ((int64_t)channels * nRanks > (int64_t)p2pChannels * 4 &&
-      channels > 1) channels /= 2;
-  return channels;
-}
-
 // Large communicators on the qualified four-island/two-rail topology expose
 // one NCCL topology node per four-GPU island.  This topology requires
 // additional channel parallelism for large-message AllReduce.  Keep the
