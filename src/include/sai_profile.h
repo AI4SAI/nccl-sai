@@ -22,6 +22,11 @@
 #define NCCL_SAI_INIT_SCHEMA_TAG 0x5bcu
 #define NCCL_SAI_PEER_NCCL_VERSION_MASK 0x000fffffu
 #define NCCL_SAI_A2A_ISLAND_MIN_RANKS_DEFAULT 576
+#define NCCL_SAI_LARGE_SCALE_RAIL_RANK_THRESHOLD 256
+#define NCCL_SAI_LARGE_SCALE_RAIL_TOPOLOGY_NODE_THRESHOLD 64
+#define NCCL_SAI_LARGE_SCALE_RAIL_CHANNELS 8
+#define NCCL_SAI_LARGE_SCALE_ALLREDUCE_MIN_BYTES \
+  (UINT64_C(256) * UINT64_C(1024) * UINT64_C(1024))
 
 enum ncclSaiA2aActivationSource {
   ncclSaiA2aActivationDisabled = 0,
@@ -610,6 +615,54 @@ static inline bool ncclSaiGraphRailByChannelEnabled(
 static inline int ncclSaiP2pNetChannelsPerPeer(
     bool railByChannelEnabled, int upstreamChannels) {
   return railByChannelEnabled && upstreamChannels < 2 ? 2 : upstreamChannels;
+}
+
+// Large communicators on the qualified four-island/two-rail topology expose
+// one NCCL topology node per four-GPU island.  This topology requires
+// additional channel parallelism for large-message AllReduce.  Keep the
+// predicate topology-derived and fail-closed so no scheduler or site identity
+// is needed.
+static inline bool ncclSaiLargeScaleRailComm(
+    bool railByChannelEnabled, int ranks, int topologyNodes) {
+  return railByChannelEnabled &&
+      ranks > NCCL_SAI_LARGE_SCALE_RAIL_RANK_THRESHOLD &&
+      topologyNodes > NCCL_SAI_LARGE_SCALE_RAIL_TOPOLOGY_NODE_THRESHOLD &&
+      ranks % topologyNodes == 0 && ranks / topologyNodes == 4;
+}
+
+static inline int ncclSaiLargeScaleRailChannelTarget(
+    bool railByChannelEnabled, int ranks, int topologyNodes,
+    int upstreamChannels) {
+  if (!ncclSaiLargeScaleRailComm(
+          railByChannelEnabled, ranks, topologyNodes)) return upstreamChannels;
+  return upstreamChannels < NCCL_SAI_LARGE_SCALE_RAIL_CHANNELS ?
+      NCCL_SAI_LARGE_SCALE_RAIL_CHANNELS : upstreamChannels;
+}
+
+static inline int ncclSaiLargeScaleRailChannelBase(
+    int upstreamChannels, int finalChannels) {
+  return finalChannels > upstreamChannels ? upstreamChannels : 0;
+}
+
+static inline bool ncclSaiLargeScaleRailChannelExpansionValid(
+    int upstreamChannels, int targetChannels) {
+  return targetChannels >= NCCL_SAI_LARGE_SCALE_RAIL_CHANNELS &&
+      targetChannels > upstreamChannels;
+}
+
+static inline int ncclSaiLargeScaleRailOperationChannels(
+    int baseChannels, int finalChannels, bool useExpandedChannels) {
+  return baseChannels > 0 && !useExpandedChannels ?
+      baseChannels : finalChannels;
+}
+
+static inline bool ncclSaiLargeScaleAllReduceTuningEligible(
+    bool railByChannelEnabled, int ranks, int topologyNodes,
+    bool isAllReduce, int taskCount, size_t bytes) {
+  return isAllReduce && taskCount == 1 &&
+      ncclSaiLargeScaleRailComm(
+          railByChannelEnabled, ranks, topologyNodes) &&
+      bytes >= NCCL_SAI_LARGE_SCALE_ALLREDUCE_MIN_BYTES;
 }
 
 // The supported dual-port topology exposes exactly two local network rails per

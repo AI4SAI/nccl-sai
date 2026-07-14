@@ -184,6 +184,43 @@ int main() {
     fprintf(stderr, "automatic dual-rail P2P channel floor failed\n");
     return 1;
   }
+  if (ncclSaiLargeScaleRailChannelTarget(false, 272, 68, 4) != 4 ||
+      ncclSaiLargeScaleRailChannelTarget(true, 255, 68, 4) != 4 ||
+      ncclSaiLargeScaleRailChannelTarget(true, 256, 64, 4) != 4 ||
+      ncclSaiLargeScaleRailChannelTarget(true, 272, 63, 4) != 4 ||
+      ncclSaiLargeScaleRailChannelTarget(true, 272, 67, 4) != 4 ||
+      ncclSaiLargeScaleRailChannelTarget(true, 325, 65, 4) != 4 ||
+      ncclSaiLargeScaleRailChannelTarget(true, 272, 68, 4) != 8 ||
+      ncclSaiLargeScaleRailChannelTarget(true, 512, 128, 12) != 12 ||
+      ncclSaiLargeScaleRailChannelBase(4, 8) != 4 ||
+      ncclSaiLargeScaleRailChannelBase(8, 8) != 0 ||
+      ncclSaiLargeScaleRailChannelBase(16, 16) != 0 ||
+      ncclSaiLargeScaleRailChannelBase(4, 4) != 0 ||
+      ncclSaiLargeScaleRailChannelExpansionValid(4, 7) ||
+      !ncclSaiLargeScaleRailChannelExpansionValid(4, 8) ||
+      ncclSaiLargeScaleRailChannelExpansionValid(8, 8) ||
+      ncclSaiLargeScaleRailOperationChannels(4, 8, false) != 4 ||
+      ncclSaiLargeScaleRailOperationChannels(4, 8, true) != 8 ||
+      ncclSaiLargeScaleRailOperationChannels(0, 8, false) != 8 ||
+      ncclSaiLargeScaleAllReduceTuningEligible(
+          false, 272, 68, true, 1, 256 * 1024 * 1024ULL) ||
+      ncclSaiLargeScaleAllReduceTuningEligible(
+          true, 255, 68, true, 1, 256 * 1024 * 1024ULL) ||
+      ncclSaiLargeScaleAllReduceTuningEligible(
+          true, 272, 63, true, 1, 256 * 1024 * 1024ULL) ||
+      ncclSaiLargeScaleAllReduceTuningEligible(
+          true, 272, 67, true, 1, 256 * 1024 * 1024ULL) ||
+      ncclSaiLargeScaleAllReduceTuningEligible(
+          true, 272, 68, false, 1, 256 * 1024 * 1024ULL) ||
+      ncclSaiLargeScaleAllReduceTuningEligible(
+          true, 272, 68, true, 2, 256 * 1024 * 1024ULL) ||
+      ncclSaiLargeScaleAllReduceTuningEligible(
+          true, 272, 68, true, 1, 256 * 1024 * 1024ULL - 1) ||
+      !ncclSaiLargeScaleAllReduceTuningEligible(
+          true, 272, 68, true, 1, 256 * 1024 * 1024ULL)) {
+    fprintf(stderr, "automatic large-scale rail tuning guard failed\n");
+    return 1;
+  }
   uint64_t localP2pRankPairs =
       (UINT64_C(1) << ncclSaiRankPairIndex(8, 0, 7)) |
       (UINT64_C(1) << ncclSaiRankPairIndex(8, 3, 7));
