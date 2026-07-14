@@ -13,6 +13,7 @@
 #include <assert.h>
 #include "shm.h"
 #include "register_inline.h"
+#include "sai_profile.h"
 
 enum p2pType { P2P_DIRECT, P2P_INTERMEDIATE, P2P_IPC, P2P_CUMEM };
 
@@ -138,7 +139,10 @@ ncclResult_t p2pCanConnect(int* ret, struct ncclComm* comm, struct ncclTopoGraph
   if (useNet) {
     int saiLocalP2pSys = 0;
     NCCLCHECK(ncclTopoSaiLocalP2pSysEligible(comm, comm->topo, info1->rank, info2->rank, &saiLocalP2pSys));
-    if (!saiLocalP2pSys) {
+    // Keep the local SYS-P2P exception for graph-less P2P operations such as
+    // grouped Send/Recv, but let collective graphs use the faster NET path.
+    if (!ncclSaiLocalP2pTransportAllowed(
+        saiLocalP2pSys != 0, graph != nullptr)) {
       *ret = 0;
       return ncclSuccess;
     }

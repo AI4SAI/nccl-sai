@@ -165,6 +165,20 @@ int main() {
     fprintf(stderr, "automatic local P2P upstream-level compatibility failed\n");
     return 1;
   }
+  if (!ncclSaiLocalP2pTransportAllowed(true, false) ||
+      ncclSaiLocalP2pTransportAllowed(true, true) ||
+      ncclSaiLocalP2pTransportAllowed(false, false)) {
+    fprintf(stderr, "local P2P transport scope failed\n");
+    return 1;
+  }
+  if (!ncclSaiA2aPlannerCanRun(true, true, true, false) ||
+      !ncclSaiA2aPlannerCanRun(true, true, false, true) ||
+      ncclSaiA2aPlannerCanRun(false, true, true, true) ||
+      ncclSaiA2aPlannerCanRun(true, false, true, true) ||
+      ncclSaiA2aPlannerCanRun(true, true, false, false)) {
+    fprintf(stderr, "AlltoAll planner fast-path predicate failed\n");
+    return 1;
+  }
   if (ncclSaiResolveLocalP2pConsensus(false, true, true) !=
           ncclSaiLocalP2pConsensusReject ||
       ncclSaiResolveLocalP2pConsensus(true, false, true) !=

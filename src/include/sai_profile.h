@@ -158,6 +158,17 @@ static inline bool ncclSaiLocalP2pAutomaticLevelAllowed(
   return resolvedUserLevel == unsetLevel || resolvedUserLevel == nvlinkLevel;
 }
 
+static inline bool ncclSaiLocalP2pTransportAllowed(
+    bool topologyEligible, bool collectiveGraph) {
+  return topologyEligible && !collectiveGraph;
+}
+
+static inline bool ncclSaiA2aPlannerCanRun(
+    bool configConsistent, bool enabled, bool plannerEnabled,
+    bool islandEnabled) {
+  return configConsistent && enabled && (plannerEnabled || islandEnabled);
+}
+
 // Profiles are expert-only labels for grouped AlltoAll/P2P experiments. They
 // are never consulted by automatic rail or local-P2P capability detection.
 // Keep the one implemented expert layout fail-closed.
