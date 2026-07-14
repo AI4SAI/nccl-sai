@@ -184,6 +184,15 @@ int main() {
     fprintf(stderr, "automatic dual-rail P2P channel floor failed\n");
     return 1;
   }
+  if (ncclSaiP2pOperationChannelsMax(false, 1, 16, 4, 2) != 2 ||
+      ncclSaiP2pOperationChannelsMax(true, 2, 16, 4, 2) != 2 ||
+      ncclSaiP2pOperationChannelsMax(true, 1, 8, 4, 2) != 2 ||
+      ncclSaiP2pOperationChannelsMax(true, 1, 16, 4, 2) != 1 ||
+      ncclSaiP2pOperationChannelsMax(true, 1, 16, 8, 2) != 2 ||
+      ncclSaiP2pOperationChannelsMax(true, 1, 16, 4, 1) != 1) {
+    fprintf(stderr, "automatic dual-rail P2P operation channel limit failed\n");
+    return 1;
+  }
   if (ncclSaiLargeScaleRailChannelTarget(false, 272, 68, 4) != 4 ||
       ncclSaiLargeScaleRailChannelTarget(true, 255, 68, 4) != 4 ||
       ncclSaiLargeScaleRailChannelTarget(true, 256, 64, 4) != 4 ||
