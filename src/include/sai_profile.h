@@ -601,6 +601,17 @@ static inline bool ncclSaiGraphRailByChannelEnabled(
   return policyEnabled && crossNic == 0 && !collNet;
 }
 
+// The qualified SAI topology has two independent rails selected by channel
+// parity.  Keep at least one P2P channel per rail for each NET peer; otherwise
+// the upstream scale heuristic can collapse a 16-rank communicator to one
+// channel per peer and leave grouped Send/Recv bandwidth on the table.
+// Callers apply this only when the user did not explicitly configure
+// nChannelsPerNetPeer.
+static inline int ncclSaiP2pNetChannelsPerPeer(
+    bool railByChannelEnabled, int upstreamChannels) {
+  return railByChannelEnabled && upstreamChannels < 2 ? 2 : upstreamChannels;
+}
+
 // The supported dual-port topology exposes exactly two local network rails per
 // GPU. Keep this override fail-closed so every other topology uses the upstream
 // local-NET index.

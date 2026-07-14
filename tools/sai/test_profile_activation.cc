@@ -165,6 +165,14 @@ int main() {
     fprintf(stderr, "automatic local P2P upstream-level compatibility failed\n");
     return 1;
   }
+  if (ncclSaiP2pNetChannelsPerPeer(false, 1) != 1 ||
+      ncclSaiP2pNetChannelsPerPeer(false, 2) != 2 ||
+      ncclSaiP2pNetChannelsPerPeer(true, 1) != 2 ||
+      ncclSaiP2pNetChannelsPerPeer(true, 2) != 2 ||
+      ncclSaiP2pNetChannelsPerPeer(true, 4) != 4) {
+    fprintf(stderr, "automatic dual-rail P2P channel floor failed\n");
+    return 1;
+  }
   uint64_t localP2pRankPairs =
       (UINT64_C(1) << ncclSaiRankPairIndex(8, 0, 7)) |
       (UINT64_C(1) << ncclSaiRankPairIndex(8, 3, 7));

@@ -1416,6 +1416,8 @@ static ncclResult_t ncclTopoGetNchannels(struct ncclComm* comm, int g /*local gp
 
        //allow upto channels requires to drive the NICs
        nNetChannels = std::max(netCountByBw, nChannelsMax);
+       nNetChannels = ncclSaiP2pNetChannelsPerPeer(
+           ncclTopoSaiRailByChannelEnabled(system), nNetChannels);
     }
     *nChannels = nNetChannels;
   }
