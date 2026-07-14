@@ -5,25 +5,28 @@ Optimized primitives for inter-GPU communication.
 ## NCCL-SAI Branch
 
 This branch carries AI4SAI changes for SAI UltraPOD and SlimPOD GPU fabrics.
-Its automatic release capabilities are narrowly guarded local P2P and
-dual-rail transport selection. Normal application use requires no
-`NCCL_SAI_*` environment variables. The runtime combines strict GPU/NIC
-topology checks, physical ASIC/port relationships, and communicator-wide
-agreement. Missing, ambiguous, merged, plugin-backed, or rank-inconsistent
+Its automatic behaviors are narrowly guarded local P2P and
+dual-rail transport selection plus an operation-specific large-scale
+AllReduce rule. Normal application use requires no `NCCL_SAI_*` environment
+variables. The runtime combines strict GPU/NIC topology checks, physical
+ASIC/port relationships, communicator-wide agreement, and operation-level
+guards. Missing, ambiguous, merged, plugin-backed, or rank-inconsistent
 layouts retain the corresponding upstream path.
 
 The source also contains experimental `ncclAlltoAll()` implementations: in
 controlled expert validation, eligible small messages use a two-stage
 GPU-island path and eligible large messages use a phased P2P planner. NCCL 2.28
 does not expose a stable cross-node hardware fabric-group identity, so these
-grouped AlltoAll/P2P schedules are not automatic release capabilities and
+grouped AlltoAll/P2P schedules are not automatic behaviors and
 normal zero-variable runs leave them on the upstream path. They remain
 available only for explicit expert experiments with rank-consistent group
 metadata.
+Normal upstream NCCL 2.28 grouped `ncclSend`/`ncclRecv` scheduling is not
+claimed to match NCCL 2.18.x small-message latency.
 
 The current automatic class is intentionally exact: SM70 GPUs form complete,
 equal-bandwidth four-GPU NVLink cliques, and each clique belongs to a distinct
-CPU locality domain. On the validated dual-port topology, physical port 1
+CPU locality domain. On the supported dual-port topology, physical port 1
 serves even channels and physical port 2 serves odd channels. NET enumeration
 order has no rail meaning.
 The internal IB transport must report two distinct GID subnet prefixes, with
@@ -38,8 +41,20 @@ identify a site or activate the exception.
 An unset level or `NCCL_P2P_LEVEL=NVL` is compatible with the strict automatic
 two-island predicate, while other explicit distance limits remain unchanged.
 
-Collective algorithms remain unchanged unless explicitly documented and
-validated. See
+On a topology that passes the strict dual-rail predicate, communicators with
+more than 256 ranks, more than 64 NCCL-visible topology nodes, and exactly four
+ranks per topology node may create eight collective connection channels when
+upstream maximum-channel controls such as `NCCL_MAX_NCHANNELS` permit the
+complete expansion.
+The pre-expansion channel count remains the default for P2P and all non-target
+collectives. Only a group containing one collective task, an AllReduce payload
+of at least 256 MiB, no explicit `NCCL_ALGO` or `NCCL_PROTO`, and no external
+tuner may select `RING`/`SIMPLE` and use the expanded channels.
+An explicit `NCCL_MIN_NCHANNELS` remains a global user policy and does not by
+itself activate this operation-specific selection.
+
+Collective algorithms remain unchanged outside that narrowly documented
+AllReduce rule. See
 `docs/sai/README.md` and `docs/sai/COMMUNICATION_TUNING_MATRIX.md` for scope,
 rollback knobs, and validation requirements.
 
@@ -48,9 +63,12 @@ is derived from NVIDIA NCCL and is not endorsed by NVIDIA. Original NVIDIA NCCL
 copyright and license notices are retained; see `LICENSE.txt` and
 `docs/sai/NOTICE.md`.
 
-For SAI users, the intended runtime mode is drop-in replacement: put the
-NCCL-SAI build's `lib/` directory before the system NCCL in `LD_LIBRARY_PATH`.
-Applications and shared MPI stacks do not set SAI activation variables.
+NCCL-SAI can be loaded without application source changes by putting its
+`lib/` directory before another NCCL in `LD_LIBRARY_PATH`. Here, "drop-in"
+describes API and loading compatibility only; it is not a cross-version
+performance guarantee or a recommendation for site-wide default promotion
+without qualification. Applications and shared MPI stacks do not set SAI
+activation variables.
 `NCCL_IB_HCA`, `NCCL_IB_MERGE_NICS`, and `NCCL_CROSS_NIC` retain their upstream
 semantics and may be supplied by ordinary site policy. When
 `NCCL_IB_MERGE_NICS` and the upstream fusion controls are unset, the internal
@@ -65,9 +83,9 @@ NIC fusion. Explicit merge `0` or `1`, merge level, and force-merge settings
 keep their upstream behavior. Legacy
 `NCCL_SAI_FABRIC_PROFILE` values remain available for compatibility and expert
 testing of grouped paths, but are not a production prerequisite and do not
-change automatic rail or local-P2P detection. `NCCL_SAI_DISABLE=1` is the global
-emergency rollback; feature-specific `*_ENABLE=0` controls remain available
-where documented.
+change automatic rail, local-P2P, or large-scale AllReduce detection.
+`NCCL_SAI_DISABLE=1` is the global emergency rollback; feature-specific
+`*_ENABLE=0` controls remain available where documented.
 
 ## Introduction
 

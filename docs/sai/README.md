@@ -1,13 +1,15 @@
 # NCCL-SAI Public Guide
 
 NCCL-SAI is an AI4SAI optimization branch derived from NVIDIA NCCL for SAI
-UltraPOD and SlimPOD GPU fabric families. It is designed as a drop-in runtime:
-applications continue to use the NCCL API without source changes.
+UltraPOD and SlimPOD GPU fabric families. Applications continue to use the
+NCCL API without source changes. This loading and API compatibility is not a
+cross-version performance guarantee or a site-wide default-promotion claim.
 
-The automatic release capabilities are a narrowly guarded local P2P
-transport-selection path for one eligible single-host layout and a strict
-dual-rail-by-channel path. These transport choices can affect operations that
-use those paths, although their collective algorithms are unchanged.
+The automatic behaviors are a narrowly guarded local P2P
+transport-selection path for one eligible single-host layout, a strict
+dual-rail-by-channel path, and an operation-specific large-scale AllReduce
+rule. Outside the documented AllReduce rule, these transport choices do not
+change collective algorithm selection.
 
 The source also contains expert-only `ncclAlltoAll()` implementations.
 Eligible small-message calls can use a two-stage island planner that aggregates
@@ -16,6 +18,8 @@ Eligible large out-of-place calls can use a phased P2P planner that limits the
 peer rounds admitted to each kernel plan. They are not transparent release
 capabilities because NCCL 2.28 cannot derive stable cross-node fabric groups
 from hardware. Normal runs keep upstream AlltoAll scheduling.
+Normal upstream NCCL 2.28 grouped `ncclSend`/`ncclRecv` scheduling is not
+claimed to match NCCL 2.18.x small-message latency.
 
 ## Activation Model
 
@@ -23,10 +27,11 @@ Normal users, applications, and shared MPI stacks set no `NCCL_SAI_*`
 environment variables. Public source does not match private hostnames,
 partitions, scheduler strings, device names, or filesystem paths. There is no
 site-identity test. Each automatic optimization evaluates the runtime
-GPU/PCIe/NIC graph needed for that optimization: SM70 GPUs arranged as
-complete, equal-bandwidth four-GPU NVLink cliques, one distinct CPU locality
-domain per clique, the validated physical dual-port ASIC shape, and
-communicator-wide agreement.
+GPU/PCIe/NIC graph and operation shape needed for that optimization: SM70 GPUs
+arranged as complete, equal-bandwidth four-GPU NVLink cliques, one distinct CPU
+locality domain per clique, the supported physical dual-port ASIC shape,
+communicator-wide agreement, and the documented communicator and message-size
+guards.
 
 Upstream NCCL controls retain upstream semantics. `NCCL_IB_HCA` and
 `NCCL_IB_MERGE_NICS` influence the topology that NCCL actually discovers, but
@@ -71,14 +76,14 @@ Compatibility and rollback controls remain available:
 - `NCCL_SAI_FABRIC_PROFILE=ultrapod-fullmesh` is a legacy compatibility and
   expert-validation request for grouped AlltoAll/P2P, not a normal runtime
   requirement or a hardware bypass. Profile values do not enable or suppress
-  automatic rail or local-P2P capability detection.
+  automatic rail, local-P2P, or large-scale AllReduce capability detection.
 - `NCCL_SAI_LOCAL_P2P_SYS_ENABLE=0` is a local-P2P rollback. Leaving it unset
   uses strict automatic hardware detection; a positive value cannot force an
   unsupported topology to pass.
 - AlltoAll and grouped-P2P `NCCL_SAI_*_ENABLE` values are expert controls for
   those expert-only paths. They do not enable or suppress automatic rail or
-  local-P2P capability detection, and they do not bypass structural layout,
-  metadata-consistency, or buffer-safety checks.
+  local-P2P or large-scale AllReduce capability detection, and they do not
+  bypass structural layout, metadata-consistency, or buffer-safety checks.
 
 ### Dual-Rail Local-NET Selection
 
@@ -128,6 +133,29 @@ graphs, or any other ineligible layout likewise retains upstream selection.
 An explicit non-`AUTO` `NCCL_NETDEVS_POLICY` also retains upstream selection;
 the automatic rail path does not reinterpret an upstream device-count policy.
 
+### Large-Scale AllReduce Channel Isolation
+
+After the strict automatic dual-rail predicate passes, NCCL-SAI may duplicate
+collective connection channels to eight only when the communicator has more
+than 256 ranks, more than 64 NCCL-visible topology nodes, exactly four ranks
+per topology node, and upstream maximum-channel controls still permit the full
+eight-channel target. `NCCL_MAX_NCHANNELS` and equivalent upstream limits below
+eight prevent the expansion rather than creating a partially expanded
+communicator.
+
+The pre-expansion count remains the channel base used by the cost model and by
+per-operation and plan-wide limits for every non-target collective. It is also
+the automatic global channel base for P2P and AlltoAll. The expanded channels
+are used only for an AllReduce of at least 256 MiB in a group with exactly one
+collective task, when `RING`/`SIMPLE` is available and neither an external tuner
+nor explicit `NCCL_ALGO` or `NCCL_PROTO` policy is present. Explicit
+`NCCL_MIN_NCHANNELS` continues to be a user-requested global policy; explicit
+maximum-channel controls retain their upstream upper-bound meaning. A minimum
+that already produces eight or more channels does not perform the automatic
+expansion and does not by itself activate `RING`/`SIMPLE` selection.
+`NCCL_SAI_DISABLE=1` disables this rule together with the other SAI-specific
+automatic behavior.
+
 ## AlltoAll Paths
 
 Size thresholds are per-peer bytes, not the total bytes passed to
@@ -138,7 +166,7 @@ Size thresholds are per-peer bytes, not the total bytes passed to
 | `NCCL_SAI_A2A_ENABLE` | `-1` | Keep the grouped SAI path off in normal runtime; `0` disables and positive values request expert evaluation. |
 | `NCCL_SAI_A2A_PLANNER_ENABLE` | `-1` | Enable the phased planner only for an explicitly requested, hardware-validated full-mesh class; `0` disables it. |
 | `NCCL_SAI_A2A_PLANNER_ROUNDS` | `-1` | Derive a phase window from the expert topology settings; positive values override it. |
-| `NCCL_SAI_A2A_GROUP_NODES` | `-1` | Use the validated expert default of 16 topology nodes per aggregation group. |
+| `NCCL_SAI_A2A_GROUP_NODES` | `-1` | Use the configured expert default of 16 topology nodes per aggregation group. |
 | `NCCL_SAI_A2A_MULTIGROUP_ENABLE` | `-1` | Require complete rank-consistent metadata for grouped layouts; positive values request expert multigroup evaluation but cannot override completeness. |
 | `NCCL_SAI_A2A_MIN_PEER_BYTES` | `131072` | Enter the phased planner at 128 KiB per peer. |
 | `NCCL_SAI_A2A_MIN_RANKS` | `32` | Require at least 32 ranks. |
@@ -165,11 +193,10 @@ The path supports distinct buffers and exactly aliased in-place buffers.
 Unsupported layouts, allocation failure, invalid sizes, missing group metadata,
 and expert limits fall back to upstream scheduling.
 
-The default 576-rank scale guard is deliberate. Sustained same-allocation A/B
-showed that upstream scheduling remains faster at a 64-rank complete group,
-while the island path first demonstrated a material gain at 576 ranks. Smaller
-communicators therefore remain upstream by default; experts can lower
-`NCCL_SAI_A2A_ISLAND_MIN_RANKS` for controlled validation.
+The default 576-rank threshold is a conservative expert-path guard, not a
+general performance-crossover claim. Smaller communicators remain upstream
+unless an expert lowers `NCCL_SAI_A2A_ISLAND_MIN_RANKS` for controlled
+validation.
 
 The default scratch reservation is the smaller of
 `ISLAND_MAX_PEER_BYTES * nranks` and `ISLAND_SCRATCH_CAP_BYTES` per rank. It is
@@ -190,10 +217,11 @@ Schedule-affecting configuration is compared during communicator
 initialization. A mismatch fails initialization before ranks can select
 different communication schedules.
 
-The automatic policy does not change communicator-wide
-`NCCL_MIN_NCHANNELS` or its legacy alias. Standard upstream channel controls
-remain available as explicit expert tuning, but AlltoAll defaults must not
-silently alter unrelated collectives or ordinary P2P traffic.
+The automatic policy does not set communicator-wide `NCCL_MIN_NCHANNELS` or
+its legacy alias. The only internal collective-channel expansion is the
+isolated large-scale AllReduce rule above; its saved base remains the limit for
+AlltoAll, unrelated collectives, and ordinary P2P traffic. Standard upstream
+channel controls remain available as explicit expert tuning.
 
 ## Fabric Metadata
 
@@ -272,43 +300,33 @@ expected and must not be mixed into the local cross-island decision.
 
 ## Public Validation Standard
 
-Before publishing a source branch or binary package, validate at least:
+Validation must match the behavior changed and the claims being published. The
+minimum release gate for the automatic capabilities in this branch is:
 
-- reproducible build from a clean source commit;
-- normal qualification with the complete `NCCL_SAI_*` set empty;
-- advertised CUDA SASS and PTX architecture coverage;
-- portable host ISA settings;
-- automatic rail and local-P2P eligibility plus fail-closed fallback;
-- single-node, cross-node, and multi-node sustained correctness runs;
-- CUDA Graph, nonblocking communicator, repeated-call, and common P2P ordering;
-- allreduce, reduce-scatter, allgather, broadcast, and common P2P
-  non-regression;
-- fail-closed behavior for missing, invalid, merged, or rank-inconsistent
-  hardware inputs and expert metadata;
-- merge-unset automatic endpoint-probe acceptance, preflight-pass/final-reject
-  upstream rebuild, explicit merge `0` and `1`, and explicit
-  merge-level/force-merge upstream behavior;
-- `NCCL_IB_MERGE_NICS=1` correctness on the upstream merged-NIC fallback, with
-  performance comparisons reported only after a same-candidate A/B.
+- one reproducible CUDA build from the final clean source commit, with the
+  advertised SASS/PTX coverage, portable host ISA, package contents, and
+  checksums recorded;
+- offline activation and fail-closed checks for the changed predicates, with
+  normal qualification using an empty `NCCL_SAI_*` environment;
+- one adjacent stable/candidate comparison on a supported single-host GPU
+  topology, reporting small-message latency and large-message bandwidth;
+- one two-host dual-rail initialization and data-path regression; and
+- one adjacent stable/candidate multi-host comparison on a communicator that
+  satisfies the documented large-scale predicate, plus a short initialization
+  trace confirming automatic rail consensus, complete channel expansion, the
+  retained P2P/base channel count, and the targeted AllReduce algorithm and
+  protocol.
 
-When publishing claims for the expert-only AlltoAll implementation, add its
-small/large-message eligibility and fallback, scratch allocation, CUDA Graph,
-nonblocking, repeated-call, mixed-P2P ordering, and relevant fabric-scale gates.
-These expert gates are not prerequisites for releasing the automatic rail and
-local-P2P capabilities without an AlltoAll performance claim.
+Additional CUDA Graph, nonblocking, collective, merge-mode, topology, or scale
+matrices are required only when the source change or published claim touches
+those behaviors. Functional AlltoAll descriptions require correctness and
+fail-closed coverage; performance-specific AlltoAll matrices may be omitted
+when no AlltoAll performance claim is made.
 
 See `docs/sai/BUILD_AND_PACKAGING.md` for build and packaging requirements.
 Public performance summaries should contain only sanitized topology classes,
 scale classes, versions, and message sizes. Keep private job IDs, hostnames,
 switch labels, paths, and raw operational logs outside the public repository.
-
-For a full-mesh topology class with 16 equal-bandwidth endpoints per group and
-one equal-bandwidth direct edge per group pair, 17 complete groups are the
-injection/edge balance point. An ideal balanced-fabric headline claim for that
-layout must use 16-18 complete, uniformly occupied groups. This scale is not a
-general release prerequisite. Smaller layouts can qualify correctness,
-fallback, and topology-normalized non-regression, but not the ideal full-fabric
-result.
 
 ## Offline Checks
 

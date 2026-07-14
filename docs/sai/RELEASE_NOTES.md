@@ -1,4 +1,4 @@
-# NCCL-SAI v2.28.9-1-sai.2 Release Notes
+# NCCL-SAI v2.28.9-1-sai.3 Release Notes
 
 NCCL-SAI is an AI4SAI optimization release derived from NVIDIA NCCL. This
 release is based on NCCL `v2.28.9-1` and targets SAI UltraPOD and SlimPOD GPU
@@ -8,17 +8,21 @@ NCCL-SAI modifications are maintained by AI4SAI/SAI contributors. This project
 is not endorsed by NVIDIA. Original NVIDIA NCCL copyright and license notices
 are retained in `LICENSE.txt`; see `docs/sai/NOTICE.md`.
 
-## Automatic Release Capabilities
+## Automatic Behaviors
 
 - Dual-rail-by-channel transport selection on the exact supported SM70,
   four-GPU-NVLink-clique and dual-port physical topology.
 - Local P2P transport selection on the exact single-host eight-rank, two-clique
   SM70 topology with distinct CPU locality domains.
+- Operation-specific large-scale AllReduce channel and `RING`/`SIMPLE` selection
+  on a topology that passes the automatic dual-rail predicate.
 
-Both capabilities require their complete runtime hardware predicate and
-communicator-wide agreement. Neither identifies the site from Slurm, hostnames,
-partitions, device-name strings, configuration paths, or environment-variable
-strings. Missing or ambiguous evidence fails closed to upstream behavior.
+These capabilities require their complete runtime topology, capability, and
+operation predicates, plus communicator-wide agreement where applicable. None
+identifies the site from Slurm, hostnames, partitions, device-name strings,
+configuration paths, or environment-variable strings. Missing or ambiguous
+evidence disables the affected automatic rule and retains its documented
+fallback.
 
 ## Expert-Only AlltoAll Implementation
 
@@ -33,11 +37,15 @@ Normal zero-variable runs keep grouped AlltoAll on the upstream path because
 NCCL 2.28 does not expose a stable cross-node hardware fabric-group identity.
 Expert use requires complete rank-consistent fabric metadata. An equal total
 topology-node count alone does not prove that one group is complete.
+Normal zero-variable AlltoAll therefore inherits upstream NCCL 2.28 grouped
+`ncclSend`/`ncclRecv` scheduling. This release does not claim small-message
+latency non-regression against NCCL 2.18.x.
 
 NCCL-SAI also includes a narrowly guarded local P2P transport-selection path
 for an eligible single-host 8-rank, two-island communicator. That path can
-affect any operation using local P2P transport, while the allreduce, allgather,
-reduce-scatter, broadcast, and reduce collective algorithms remain unchanged.
+affect any operation using local P2P transport. Collective algorithm selection
+remains unchanged outside the separately documented large-scale AllReduce
+rule.
 
 The automatic dual-rail path requires the actual topology visible to NCCL to
 contain one to four complete, equal-bandwidth four-GPU NVLink cliques of SM70
@@ -71,13 +79,28 @@ topologies, nonzero cross-NIC mode, and rank-inconsistent layouts retain the
 corresponding upstream path. An explicit non-`AUTO` `NCCL_NETDEVS_POLICY`
 likewise keeps upstream device selection.
 
+For the large-scale AllReduce rule, the communicator must have more than 256
+ranks, more than 64 NCCL-visible topology nodes, and exactly four ranks per
+topology node. NCCL-SAI creates eight collective connection channels only when
+upstream maximum-channel controls such as `NCCL_MAX_NCHANNELS` permit the
+full eight-channel target. The pre-expansion count remains the channel base
+used by the cost model and by per-operation and plan-wide limits for non-target
+collectives. It is also the automatic global channel base for P2P and AlltoAll.
+Only an AllReduce of at least 256 MiB in a group with one collective task may
+select `RING`/`SIMPLE` and use all eight channels. Explicit `NCCL_ALGO` or
+`NCCL_PROTO`, an external tuner, a maximum below eight, an unavailable
+`RING`/`SIMPLE` entry, or any failed topology guard retains the saved base
+behavior. An explicit `NCCL_MIN_NCHANNELS` that already produces eight or more
+channels remains a global user policy and does not by itself activate this
+operation-specific selection.
+
 ## Transparent Runtime Model
 
 Normal users, applications, and shared MPI stacks set no `NCCL_SAI_*`
 variables. NCCL-SAI does not identify a site from Slurm, hostnames, partitions,
-device-name strings, or configuration paths. Rail and local-P2P activation use
-strict runtime topology plus capability and safety checks, followed by
-communicator-wide agreement.
+device-name strings, or configuration paths. Rail, local-P2P, and large-scale
+AllReduce activation use strict runtime topology plus capability, operation,
+and safety checks, followed by communicator-wide agreement where applicable.
 Grouped AlltoAll/P2P schedules are not enabled automatically: scheduler
 metadata is neither hardware truth nor a site identity. Upstream controls such as
 `NCCL_IB_HCA`, `NCCL_IB_MERGE_NICS`, and `NCCL_CROSS_NIC` retain their upstream
@@ -87,11 +110,13 @@ topology they actually produce rather than matching their text values.
 `NCCL_SAI_FABRIC_PROFILE=ultrapod-fullmesh` remains a compatibility/expert
 request for grouped AlltoAll/P2P, not a normal prerequisite and not a hardware
 bypass. The structural topology predicate must still pass. Profile values do
-not enable or suppress automatic rail or local-P2P capability detection.
+not enable or suppress automatic rail, local-P2P, or large-scale AllReduce
+capability detection.
 
 Rollback and expert controls:
 
-- `NCCL_SAI_DISABLE=1`: globally disable SAI-specific behavior.
+- `NCCL_SAI_DISABLE=1`: globally disable SAI-specific behavior, including the
+  large-scale AllReduce rule.
 - Upstream merge controls unset: the exact internal-IB preflight may start a
   communicator-wide physical-endpoint probe. A preflight or full-topology
   mismatch keeps, or rebuilds with, upstream default fusion. With controls
@@ -103,6 +128,9 @@ Rollback and expert controls:
   eight-endpoint automatic class.
 - Upstream `NCCL_CROSS_NIC=0` allows the ordinary ring/tree rail override;
   other effective values retain the graph-selected endpoint.
+- Upstream maximum-channel controls below eight prevent the automatic
+  large-scale AllReduce expansion. Explicit `NCCL_ALGO` or `NCCL_PROTO` and an
+  external tuner retain precedence over its algorithm/protocol selection.
 - `NCCL_SAI_A2A_ENABLE=1`: request expert evaluation of the AlltoAll SAI path;
   it does not bypass the hardware predicate or fabric-group validation.
 - `NCCL_SAI_A2A_ENABLE=0`: disable the alltoall SAI path.
@@ -137,16 +165,18 @@ Rollback and expert controls:
   ragged AlltoAll planner, whose metadata, occupancy, and build-consensus gates
   remain independent.
 
-The automatic policy does not set a communicator-wide minimum channel
-count. Standard upstream `NCCL_MIN_NCHANNELS` controls remain explicit expert
-tuning because a global floor can change unrelated collective and P2P paths.
+The automatic policy does not set a communicator-wide minimum channel count.
+It may create eight collective connection channels for the isolated
+large-scale AllReduce rule, while retaining the pre-expansion base for P2P,
+AlltoAll, and non-target collectives. Standard upstream
+`NCCL_MIN_NCHANNELS` remains an explicit user-requested global policy.
 
 The release deliberately does not derive fabric groups from Slurm variables,
 rank order, hostnames, HCA names, LIDs, or guessed GUID ranges. None of those is
 a stable cross-node hardware grouping proof. Until a hardware-backed provider
 exists, normal zero-SAI-variable grouped paths remain upstream. Explicit
 numeric group IDs are retained only for controlled expert validation and never
-determine rail or local-P2P eligibility.
+determine rail, local-P2P, or large-scale AllReduce eligibility.
 
 ## Release Qualification
 
@@ -156,29 +186,27 @@ SHA256, static-library SHA256, CUDA architecture coverage, and portable host
 ISA. Matching checksums and contents manifests accompany the source and binary
 assets.
 
-The build audit records the clean source identity, advertised SASS/PTX
-architecture coverage, portable host ISA target, package contents, and library
-digests. Communication, topology, message-size, CUDA Graph, fallback, and
-cross-collective claims are limited to the exact gate entries present in the
-published sanitized evidence summary. A gate or scale class not listed there
-is not claimed by this release.
+Before publication, the build audit must record the clean source identity,
+advertised SASS/PTX architecture coverage, portable host ISA target, package
+contents, and library digests. The eventual public qualification summary must
+be bound to the final shared-library digest and record only the scope-matched
+comparisons and activation traces actually completed. CUDA Graph, nonblocking,
+cross-collective, merge-mode, or broader scale claims require their own evidence
+and are not implied by this release.
 
-Application acceptance is a separate private gate bound to the exact final
-shared-library hash. Private workloads, scheduler records, and raw application
-logs are not release assets. This release does not use application acceptance
-as island-path evidence and does not claim a VASP application speedup.
-
-For the full-mesh layout class with 16 equal-bandwidth endpoints per group and
-one equal-bandwidth direct edge per group pair, any new headline performance
-claim for the ideal balanced fabric requires 16-18 complete, uniformly occupied
-groups. That scale is not a general release gate. Smaller layouts remain valid
-for correctness, fallback, and topology-normalized non-regression evidence.
+Application-level acceptance is outside the public release evidence. Private
+workloads, scheduler records, and raw application logs are not release assets,
+and no application-level speedup is claimed.
 
 ## Not Claimed
 
 This release does not claim:
 
 - universal speedup for all NCCL or MPI collectives;
+- NCCL 2.28 grouped `ncclSend`/`ncclRecv` small-message latency non-regression
+  against NCCL 2.18.x;
+- that API/loading compatibility recommends replacing any existing default NCCL
+  without scope-matched qualification;
 - application-level speedup for programs that do not use the optimized path;
 - performance guarantees for every topology, scheduler allocation, or
   concurrent production workload;
@@ -191,7 +219,7 @@ This release does not claim:
 
 ## Redistribution
 
-This release is published under the `AI4SAI` organization in a public NCCL-SAI
+NCCL-SAI releases are published under the `AI4SAI` organization in a public
 repository derived from NVIDIA NCCL. Upstream license files and copyright
 notices remain intact, and the repository keeps upstream provenance explicit
 without implying NVIDIA endorsement. Binary packages and tarballs include
