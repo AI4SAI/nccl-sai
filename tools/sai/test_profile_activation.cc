@@ -5,6 +5,7 @@
  ************************************************************************/
 
 #include "sai_profile.h"
+#include "topo_bcm.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -75,6 +76,16 @@ int main() {
   }
   if (NCCL_SAI_A2A_ISLAND_MIN_RANKS_DEFAULT != 576) {
     fprintf(stderr, "island scale guard changed unexpectedly\n");
+    return 1;
+  }
+  if (ncclTopoBcmGen(UINT64_C(0x1000c0101000a096), 0) != 4 ||
+      ncclTopoBcmGen(UINT64_C(0x1000c0101000a096), 1) != 4 ||
+      ncclTopoBcmGen(UINT64_C(0x1000c0121000a096), 0) != 4 ||
+      ncclTopoBcmGen(UINT64_C(0x1000c0121000a096), 1) != 4 ||
+      ncclTopoBcmGen(UINT64_C(0x1000c03010000000), 0) != 5 ||
+      ncclTopoBcmGen(UINT64_C(0x1000c03010001000), 1) != 5 ||
+      ncclTopoBcmGen(UINT64_C(0x1000c0111000a096), 0) != 0) {
+    fprintf(stderr, "BCM switch generation detection failed\n");
     return 1;
   }
   if (ncclSaiRailPathCapabilityClass(4, 4, 5) != 5 ||

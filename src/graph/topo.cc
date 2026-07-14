@@ -7,6 +7,7 @@
 #include "core.h"
 #include "graph.h"
 #include "topo.h"
+#include "topo_bcm.h"
 #include "comm.h"
 #include "nccl.h"
 #include "nvmlwrap.h"
@@ -190,20 +191,11 @@ ncclResult_t ncclTopoConnectNodes(struct ncclTopoNode* node, struct ncclTopoNode
   return ncclSuccess;
 }
 
-// BCM Gen4 Switches present themselves as a two-level hierarchical switch
-// even though they're supposed to sustain full BW across all ports.
-// Flatten the switch as this extra level can break the search and make
-// NCCL take wrong topology decisions.
-int getBcmGen(uint64_t id, int level) {
-  if ((id & 0xfffffffffffff000) == 0x1000c0101000a000) return 4;
-  if ((id & 0xfffffffffffff000) == (0x1000c03010000000 | level*0x1000)) return 5;
-  return 0;
-}
 ncclResult_t ncclTopoFlattenBcmSwitches(struct ncclTopoSystem* system) {
   ncclResult_t ret = ncclSuccess;
   for (int s=0; s<system->nodes[PCI].count; s++) {
     struct ncclTopoNode* pciSwitch = system->nodes[PCI].nodes+s;
-    int gen = getBcmGen(pciSwitch->pci.device, 0);
+    int gen = ncclTopoBcmGen(pciSwitch->pci.device, 0);
     // Flatten Gen4 PEX switches in base mode
     if (gen) {
       // Find sub switches with the same device ID.
@@ -213,7 +205,7 @@ ncclResult_t ncclTopoFlattenBcmSwitches(struct ncclTopoSystem* system) {
       for (int l=0; l<pciSwitch->nlinks; l++) {
         struct ncclTopoNode* sub = pciSwitch->links[l].remNode;
         // Only fuse sub switches with the same device ID.
-        if (sub->type != PCI || getBcmGen(sub->pci.device, 1) != gen) continue;
+        if (sub->type != PCI || ncclTopoBcmGen(sub->pci.device, 1) != gen) continue;
         // Save sub switch for later
         subSwIds[subs++] = sub->id;
         // Remove link to that sub switch
