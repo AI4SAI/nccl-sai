@@ -1430,13 +1430,11 @@ extern int64_t ncclParamWorkArgsBytes();
 
 ncclResult_t ncclTopoComputeP2pChannels(struct ncclComm* comm) {
   /* here we already honor comm->max/minCTAs for p2pnChannels. */
-  int baseChannels = comm->saiNChannelsBase > 0 ?
-      comm->saiNChannelsBase : comm->nChannels;
   if (comm->sharedRes->owner != comm) {
-    comm->p2pnChannels = std::min(baseChannels, (int)ncclParamMaxP2pNChannels());
+    comm->p2pnChannels = std::min(comm->nChannels, (int)ncclParamMaxP2pNChannels());
     comm->p2pnChannels = std::min(std::max(comm->p2pnChannels, (int)ncclParamMinP2pNChannels()), comm->sharedRes->tpP2pNChannels);
   } else {
-    comm->p2pnChannels = std::min(baseChannels, (int)ncclParamMaxP2pNChannels());
+    comm->p2pnChannels = std::min(comm->nChannels, (int)ncclParamMaxP2pNChannels());
     comm->p2pnChannels = std::max(comm->p2pnChannels, (int)ncclParamMinP2pNChannels());
   }
 

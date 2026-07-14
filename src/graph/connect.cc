@@ -11,7 +11,6 @@
 #include "trees.h"
 #include "rings.h"
 #include "topo.h"
-#include "sai_profile.h"
 
 /******************************************************************/
 /********************* Internode connection ***********************/
@@ -381,7 +380,6 @@ ncclResult_t ncclTopoPostset(struct ncclComm* comm, int* firstRanks, int* treePa
   int nranks = comm->nRanks;
   int nNodes = comm->nNodes;
   int nChannels = comm->nChannels;
-  int saiTargetChannels = 0;
   int minHeadNum = INT_MAX;
   int shared = parent && parent->nvlsSupport  && parent->shareResources;
   NCCLCHECK(ncclCalloc(&ringRecv, nNodes*MAXCHANNELS));
@@ -493,30 +491,6 @@ ncclResult_t ncclTopoPostset(struct ncclComm* comm, int* firstRanks, int* treePa
   } else {
     nChannels = comm->nChannels = std::min(std::min(ncclMaxNchannels(), nChannels), comm->config.maxCTAs);
     nChannels = comm->nChannels = copyChannels(comm, nChannels, std::max(ncclMinNchannels(), comm->config.minCTAs), ringPrev, ringNext);
-  }
-
-  saiTargetChannels = ncclSaiLargeScaleRailChannelTarget(
-      ncclTopoSaiRailByChannelEnabled(comm->topo), comm->nRanks,
-      comm->nNodes, nChannels);
-  saiTargetChannels = std::min(
-      std::min(saiTargetChannels, ncclMaxNchannels()), comm->config.maxCTAs);
-  if (comm->sharedRes->owner != comm) {
-    saiTargetChannels = std::min(
-        saiTargetChannels, comm->sharedRes->tpNChannels);
-  }
-  if (ncclSaiLargeScaleRailChannelExpansionValid(
-          nChannels, saiTargetChannels)) {
-    int priorChannels = nChannels;
-    nChannels = comm->nChannels = copyChannels(
-        comm, nChannels, saiTargetChannels, ringPrev, ringNext);
-    comm->saiNChannelsBase = ncclSaiLargeScaleRailChannelBase(
-        priorChannels, nChannels);
-    if (comm->rank == 0) {
-      INFO(NCCL_INIT,
-          "NCCL-SAI large-scale rail collective channels: %d -> %d, default base %d, ranks %d, topologyNodes %d",
-          priorChannels, nChannels, comm->saiNChannelsBase,
-          comm->nRanks, comm->nNodes);
-    }
   }
 
   comm->collChannels = comm->nChannels;

@@ -5,13 +5,12 @@ Optimized primitives for inter-GPU communication.
 ## NCCL-SAI Branch
 
 This branch carries AI4SAI changes for SAI UltraPOD and SlimPOD GPU fabrics.
-Its automatic behaviors are narrowly guarded local P2P and
-dual-rail transport selection plus an operation-specific large-scale
-AllReduce rule. Normal application use requires no `NCCL_SAI_*` environment
+Its automatic behaviors are narrowly guarded local P2P and dual-rail transport
+selection. Normal application use requires no `NCCL_SAI_*` environment
 variables. The runtime combines strict GPU/NIC topology checks, physical
-ASIC/port relationships, communicator-wide agreement, and operation-level
-guards. Missing, ambiguous, merged, plugin-backed, or rank-inconsistent
-layouts retain the corresponding upstream path.
+ASIC/port relationships, and communicator-wide agreement. Missing, ambiguous,
+merged, plugin-backed, or rank-inconsistent layouts retain the corresponding
+upstream path.
 
 The source also contains experimental `ncclAlltoAll()` implementations: in
 controlled expert validation, eligible small messages use a two-stage
@@ -41,20 +40,9 @@ identify a site or activate the exception.
 An unset level or `NCCL_P2P_LEVEL=NVL` is compatible with the strict automatic
 two-island predicate, while other explicit distance limits remain unchanged.
 
-On a topology that passes the strict dual-rail predicate, communicators with
-more than 256 ranks, more than 64 NCCL-visible topology nodes, and exactly four
-ranks per topology node may create eight collective connection channels when
-upstream maximum-channel controls such as `NCCL_MAX_NCHANNELS` permit the
-complete expansion.
-The pre-expansion channel count remains the default for P2P and all non-target
-collectives. Only a group containing one collective task, an AllReduce payload
-of at least 256 MiB, no explicit `NCCL_ALGO` or `NCCL_PROTO`, and no external
-tuner may select `RING`/`SIMPLE` and use the expanded channels.
-An explicit `NCCL_MIN_NCHANNELS` remains a global user policy and does not by
-itself activate this operation-specific selection.
-
-Collective algorithms remain unchanged outside that narrowly documented
-AllReduce rule. See
+NCCL-SAI does not add collective connection channels or override collective
+algorithm and protocol selection. Standard upstream channel, algorithm, and
+protocol controls retain their normal semantics. See
 `docs/sai/README.md` and `docs/sai/COMMUNICATION_TUNING_MATRIX.md` for scope,
 rollback knobs, and validation requirements.
 
@@ -83,7 +71,7 @@ NIC fusion. Explicit merge `0` or `1`, merge level, and force-merge settings
 keep their upstream behavior. Legacy
 `NCCL_SAI_FABRIC_PROFILE` values remain available for compatibility and expert
 testing of grouped paths, but are not a production prerequisite and do not
-change automatic rail, local-P2P, or large-scale AllReduce detection.
+change automatic rail or local-P2P detection.
 `NCCL_SAI_DISABLE=1` is the global emergency rollback; feature-specific
 `*_ENABLE=0` controls remain available where documented.
 

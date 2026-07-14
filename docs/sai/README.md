@@ -5,11 +5,10 @@ UltraPOD and SlimPOD GPU fabric families. Applications continue to use the
 NCCL API without source changes. This loading and API compatibility is not a
 cross-version performance guarantee or a site-wide default-promotion claim.
 
-The automatic behaviors are a narrowly guarded local P2P
-transport-selection path for one eligible single-host layout, a strict
-dual-rail-by-channel path, and an operation-specific large-scale AllReduce
-rule. Outside the documented AllReduce rule, these transport choices do not
-change collective algorithm selection.
+The automatic behaviors are a narrowly guarded local P2P transport-selection
+path for one eligible single-host layout and a strict dual-rail-by-channel path.
+These transport choices do not change collective channel, algorithm, or
+protocol selection.
 
 The source also contains expert-only `ncclAlltoAll()` implementations.
 Eligible small-message calls can use a two-stage island planner that aggregates
@@ -76,13 +75,13 @@ Compatibility and rollback controls remain available:
 - `NCCL_SAI_FABRIC_PROFILE=ultrapod-fullmesh` is a legacy compatibility and
   expert-validation request for grouped AlltoAll/P2P, not a normal runtime
   requirement or a hardware bypass. Profile values do not enable or suppress
-  automatic rail, local-P2P, or large-scale AllReduce capability detection.
+  automatic rail or local-P2P capability detection.
 - `NCCL_SAI_LOCAL_P2P_SYS_ENABLE=0` is a local-P2P rollback. Leaving it unset
   uses strict automatic hardware detection; a positive value cannot force an
   unsupported topology to pass.
 - AlltoAll and grouped-P2P `NCCL_SAI_*_ENABLE` values are expert controls for
   those expert-only paths. They do not enable or suppress automatic rail or
-  local-P2P or large-scale AllReduce capability detection, and they do not
+  local-P2P capability detection, and they do not
   bypass structural layout, metadata-consistency, or buffer-safety checks.
 
 ### Dual-Rail Local-NET Selection
@@ -133,28 +132,11 @@ graphs, or any other ineligible layout likewise retains upstream selection.
 An explicit non-`AUTO` `NCCL_NETDEVS_POLICY` also retains upstream selection;
 the automatic rail path does not reinterpret an upstream device-count policy.
 
-### Large-Scale AllReduce Channel Isolation
+### Collective Channel Policy
 
-After the strict automatic dual-rail predicate passes, NCCL-SAI may duplicate
-collective connection channels to eight only when the communicator has more
-than 256 ranks, more than 64 NCCL-visible topology nodes, exactly four ranks
-per topology node, and upstream maximum-channel controls still permit the full
-eight-channel target. `NCCL_MAX_NCHANNELS` and equivalent upstream limits below
-eight prevent the expansion rather than creating a partially expanded
-communicator.
-
-The pre-expansion count remains the channel base used by the cost model and by
-per-operation and plan-wide limits for every non-target collective. It is also
-the automatic global channel base for P2P and AlltoAll. The expanded channels
-are used only for an AllReduce of at least 256 MiB in a group with exactly one
-collective task, when `RING`/`SIMPLE` is available and neither an external tuner
-nor explicit `NCCL_ALGO` or `NCCL_PROTO` policy is present. Explicit
-`NCCL_MIN_NCHANNELS` continues to be a user-requested global policy; explicit
-maximum-channel controls retain their upstream upper-bound meaning. A minimum
-that already produces eight or more channels does not perform the automatic
-expansion and does not by itself activate `RING`/`SIMPLE` selection.
-`NCCL_SAI_DISABLE=1` disables this rule together with the other SAI-specific
-automatic behavior.
+NCCL-SAI does not add collective connection channels or override collective
+algorithm and protocol selection. Standard upstream minimum/maximum channel,
+algorithm, protocol, and tuner controls retain their normal semantics.
 
 ## AlltoAll Paths
 
@@ -218,10 +200,8 @@ initialization. A mismatch fails initialization before ranks can select
 different communication schedules.
 
 The automatic policy does not set communicator-wide `NCCL_MIN_NCHANNELS` or
-its legacy alias. The only internal collective-channel expansion is the
-isolated large-scale AllReduce rule above; its saved base remains the limit for
-AlltoAll, unrelated collectives, and ordinary P2P traffic. Standard upstream
-channel controls remain available as explicit expert tuning.
+its legacy alias. Standard upstream channel controls remain available as
+explicit expert tuning.
 
 ## Fabric Metadata
 
@@ -311,11 +291,10 @@ minimum release gate for the automatic capabilities in this branch is:
 - one adjacent stable/candidate comparison on a supported single-host GPU
   topology, reporting small-message latency and large-message bandwidth;
 - one two-host dual-rail initialization and data-path regression; and
-- one adjacent stable/candidate multi-host comparison on a communicator that
-  satisfies the documented large-scale predicate, plus a short initialization
-  trace confirming automatic rail consensus, complete channel expansion, the
-  retained P2P/base channel count, and the targeted AllReduce algorithm and
-  protocol.
+- one adjacent stable/candidate multi-host comparison beyond the historical
+  scale-failure boundary, plus a short initialization trace confirming
+  automatic rail consensus and the upstream-selected collective/P2P channel
+  layout.
 
 Additional CUDA Graph, nonblocking, collective, merge-mode, topology, or scale
 matrices are required only when the source change or published claim touches

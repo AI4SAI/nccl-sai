@@ -262,8 +262,7 @@ NCCL_PARAM(GraphRegister, "GRAPH_REGISTER", 1);
 static ncclResult_t getCollNetSupport(struct ncclComm* comm, struct ncclTaskColl* task, int* collNetSupport);
 static ncclResult_t getAlgoInfo(
   struct ncclComm* comm, struct ncclTaskColl* task,
-  int collNetSupport, int nvlsSupport, int numPipeOps, int aggTaskCount,
-  int groupTaskCount, ncclSimInfo_t* simInfo = NULL
+  int collNetSupport, int nvlsSupport, int numPipeOps, ncclSimInfo_t* simInfo = NULL
 );
 static ncclResult_t calcCollChunking(
   struct ncclComm* comm, struct ncclTaskColl* task, int nChannels, size_t nBytes,
@@ -359,7 +358,6 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
   memset(tasksByFnOpTy, 0, sizeof(tasksByFnOpTy));
   int fnOpTyIndices[ncclNumFuncs*ncclNumDevRedOps*ncclNumTypes];
   int fnOpTyCount = 0;
-  int groupTaskCount = planner->nTasksColl;
 
   if (comm->symmetricSupport) {
     NCCLCHECK(ncclMakeSymmetricTaskList(comm, task, &planner->collSymTaskQueue, &task));
@@ -389,24 +387,18 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
     // Crudely estimate number of tasks per channel. This is using the wrong number
     // of channels for NVLS algos, but knowing the algo requires having this value,
     // so either be crude our iterate until fixed point, we chose the former.
-    int taskChannelBase = comm->saiNChannelsBase > 0 ?
-        comm->saiNChannelsBase : comm->nChannels;
-    int nTasksPerChannel = divUp(comm->planner.nTasksColl, taskChannelBase);
+    int nTasksPerChannel = divUp(comm->planner.nTasksColl, comm->nChannels);
     do {
       struct ncclTaskColl* aggEnd = aggBeg->next;
       struct ncclTaskColl agg = *aggBeg;
-      int aggTaskCount = 1;
       // We aggregate operations that are within 4X size of each other.
       while (aggEnd != nullptr && aggEnd->trafficBytes < 4*aggBeg->trafficBytes) {
         agg.count += aggEnd->count;
         agg.trafficBytes += aggEnd->trafficBytes;
-        aggTaskCount++;
         aggEnd = aggEnd->next;
       }
 
-      NCCLCHECK(getAlgoInfo(
-          comm, &agg, collNetSupport, nvlsSupport, nTasksPerChannel,
-          aggTaskCount, groupTaskCount, simInfo));
+      NCCLCHECK(getAlgoInfo(comm, &agg, collNetSupport, nvlsSupport, nTasksPerChannel, simInfo));
       agg.devFuncId = ncclDevFuncId(agg.func, agg.opDev.op, agg.datatype, agg.algorithm, agg.protocol);
 
       int isCollnet=0, isNvls=0;
@@ -534,16 +526,8 @@ static ncclResult_t scheduleCollTasksToPlan(
   int nPlanColls = 0;
   size_t trafficBytes[2*2] = {0, 0, 0, 0}; // [collnet][nvls]
   int nChannels[2*2] = {0, 0, 0, 0}; // [collnet][nvls]
-  int baseChannels = comm->saiNChannelsBase > 0 ?
-      comm->saiNChannelsBase : comm->nChannels;
-  struct ncclTaskColl* firstTask = ncclIntruQueueHead(&planner->collTaskQueue);
-  int standardChannels = firstTask != nullptr && planner->nTasksColl == 1 &&
-      firstTask->isCollnet == 0 && firstTask->isNvls == 0 &&
-      firstTask->nMaxChannels > baseChannels ?
-      comm->nChannels : baseChannels;
-  int const nMaxChannels[2*2] = {
-      standardChannels, comm->nvlsChannels, // [collnet][nvls]
-      baseChannels, std::min(baseChannels, comm->nvlsChannels)};
+  int const nMaxChannels[2*2] = {comm->nChannels, comm->nvlsChannels, // [collnet][nvls]
+                                 comm->nChannels, std::min(comm->nChannels, comm->nvlsChannels)};
   constexpr size_t MinTrafficPerChannel = 16 << 10; // 16K traffic as minimal
   do {
     size_t workBytes = 0;
@@ -1942,7 +1926,6 @@ static void initCollCostTable(float** collCostTable) {
 static ncclResult_t updateCollCostTable(
     struct ncclComm* comm, struct ncclTaskColl* info, size_t nBytes,
     int collNetSupport, int nvlsSupport, int numPipeOps,
-    int baseChannels, bool saiLargeScaleAllReduceTuning,
     float** collCostTable) {
   float (*table)[NCCL_NUM_PROTOCOLS] = (float (*)[NCCL_NUM_PROTOCOLS])collCostTable;
 
@@ -1963,12 +1946,7 @@ static ncclResult_t updateCollCostTable(
     if (a == NCCL_ALGO_PAT && info->func == ncclFuncReduceScatter
         && (info->opDev.op == ncclDevPreMulSum || info->opDev.op == ncclDevSumPostDiv)) continue;
     for (int p=0; p<NCCL_NUM_PROTOCOLS; p++) {
-      int modelChannels = saiLargeScaleAllReduceTuning &&
-          a == NCCL_ALGO_RING && p == NCCL_PROTO_SIMPLE ?
-          comm->nChannels : baseChannels;
-      NCCLCHECK(ncclTopoGetAlgoTime(
-          comm, info->func, a, p, nBytes, numPipeOps, modelChannels,
-          &table[a][p]));
+      NCCLCHECK(ncclTopoGetAlgoTime(comm, info->func, a, p, nBytes, numPipeOps, &table[a][p]));
       // Relegate fp8 reduction trees of sufficient depth that they incur precision loss
       // to be least preferred.
       if (info->datatype == ncclFloat8e4m3 || info->datatype == ncclFloat8e5m2) {
@@ -1984,8 +1962,7 @@ static ncclResult_t updateCollCostTable(
 
 static ncclResult_t topoGetAlgoInfo(
     struct ncclComm* comm, struct ncclTaskColl* info, size_t nBytes,
-    bool saiLargeScaleAllReduceTuning, float** collCostTable,
-    ncclSimInfo_t* simInfo
+    float** collCostTable, ncclSimInfo_t* simInfo
   ) {
   float (*table)[NCCL_NUM_PROTOCOLS] = (float (*)[NCCL_NUM_PROTOCOLS])collCostTable;
 
@@ -2023,20 +2000,10 @@ static ncclResult_t topoGetAlgoInfo(
     WARN("Error : no algorithm/protocol available for function %s with datatype %s.%s%s", ncclFuncToString(info->func), ncclDatatypeToString(info->datatype), ncclAlgoEnvStr, ncclProtoEnvStr);
     return (algoEnv || protoEnv) ? ncclInvalidUsage : ncclInternalError;
   }
-  bool saiLargeScaleAllReduceTuningApplied = false;
-  if (saiLargeScaleAllReduceTuning &&
-      table[NCCL_ALGO_RING][NCCL_PROTO_SIMPLE] >= 0.0) {
-    info->algorithm = NCCL_ALGO_RING;
-    info->protocol = NCCL_PROTO_SIMPLE;
-    time = table[NCCL_ALGO_RING][NCCL_PROTO_SIMPLE];
-    saiLargeScaleAllReduceTuningApplied = true;
-  }
   if (simInfo) simInfo->estimatedTime = time;
   TRACE(NCCL_COLL, "%ld Bytes -> Algo %d proto %d time %f", nBytes, info->algorithm, info->protocol, time);
 
-  int nc = ncclSaiLargeScaleRailOperationChannels(
-      comm->saiNChannelsBase, comm->nChannels,
-      saiLargeScaleAllReduceTuningApplied);
+  int nc = comm->nChannels;
   int nt = comm->maxThreads[info->algorithm][info->protocol];
   int threadThreshold = comm->threadThresholds[info->algorithm][info->protocol];
   if (info->algorithm == NCCL_ALGO_COLLNET_DIRECT) {
@@ -2053,7 +2020,7 @@ static ncclResult_t topoGetAlgoInfo(
   } else if (info->algorithm == NCCL_ALGO_NVLS || info->algorithm == NCCL_ALGO_NVLS_TREE) {
     // NVLS should not need more than 16 channels to get peak BW.
     if (comm->nNodes > 1 && info->algorithm == NCCL_ALGO_NVLS) {
-      nc = std::min(comm->nvlsChannels, nc);
+      nc = std::min(comm->nvlsChannels, comm->nChannels);
     } else {
       nc = comm->nvlsChannels;
     }
@@ -2091,8 +2058,7 @@ static ncclResult_t topoGetAlgoInfo(
 // Finally, nChannels will be overriden by the plugin setting.
 static ncclResult_t getAlgoInfo(
     struct ncclComm* comm, struct ncclTaskColl* info,
-    int collNetSupport, int nvlsSupport, int numPipeOps, int aggTaskCount,
-    int groupTaskCount, ncclSimInfo_t* simInfo/* = NULL*/
+    int collNetSupport, int nvlsSupport, int numPipeOps, ncclSimInfo_t* simInfo/* = NULL*/
   ) {
   size_t elementSize = ncclTypeSize(info->datatype);
   size_t nBytes = elementSize * ncclFuncMaxSendRecvCount(info->func, comm->nRanks, info->count);
@@ -2105,22 +2071,9 @@ static ncclResult_t getAlgoInfo(
   info->algorithm = NCCL_ALGO_UNDEF;
   info->protocol = NCCL_PROTO_UNDEF;
   int nMaxChannels = 0;
-  bool saiLargeScaleAllReduceTuning =
-      comm->saiNChannelsBase > 0 && comm->tuner == NULL &&
-      comm->nChannels >= NCCL_SAI_LARGE_SCALE_RAIL_CHANNELS &&
-      groupTaskCount == 1 &&
-      ncclGetEnv("NCCL_ALGO") == NULL && ncclGetEnv("NCCL_PROTO") == NULL &&
-      ncclSaiLargeScaleAllReduceTuningEligible(
-          ncclTopoSaiRailByChannelEnabled(comm->topo), comm->nRanks,
-          comm->nNodes, info->func == ncclFuncAllReduce, aggTaskCount, nBytes);
-  int baseChannels = comm->saiNChannelsBase > 0 ?
-      comm->saiNChannelsBase : comm->nChannels;
   float collCostTable[NCCL_NUM_ALGORITHMS][NCCL_NUM_PROTOCOLS];
   initCollCostTable((float **)collCostTable);
-  NCCLCHECK(updateCollCostTable(
-      comm, info, nBytes, collNetSupport, nvlsSupport, numPipeOps,
-      baseChannels, saiLargeScaleAllReduceTuning,
-      (float **)collCostTable));
+  NCCLCHECK(updateCollCostTable(comm, info, nBytes, collNetSupport, nvlsSupport, numPipeOps, (float **)collCostTable));
   if (comm->tuner != NULL) {
     NCCLCHECK(ncclRegFind(comm, info->sendbuff, sendbuffSize, &regSendBuf));
     NCCLCHECK(ncclRegFind(comm, info->recvbuff, recvbuffSize, &regRecvBuf));
@@ -2131,13 +2084,9 @@ static ncclResult_t getAlgoInfo(
           comm->tunerContext, info->func, nBytes,
           numPipeOps, (float **)collCostTable, NCCL_NUM_ALGORITHMS, NCCL_NUM_PROTOCOLS,
           regBuff, &nMaxChannels));
-    NCCLCHECK(topoGetAlgoInfo(
-        comm, info, nBytes, saiLargeScaleAllReduceTuning,
-        (float **)collCostTable, simInfo));
+    NCCLCHECK(topoGetAlgoInfo(comm, info, nBytes, (float **)collCostTable, simInfo));
   } else {
-    NCCLCHECK(topoGetAlgoInfo(
-        comm, info, nBytes, saiLargeScaleAllReduceTuning,
-        (float **)collCostTable, simInfo));
+    NCCLCHECK(topoGetAlgoInfo(comm, info, nBytes, (float **)collCostTable, simInfo));
     // NCCL_CTA_POLICY_EFFICIENCY requires user (non-symmetric) buffer registration (currently unsupported with MNNVL)
     if (comm->config.CTAPolicy == NCCL_CTA_POLICY_EFFICIENCY && ncclGetEnv("NCCL_ALGO") == NULL && ncclGetEnv("NCCL_PROTO") == NULL && !comm->MNNVL) {
       // make algorithm selection based on buffer registration
@@ -2162,11 +2111,7 @@ static ncclResult_t getAlgoInfo(
     }
   }
 
-  int operationChannels = ncclSaiLargeScaleRailOperationChannels(
-      comm->saiNChannelsBase, comm->nChannels,
-      saiLargeScaleAllReduceTuning);
-  info->nMaxChannels = nMaxChannels == 0 ? info->nMaxChannels :
-      std::min(nMaxChannels, operationChannels);
+  info->nMaxChannels = nMaxChannels == 0 ? info->nMaxChannels : nMaxChannels;
   return ncclSuccess;
 }
 
