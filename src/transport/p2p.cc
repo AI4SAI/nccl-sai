@@ -127,6 +127,15 @@ ncclResult_t p2pCanConnect(int* ret, struct ncclComm* comm, struct ncclTopoGraph
   // Check topology / p2p level.
   int intermediateRank;
   NCCLCHECK(ncclTopoCheckP2p(comm, comm->topo, info1->rank, info2->rank, ret, NULL, &intermediateRank, NULL));
+  if (*ret != 0 && graph != nullptr) {
+    int saiLocalP2pSys = 0;
+    NCCLCHECK(ncclTopoSaiLocalP2pSysEligible(
+        comm, comm->topo, info1->rank, info2->rank, &saiLocalP2pSys));
+    // ncclTopoCheckP2p() admits the automatic SYS exception before transport
+    // selection. Undo only that strict SAI exception for collective graphs so
+    // the existing early return cannot bypass the faster NET transport.
+    if (saiLocalP2pSys != 0) *ret = 0;
+  }
   if (*ret == 0) return ncclSuccess;
   if (intermediateRank != -1) {
     if (useMemcpy) *ret = 0;
