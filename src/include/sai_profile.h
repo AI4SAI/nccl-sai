@@ -158,9 +158,26 @@ static inline bool ncclSaiLocalP2pAutomaticLevelAllowed(
   return resolvedUserLevel == unsetLevel || resolvedUserLevel == nvlinkLevel;
 }
 
-static inline bool ncclSaiLocalP2pTransportAllowed(
-    bool topologyEligible, bool collectiveGraph) {
-  return topologyEligible && !collectiveGraph;
+static inline int ncclSaiRankPairIndex(int nRanks, int rank1, int rank2) {
+  if (nRanks < 2 || nRanks > 11 || rank1 < 0 || rank1 >= nRanks ||
+      rank2 < 0 || rank2 >= nRanks || rank1 == rank2) return -1;
+  if (rank1 > rank2) {
+    int swap = rank1;
+    rank1 = rank2;
+    rank2 = swap;
+  }
+  int index = 0;
+  for (int first = 0; first < rank1; first++) {
+    index += nRanks - first - 1;
+  }
+  index += rank2 - rank1 - 1;
+  return index < 64 ? index : -1;
+}
+
+static inline bool ncclSaiRankPairSelected(
+    uint64_t rankPairs, int nRanks, int rank1, int rank2) {
+  int index = ncclSaiRankPairIndex(nRanks, rank1, rank2);
+  return index >= 0 && (rankPairs & (UINT64_C(1) << index)) != 0;
 }
 
 static inline bool ncclSaiA2aPlannerCanRun(
@@ -446,6 +463,7 @@ static inline uint64_t ncclSaiLocalP2pPolicySignature() {
 struct ncclSaiLocalP2pInfo {
   uint64_t policySignature;
   uint64_t topologyClass;
+  uint64_t rankPairs;
   int eligible;
 };
 

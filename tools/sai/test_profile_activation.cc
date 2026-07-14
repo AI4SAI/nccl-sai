@@ -165,10 +165,18 @@ int main() {
     fprintf(stderr, "automatic local P2P upstream-level compatibility failed\n");
     return 1;
   }
-  if (!ncclSaiLocalP2pTransportAllowed(true, false) ||
-      ncclSaiLocalP2pTransportAllowed(true, true) ||
-      ncclSaiLocalP2pTransportAllowed(false, false)) {
-    fprintf(stderr, "local P2P transport scope failed\n");
+  uint64_t localP2pRankPairs =
+      (UINT64_C(1) << ncclSaiRankPairIndex(8, 0, 7)) |
+      (UINT64_C(1) << ncclSaiRankPairIndex(8, 3, 7));
+  if (ncclSaiRankPairIndex(8, 0, 1) != 0 ||
+      ncclSaiRankPairIndex(8, 0, 7) != 6 ||
+      ncclSaiRankPairIndex(8, 1, 2) != 7 ||
+      ncclSaiRankPairIndex(8, 3, 7) != 21 ||
+      ncclSaiRankPairIndex(8, 4, 4) != -1 ||
+      !ncclSaiRankPairSelected(localP2pRankPairs, 8, 7, 0) ||
+      !ncclSaiRankPairSelected(localP2pRankPairs, 8, 3, 7) ||
+      ncclSaiRankPairSelected(localP2pRankPairs, 8, 1, 7)) {
+    fprintf(stderr, "local P2P rank-pair mask failed\n");
     return 1;
   }
   if (!ncclSaiA2aPlannerCanRun(true, true, true, false) ||

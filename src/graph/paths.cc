@@ -798,6 +798,7 @@ ncclResult_t ncclTopoSaiGetLocalP2pInfo(
   topologyHash = ncclSaiTopologyHashValue(
       topologyHash, crossIslandRankPairs);
   info->topologyClass = topologyHash;
+  info->rankPairs = crossIslandRankPairs;
   info->eligible = 1;
   return ncclSuccess;
 }
@@ -816,31 +817,12 @@ ncclResult_t ncclTopoSaiLocalP2pSysEligible(struct ncclComm* comm, struct ncclTo
     if (comm->peerInfo[r].hostHash != hostHash || comm->peerInfo[r].shmDev != shmDev) return ncclSuccess;
   }
 
-  int gpuIndex[8];
-  for (int r = 0; r < comm->nRanks; r++) {
-    ncclResult_t ret = ncclTopoRankToIndex(system, r, gpuIndex+r, /*showWarn=*/false);
-    if (ret == ncclInternalError) return ncclSuccess;
-    NCCLCHECK(ret);
-  }
-
-  int parent[NCCL_TOPO_MAX_NODES];
-  int nComps = 0;
-  float islandNvBw = 0;
-  if (!ncclSaiFourGpuIslandPartition(
-      system, parent, &nComps, &islandNvBw, NULL) ||
-      nComps != 2) return ncclSuccess;
-
-  int root1 = ncclSaiFindParent(parent, gpuIndex[rank1]);
-  int root2 = ncclSaiFindParent(parent, gpuIndex[rank2]);
-  if (root1 == root2) return ncclSuccess;
-
-  struct ncclTopoNode* gpu1 = system->nodes[GPU].nodes+gpuIndex[rank1];
-  int crossType = gpu1->paths[GPU][gpuIndex[rank2]].type;
-  if (crossType == PATH_SYS) {
+  if (ncclSaiRankPairSelected(
+      system->saiLocalP2pRankPairs, comm->nRanks, rank1, rank2)) {
     *eligible = 1;
     if (ncclParamSaiLocalP2pSysTrace() && comm->rank == 0) {
-      INFO(NCCL_INIT|NCCL_P2P, "SAI local P2P SYS enabled for single-host two-island communicator: rank %d <-> rank %d path %s",
-           rank1, rank2, topoPathTypeStr[crossType]);
+      INFO(NCCL_INIT|NCCL_P2P, "SAI local P2P SYS enabled for single-host two-island communicator: rank %d <-> rank %d",
+           rank1, rank2);
     }
   }
   return ncclSuccess;
@@ -1118,16 +1100,6 @@ ncclResult_t ncclTopoNeedFlush(struct ncclComm* comm, int64_t netId, int netDev,
 }
 
 NCCL_PARAM(NetDisableIntra, "NET_DISABLE_INTRA", 0);
-
-ncclResult_t ncclTopoSaiCollectiveNetEligible(
-    struct ncclComm* comm, struct ncclTopoSystem* system,
-    int rank1, int rank2, int* eligible) {
-  if (eligible == NULL) return ncclInvalidArgument;
-  *eligible = 0;
-  if (ncclParamNetDisableIntra() == 1) return ncclSuccess;
-  return ncclTopoSaiLocalP2pSysEligible(
-      comm, system, rank1, rank2, eligible);
-}
 
 // Check whether going through the network would be faster than going through P2P/SHM.
 ncclResult_t ncclTopoCheckNet(struct ncclTopoSystem* system, int rank1, int rank2, int* net) {

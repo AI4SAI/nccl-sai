@@ -181,6 +181,7 @@ struct ncclTopoSystem {
   int inter;
   bool saiRailByChannel;
   bool saiLocalP2pSys;
+  uint64_t saiLocalP2pRankPairs;
 };
 
 ncclResult_t ncclTopoGetNode(struct ncclTopoSystem* system, struct ncclTopoNode** node, int type, uint64_t id);

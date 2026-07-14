@@ -1667,8 +1667,11 @@ bool ncclTopoSaiRailByChannelEnabled(struct ncclTopoSystem* system) {
 }
 
 void ncclTopoSaiSetLocalP2pSys(
-    struct ncclTopoSystem* system, bool enabled) {
-  if (system != NULL) system->saiLocalP2pSys = enabled;
+    struct ncclTopoSystem* system, bool enabled, uint64_t rankPairs) {
+  if (system != NULL) {
+    system->saiLocalP2pSys = enabled;
+    system->saiLocalP2pRankPairs = enabled ? rankPairs : 0;
+  }
 }
 
 bool ncclTopoSaiLocalP2pSysEnabled(struct ncclTopoSystem* system) {

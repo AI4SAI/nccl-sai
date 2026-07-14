@@ -1396,11 +1396,14 @@ static ncclResult_t ncclBuildCommTopology(
     struct ncclComm* comm, struct ncclSaiLocalP2pInfo saiLocalP2pInfo[8]) {
   const int rank = comm->rank;
   const int nranks = comm->nRanks;
+  bool localP2pEnabled = false;
+  uint64_t localP2pRankPairs = 0;
 
   NCCLCHECK(ncclTopoGetSystem(comm, &comm->topo));
-  // Compute an upstream-only path baseline first. The local two-island P2P
-  // relaxation is resolved communicator-wide before the post-trim recompute.
-  ncclTopoSaiSetLocalP2pSys(comm->topo, false);
+  // Keep collective graph search on the upstream NET baseline. The agreed
+  // local P2P rank-pair mask is applied only after topology trimming and is
+  // consumed by graph-less P2P transport selection.
+  ncclTopoSaiSetLocalP2pSys(comm->topo, false, 0);
   NCCLCHECK(ncclTopoComputePaths(comm->topo, comm));
   if (nranks == 8) {
     memset(saiLocalP2pInfo, 0, sizeof(*saiLocalP2pInfo) * 8);
@@ -1418,7 +1421,9 @@ static ncclResult_t ncclBuildCommTopology(
       if (saiLocalP2pInfo[r].policySignature !=
           saiLocalP2pInfo[0].policySignature) policyConsistent = false;
       if (saiLocalP2pInfo[r].topologyClass !=
-          saiLocalP2pInfo[0].topologyClass) topologyConsistent = false;
+          saiLocalP2pInfo[0].topologyClass ||
+          saiLocalP2pInfo[r].rankPairs !=
+          saiLocalP2pInfo[0].rankPairs) topologyConsistent = false;
     }
     int consensus = ncclSaiResolveLocalP2pConsensus(
         policyConsistent, allEligible, topologyConsistent);
@@ -1426,19 +1431,17 @@ static ncclResult_t ncclBuildCommTopology(
       if (rank == 0) WARN("NCCL-SAI local P2P policy differs across ranks");
       return ncclInvalidUsage;
     }
-    bool enabled = consensus == ncclSaiLocalP2pConsensusEnabled;
-    ncclTopoSaiSetLocalP2pSys(comm->topo, enabled);
+    localP2pEnabled = consensus == ncclSaiLocalP2pConsensusEnabled;
+    if (localP2pEnabled) localP2pRankPairs = saiLocalP2pInfo[0].rankPairs;
     if (rank == 0) {
       INFO(NCCL_INIT|NCCL_P2P,
         "NCCL-SAI automatic local P2P policy: enabled %d eligibleRanks %d/%d",
-        enabled ? 1 : 0, eligibleRanks, nranks);
+        localP2pEnabled ? 1 : 0, eligibleRanks, nranks);
     }
-    // The upstream baseline may have marked cross-island GPU paths as NET
-    // when both P2P and SHM were unavailable. Recompute with the agreed policy
-    // before trimming so an eligible second island is not discarded.
-    NCCLCHECK(ncclTopoComputePaths(comm->topo, comm));
   }
   NCCLCHECK(ncclTopoTrimSystem(comm->topo, comm));
+  ncclTopoSaiSetLocalP2pSys(
+      comm->topo, localP2pEnabled, localP2pRankPairs);
   NCCLCHECK(ncclTopoComputePaths(comm->topo, comm));
   return ncclSuccess;
 }

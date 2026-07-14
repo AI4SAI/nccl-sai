@@ -124,34 +124,31 @@ extern int64_t ncclParamMNNVLEnable();
 ncclResult_t p2pCanConnect(int* ret, struct ncclComm* comm, struct ncclTopoGraph* graph, struct ncclPeerInfo* info1, struct ncclPeerInfo* info2) {
   initCeOperation();
 
-  // Check topology / p2p level.
-  int intermediateRank;
-  NCCLCHECK(ncclTopoCheckP2p(comm, comm->topo, info1->rank, info2->rank, ret, NULL, &intermediateRank, NULL));
-  if (*ret != 0 && graph != nullptr) {
-    int saiLocalP2pSys = 0;
-    NCCLCHECK(ncclTopoSaiLocalP2pSysEligible(
-        comm, comm->topo, info1->rank, info2->rank, &saiLocalP2pSys));
-    // ncclTopoCheckP2p() admits the automatic SYS exception before transport
-    // selection. Undo only that strict SAI exception for collective graphs so
-    // the existing early return cannot bypass the faster NET transport.
-    if (saiLocalP2pSys != 0) *ret = 0;
-  }
-  if (*ret == 0) return ncclSuccess;
-  if (intermediateRank != -1) {
-    if (useMemcpy) *ret = 0;
-    return ncclSuccess;
-  }
+  int saiLocalP2pSys = 0;
+  NCCLCHECK(ncclTopoSaiLocalP2pSysEligible(
+      comm, comm->topo, info1->rank, info2->rank, &saiLocalP2pSys));
+  if (graph == nullptr && saiLocalP2pSys != 0) {
+    // The strict pair mask was agreed before topology trimming. It keeps the
+    // graph-less grouped Send/Recv fast path without changing collective graph
+    // search or requiring the peer island to remain in the trimmed topology.
+    *ret = 1;
+  } else {
+    // Check topology / p2p level.
+    int intermediateRank;
+    NCCLCHECK(ncclTopoCheckP2p(
+        comm, comm->topo, info1->rank, info2->rank, ret, NULL,
+        &intermediateRank, NULL));
+    if (*ret == 0) return ncclSuccess;
+    if (intermediateRank != -1) {
+      if (useMemcpy) *ret = 0;
+      return ncclSuccess;
+    }
 
-  // Check if NET would work better
-  int useNet = 0;
-  NCCLCHECK(ncclTopoCheckNet(comm->topo, info1->rank, info2->rank, &useNet));
-  if (useNet) {
-    int saiLocalP2pSys = 0;
-    NCCLCHECK(ncclTopoSaiLocalP2pSysEligible(comm, comm->topo, info1->rank, info2->rank, &saiLocalP2pSys));
-    // Keep the local SYS-P2P exception for graph-less P2P operations such as
-    // grouped Send/Recv, but let collective graphs use the faster NET path.
-    if (!ncclSaiLocalP2pTransportAllowed(
-        saiLocalP2pSys != 0, graph != nullptr)) {
+    // Check if NET would work better.
+    int useNet = 0;
+    NCCLCHECK(ncclTopoCheckNet(
+        comm->topo, info1->rank, info2->rank, &useNet));
+    if (useNet) {
       *ret = 0;
       return ncclSuccess;
     }
