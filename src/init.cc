@@ -1535,6 +1535,7 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   __atomic_store_n(&comm->peerInfoValid, true, __ATOMIC_RELEASE);
 
   comm->cuMemSupport = 1;
+  comm->saiA2a.spansMultiplePhysicalHosts = false;
   for (int i = 0; i < nranks; i++) {
     if (comm->peerInfo[i].version != comm->peerInfo[rank].version) {
       WARN("Mismatched NCCL version detected : rank %d version %d rank %d version %d",
@@ -1542,7 +1543,10 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
       ret = ncclInvalidUsage;
       goto fail;
     }
-    if (comm->peerInfo[i].hostHash != comm->peerInfo[rank].hostHash) nNodes++;
+    if (comm->peerInfo[i].hostHash != comm->peerInfo[rank].hostHash) {
+      nNodes++;
+      comm->saiA2a.spansMultiplePhysicalHosts = true;
+    }
     if (!comm->peerInfo[i].cuMemSupport) comm->cuMemSupport = 0;
     if ((i != rank) && (comm->peerInfo[i].hostHash == comm->peerInfo[rank].hostHash) && (comm->peerInfo[i].busId == comm->peerInfo[rank].busId)) {
       WARN("Duplicate GPU detected : rank %d and rank %d both on CUDA device %lx", rank, i, comm->peerInfo[rank].busId);
@@ -1862,6 +1866,10 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     ret = ncclInvalidUsage;
     goto fail;
   }
+  // NCCL_SAI_DISABLE participates in the explicit-control signature above, so
+  // this rank-local read is communicator-consistent and remains frozen after
+  // initialization even if the process environment changes later.
+  comm->saiA2a.globallyDisabled = ncclSaiGloballyDisabled();
 
   comm->saiA2a.configConsistent = true;
   for (int r = 1; r < nranks; r++) {

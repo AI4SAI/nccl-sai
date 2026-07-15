@@ -466,6 +466,8 @@ struct ncclCommSymTeams;
 struct ncclSaiA2aState {
   struct ncclSaiA2aConfig config;
   bool configConsistent;
+  bool globallyDisabled;
+  bool spansMultiplePhysicalHosts;
   bool islandScratchReady;
   void* islandScratch;
   size_t islandScratchBytes;

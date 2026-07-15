@@ -188,9 +188,10 @@ void ncclSaiA2aGetConfig(struct ncclComm* comm, struct ncclSaiA2aConfig* config)
       ncclSaiFullMeshProfileEnabled() && topologyEligible;
   // NCCL 2.28 has no stable cross-node hardware identity for the physical
   // fabric group. Do not infer it from scheduler metadata, rank order, host
-  // names, or HCA strings. Grouped AlltoAll remains an explicit expert path
-  // until a hardware-backed provider exists; transparent runtime behavior
-  // stays upstream and allocates no SAI scratch.
+  // names, or HCA strings. Topology-aware AlltoAll planners remain explicit
+  // expert paths until a hardware-backed provider exists. The independent
+  // dense-exchange batching rule is applied later to already formed P2P tasks
+  // and allocates no SAI scratch.
   bool automaticFullMeshProfile = false;
   bool fullMeshProfile = explicitFullMeshProfile || automaticFullMeshProfile;
   int64_t a2aEnable = ncclParamSaiA2aEnable();

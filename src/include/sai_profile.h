@@ -187,10 +187,10 @@ static inline bool ncclSaiA2aPlannerCanRun(
 }
 
 static inline bool ncclSaiDenseP2pCrossEpochAllowed(
-    int nRanks, int maxLocalRanks) {
+    bool spansMultiplePhysicalHosts, bool globallyDisabled) {
   // Cross-epoch compaction targets multi-host connection and proxy pressure.
-  // Single-host exchanges retain upstream epoch partitioning.
-  return nRanks > 0 && maxLocalRanks > 0 && nRanks > maxLocalRanks;
+  // The global SAI rollback and single-host exchanges retain upstream epochs.
+  return spansMultiplePhysicalHosts && !globallyDisabled;
 }
 
 // Profiles are expert-only labels for grouped AlltoAll/P2P experiments. They
