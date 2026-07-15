@@ -5,23 +5,29 @@ Optimized primitives for inter-GPU communication.
 ## NCCL-SAI Branch
 
 This branch carries AI4SAI changes for SAI UltraPOD and SlimPOD GPU fabrics.
-Its automatic behaviors are narrowly guarded local P2P and dual-rail transport
-selection. Normal application use requires no `NCCL_SAI_*` environment
-variables. The runtime combines strict GPU/NIC topology checks, physical
-ASIC/port relationships, and communicator-wide agreement. Missing, ambiguous,
-merged, plugin-backed, or rank-inconsistent layouts retain the corresponding
-upstream path.
+Its automatic behaviors are narrowly guarded local P2P, dual-rail transport
+selection, and multi-host dense-exchange work-batch compaction. Normal
+application use requires no `NCCL_SAI_*` environment variables. The runtime
+combines strict GPU/NIC topology checks, physical ASIC/port relationships,
+operation-shape checks, and communicator-wide agreement. Missing, ambiguous,
+merged, plugin-backed, rank-inconsistent, or nonmatching layouts retain the
+corresponding upstream path.
 
 The source also contains experimental `ncclAlltoAll()` implementations: in
 controlled expert validation, eligible small messages use a two-stage
 GPU-island path and eligible large messages use a phased P2P planner. NCCL 2.28
 does not expose a stable cross-node hardware fabric-group identity, so these
-grouped AlltoAll/P2P schedules are not automatic behaviors and
-normal zero-variable runs leave them on the upstream path. They remain
-available only for explicit expert experiments with rank-consistent group
-metadata.
-Normal upstream NCCL 2.28 grouped `ncclSend`/`ncclRecv` scheduling is not
-claimed to match NCCL 2.18.x small-message latency.
+topology-aware planners remain available only for explicit expert experiments
+with rank-consistent group metadata.
+
+Separately, an exact dense full exchange with one nonzero, equal-size send and
+receive task per peer may compact P2P work batches across upstream schedule
+epochs when the communicator spans multiple physical hosts. This applies after
+the normal task expansion of either `ncclAlltoAll()` or equivalent grouped
+`ncclSend`/`ncclRecv` calls. It does not change peer order, channel selection,
+or protocol. Single-host and nonmatching exchanges retain upstream epoch
+partitioning. NCCL 2.28 small-message latency is not claimed to match NCCL
+2.18.x.
 
 The current automatic class is intentionally exact: SM70 GPUs form complete,
 equal-bandwidth four-GPU NVLink cliques, and each clique belongs to a distinct

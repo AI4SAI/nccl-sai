@@ -6,19 +6,24 @@ NCCL API without source changes. This loading and API compatibility is not a
 cross-version performance guarantee or a site-wide default-promotion claim.
 
 The automatic behaviors are a narrowly guarded local P2P transport-selection
-path for one eligible single-host layout and a strict dual-rail-by-channel path.
-These transport choices do not change collective channel, algorithm, or
-protocol selection.
+path for one eligible single-host layout, a strict dual-rail-by-channel path,
+and multi-host work-batch compaction for exact dense full exchanges. These
+rules do not change collective algorithm or protocol selection.
 
 The source also contains expert-only `ncclAlltoAll()` implementations.
 Eligible small-message calls can use a two-stage island planner that aggregates
 network traffic across regular GPU islands before a local redistribution.
 Eligible large out-of-place calls can use a phased P2P planner that limits the
-peer rounds admitted to each kernel plan. They are not transparent release
-capabilities because NCCL 2.28 cannot derive stable cross-node fabric groups
-from hardware. Normal runs keep upstream AlltoAll scheduling.
-Normal upstream NCCL 2.28 grouped `ncclSend`/`ncclRecv` scheduling is not
-claimed to match NCCL 2.18.x small-message latency.
+peer rounds admitted to each kernel plan. These topology-aware planners are not
+transparent release capabilities because NCCL 2.28 cannot derive stable
+cross-node fabric groups from hardware.
+
+The independent dense-exchange rule acts only after normal P2P tasks exist. A
+multi-host operation with exactly one nonzero, equal-size send and receive per
+peer may compact work batches across upstream schedule epochs. Single-host,
+sparse, asymmetric, mixed-size, or otherwise nonmatching operations retain
+upstream epoch partitioning. NCCL 2.28 small-message latency is not claimed to
+match NCCL 2.18.x.
 
 ## Activation Model
 
@@ -57,8 +62,10 @@ probe. The preflight is an exposure mechanism, not an activation identity.
 
 Scheduler metadata is not used for site identity or automatic fabric-group
 classification. NCCL 2.28 does not expose enough cross-node switch identity to
-prove the physical group from hardware, so normal zero-variable runs keep
-grouped AlltoAll/P2P schedules on the upstream path.
+prove the physical group from hardware, so normal zero-variable runs keep the
+expert island, phased, and fabric-group peer-order planners off. The automatic
+dense-exchange rule does not infer fabric groups or reorder peers; it only
+compacts an already formed exact full exchange on a multi-host communicator.
 
 The single-host eight-rank, two-island P2P relaxation is selected from exactly
 two SM70 four-GPU NVLink cliques with equal link bandwidth and distinct CPU
@@ -211,12 +218,14 @@ identify rails or subnets; LIDs are assigned by the subnet manager. None alone
 proves membership in the validated physical group. Slurm topology strings,
 hostnames, rank order, and device names are also not hardware evidence.
 
-Therefore normal zero-variable grouped AlltoAll/P2P remains upstream. An
-explicit numeric `NCCL_SAI_FABRIC_GROUP_ID` is retained only for controlled
-expert tests. Values are accepted as metadata only when every rank provides a
-valid ID and all ranks in one topology node agree. The layout is marked complete
-only when every group has the configured number of topology nodes. An invalid
-explicit ID is never replaced by another source.
+Therefore normal zero-variable operation does not enable the expert
+fabric-group AlltoAll/P2P planners. The separate dense-exchange compaction rule
+does not consume group IDs and preserves the upstream peer order. An explicit
+numeric `NCCL_SAI_FABRIC_GROUP_ID` is retained only for controlled expert tests.
+Values are accepted as metadata only when every rank provides a valid ID and
+all ranks in one topology node agree. The layout is marked complete only when
+every group has the configured number of topology nodes. An invalid explicit ID
+is never replaced by another source.
 
 The total topology-node count is not evidence that an allocation contains one
 complete group: the same count can be assembled from several fragmented groups.
@@ -291,10 +300,10 @@ minimum release gate for the automatic capabilities in this branch is:
 - one adjacent stable/candidate comparison on a supported single-host GPU
   topology, reporting small-message latency and large-message bandwidth;
 - one two-host dual-rail initialization and data-path regression; and
-- one adjacent stable/candidate multi-host comparison beyond the historical
-  scale-failure boundary, plus a short initialization trace confirming
-  automatic rail consensus and the upstream-selected collective/P2P channel
-  layout.
+- one adjacent stable/candidate multi-host comparison beyond the affected scale
+  boundary, plus a short trace confirming automatic rail consensus and, for an
+  exact dense exchange, cross-epoch compaction without peer-order or channel
+  overrides.
 
 Additional CUDA Graph, nonblocking, collective, merge-mode, topology, or scale
 matrices are required only when the source change or published claim touches

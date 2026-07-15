@@ -14,6 +14,9 @@ are retained in `LICENSE.txt`; see `docs/sai/NOTICE.md`.
   four-GPU-NVLink-clique and dual-port physical topology.
 - Local P2P transport selection on the exact single-host eight-rank, two-clique
   SM70 topology with distinct CPU locality domains.
+- Cross-epoch work-batch compaction for exact dense full exchanges on
+  communicators spanning multiple physical hosts. Single-host and nonmatching
+  P2P operations retain upstream epoch partitioning.
 
 These capabilities require their complete runtime topology, capability, and
 operation predicates, plus communicator-wide agreement where applicable. None
@@ -29,15 +32,21 @@ a hardware-validated topology with rank-consistent fabric-group metadata.
 
 Eligible small-message calls use a two-stage GPU-island aggregation path.
 Eligible large out-of-place calls use the phased planner. Unsupported layouts
-and sizes use upstream scheduling. The island path supports distinct and
-exactly aliased buffers; partially overlapping buffers are not claimed.
-Normal zero-variable runs keep grouped AlltoAll on the upstream path because
-NCCL 2.28 does not expose a stable cross-node hardware fabric-group identity.
-Expert use requires complete rank-consistent fabric metadata. An equal total
-topology-node count alone does not prove that one group is complete.
-Normal zero-variable AlltoAll therefore inherits upstream NCCL 2.28 grouped
-`ncclSend`/`ncclRecv` scheduling. This release does not claim small-message
-latency non-regression against NCCL 2.18.x.
+and sizes use the ordinary P2P schedule. The island path supports distinct and
+exactly aliased buffers; partially overlapping buffers are not claimed. Normal
+zero-variable runs keep these topology-aware planners off because NCCL 2.28
+does not expose a stable cross-node hardware fabric-group identity. Expert use
+requires complete rank-consistent fabric metadata. An equal total topology-node
+count alone does not prove that one group is complete.
+
+Ordinary `ncclAlltoAll()` and equivalent grouped `ncclSend`/`ncclRecv` calls
+still use the upstream peer order and task expansion. When that expansion is an
+exact dense full exchange and the communicator spans multiple physical hosts,
+NCCL-SAI permits work batches to cross upstream schedule-epoch boundaries.
+This rule needs no fabric-group metadata and changes neither peer order nor
+channel selection. Single-host and nonmatching operations retain upstream epoch
+partitioning. This release does not claim small-message latency non-regression
+against NCCL 2.18.x.
 
 NCCL-SAI also includes a narrowly guarded local P2P transport-selection path
 for an eligible single-host 8-rank, two-island communicator. That path can
@@ -87,8 +96,10 @@ variables. NCCL-SAI does not identify a site from Slurm, hostnames, partitions,
 device-name strings, or configuration paths. Rail and local-P2P activation use
 strict runtime topology plus capability and safety checks, followed by
 communicator-wide agreement where applicable.
-Grouped AlltoAll/P2P schedules are not enabled automatically: scheduler
-metadata is neither hardware truth nor a site identity. Upstream controls such as
+The expert island, phased, and fabric-group peer-order planners are not enabled
+automatically: scheduler metadata is neither hardware truth nor a site
+identity. The independent dense-exchange compaction rule uses only the
+communicator span and exact operation shape. Upstream controls such as
 `NCCL_IB_HCA`, `NCCL_IB_MERGE_NICS`, and `NCCL_CROSS_NIC` retain their upstream
 meaning and may be supplied by normal site policy; NCCL-SAI evaluates the
 topology they actually produce rather than matching their text values.
@@ -152,9 +163,10 @@ count. Standard upstream channel controls remain explicit user policy.
 The release deliberately does not derive fabric groups from Slurm variables,
 rank order, hostnames, HCA names, LIDs, or guessed GUID ranges. None of those is
 a stable cross-node hardware grouping proof. Until a hardware-backed provider
-exists, normal zero-SAI-variable grouped paths remain upstream. Explicit
-numeric group IDs are retained only for controlled expert validation and never
-determine rail or local-P2P eligibility.
+exists, normal zero-SAI-variable runs keep fabric-group planners off. The exact
+dense-exchange compaction rule neither requires nor produces group identity.
+Explicit numeric group IDs are retained only for controlled expert validation
+and never determine rail, local-P2P, or dense-exchange eligibility.
 
 ## Release Qualification
 

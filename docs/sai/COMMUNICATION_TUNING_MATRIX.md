@@ -42,7 +42,7 @@ occupancy-aware schedule and must not be inferred from group-ID discovery alone.
 
 | Collective/API | Why It Matters | Required Public Gate |
 | --- | --- | --- |
-| `ncclAlltoAll()` | Expert-only implementation in this release; important for exchange-heavy research but not an automatic runtime capability. | When an AlltoAll claim is made, test small and large messages across local, same-domain, cross-domain, and multi-domain classes. |
+| `ncclAlltoAll()` | The topology-aware island and phased planners are expert-only. Exact dense full exchanges on multi-host communicators may automatically compact work batches across upstream epochs. | Test small and large messages on one host and at a representative multi-host scale; verify native API and equivalent grouped send/recv correctness and fallback. |
 | `ncclAllReduce()` | Dominant data-parallel and solver collective; ring order can expose the slowest fabric segment. | Latency and bandwidth samples across same-domain and multi-domain classes, plus fragmented or concurrent-layout stress when available. |
 | `ncclReduceScatter()` / `ncclAllGather()` | Common in modern distributed training and optimizer pipelines. | Correctness and bandwidth non-regression against upstream behavior. |
 | `ncclBroadcast()` / `ncclReduce()` | Common control and solver phases. | Correctness and latency non-regression. |
@@ -57,8 +57,9 @@ Qualification of the default runtime must additionally prove:
 - a supported physical topology activates rail and local-P2P capability without
   Slurm identity, partition, hostname, or HCA-string matching;
 - the runtime implementation does not read `SLURM_*` variables for SAI policy;
-- normal zero-variable grouped AlltoAll/P2P remains upstream until a stable
-  hardware-backed fabric-group provider exists;
+- normal zero-variable runs keep expert fabric-group planners off, while exact
+  multi-host dense exchanges may compact work batches without changing peer
+  order or channels;
 - fabricated scheduler metadata cannot activate any SAI path;
 - with fusion controls unset, the internal IB plugin preserves physical
   endpoints only as a temporary communicator-wide probe after the exact
@@ -113,11 +114,12 @@ Public reports should not include:
 
 ## Release Decision
 
-AlltoAll optimization is not a default-release gate while stable hardware
-fabric-group identity is unavailable. A publishable runtime must prove the
-automatic rail and local-P2P paths, upstream fallback, and correctness of common
-collectives. Any expert AlltoAll performance claim is a separate qualification
-and must not be presented as transparent default behavior.
+Expert fabric-group AlltoAll planners are not a default-release gate while
+stable hardware group identity is unavailable. The automatic dense-exchange
+compaction rule is a release gate because it changes ordinary multi-host
+AlltoAll/P2P work batching. A publishable runtime must prove its strict shape
+guard, single-host fallback, multi-host correctness, and scope-matched
+performance. Expert planner claims remain a separate qualification.
 
 Unset, explicit `NCCL_IB_MERGE_NICS=0`, and explicit
 `NCCL_IB_MERGE_NICS=1` performance ordering may be reported only from a
