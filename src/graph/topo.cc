@@ -698,6 +698,8 @@ ncclResult_t ncclTopoGetLocal(struct ncclTopoSystem* system, int type, int index
   return ncclSuccess;
 }
 
+NCCL_PARAM(SaiRailByChannel, "SAI_RAIL_BY_CHANNEL", 0);
+
 ncclResult_t ncclTopoGetLocalNet(struct ncclTopoSystem* system, int rank, int channelId, int* id) {
   int gpu;
   NCCLCHECK(ncclTopoRankToIndex(system, rank, &gpu));
@@ -707,9 +709,14 @@ ncclResult_t ncclTopoGetLocalNet(struct ncclTopoSystem* system, int rank, int ch
   int* localGpus;
   int localGpuCount;
   NCCLCHECK(ncclTopoGetLocal(system, NET, localNets[0], GPU, &localGpus, &localGpuCount, NULL));
-  int net = system->nodes[GPU].nodes[gpu].gpu.dev;
-  if (isPow2(localNetCount)) net = mirrorBits(net, localNetCount);
-  net += channelId%(DIVUP(localNetCount,localGpuCount));
+  int net;
+  if (ncclParamSaiRailByChannel() && localNetCount == 2) {
+    net = channelId;
+  } else {
+    net = system->nodes[GPU].nodes[gpu].gpu.dev;
+    if (isPow2(localNetCount)) net = mirrorBits(net, localNetCount);
+    net += channelId%(DIVUP(localNetCount,localGpuCount));
+  }
   *id = system->nodes[NET].nodes[localNets[net%localNetCount]].id;
   free(localNets);
   free(localGpus);

@@ -58,6 +58,7 @@ ncclResult_t ncclTopoGetNvsCount(struct ncclTopoSystem* system, int* count);
 ncclResult_t ncclTopoGetNvsCount(struct ncclTopoSystem* system, int* count);
 ncclResult_t ncclTopoGetLocalNet(struct ncclTopoSystem* system, int rank, int channelId, int* id);
 ncclResult_t ncclTopoGetLocalGpu(struct ncclTopoSystem* system, int net, int* gpuIndex);
+int64_t ncclParamSaiRailByChannel();
 
 #define NCCL_TOPO_MAX_NODES 256
 
