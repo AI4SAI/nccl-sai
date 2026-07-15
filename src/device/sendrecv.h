@@ -62,37 +62,6 @@ struct RunWorkBatch<ncclFuncSendRecv, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_SIMPL
     struct ncclDevWorkP2p* works = (ncclDevWorkP2p*)ncclShmem.workStorage;
     int nWorks = ncclShmem.nWorks;
 
-    if (nWorks == NCCL_MAX_DEV_WORK_P2P_PER_BATCH && works[0].saiDenseTiny) {
-      int workIx = wid/2;
-      if (nWorks <= workIx) return;
-
-      struct ncclDevWorkP2p* work = &works[workIx];
-      int subtid = tid - workIx*2*WARP_SIZE;
-      if (work->sendRank == ncclShmem.comm.rank) {
-        reduceCopy<COLL_UNROLL, RedOp, T, 0,1,1, 0,1,1, /*PreOpSrcs=*/0>
-          (subtid, 2*WARP_SIZE, 0, nullptr, false, 1, &work->sendAddr, 1,
-           &work->recvAddr, (ssize_t)work->sendBytes);
-        return;
-      }
-
-      bool isSend = (wid & 1) == 0;
-      int group = 2*workIx + (isSend ? 0 : 1);
-      if (isSend) {
-        if (work->sendProtoLL) {
-          runSend<ProtoLL>(lane, WARP_SIZE, group, work);
-        } else {
-          runSend<ProtoSimple<1,1>>(lane, WARP_SIZE, group, work);
-        }
-      } else {
-        if (work->recvProtoLL) {
-          runRecv<ProtoLL>(lane, WARP_SIZE, group, work);
-        } else {
-          runRecv<ProtoSimple<1,1>>(lane, WARP_SIZE, group, work);
-        }
-      }
-      return;
-    }
-
     if (wid == 0) {
       // Modify the memory range of each work[] to reflect this channel's
       // partition of the work. Since integer divides are very heavy it's

@@ -135,28 +135,24 @@ __device__ __forceinline__ void loadWorkBatchToShmem(
   while (true) {
     struct ncclDevWorkBatch batch = ((struct ncclDevWorkBatch*)(args+1))[batchIx];
 
-    int nWorksLow32 = __popc(uint32_t(batch.offsetBitset)); // just of low 32 bits
-    int nWorks = nWorksLow32 + __popc(uint32_t(batch.offsetBitset>>32)); // add high 32 bits
-    uint64_t contiguousMask = nWorks == 64 ? ~0ull : (1ull<<nWorks)-1;
-    bool contiguousP2p = batch.workType == (int)ncclDevWorkTypeP2p &&
-        batch.offsetBitset == contiguousMask;
-
     // fnsOfBitset[n] = index of n'th set bit in batch.offsetBitset.
-    // Contiguous P2P batches can use the destination index directly.
+    // PTX has instruction "fns" (find n-th set) but it expands to a lot of SASS,
+    // since we know all lanes will be querying the same bitmask we can compute
+    // much faster using shared memory.
     uint8_t* fnsOfBitset = (uint8_t*)ncclScratchForWarp(threadIdx.x/WARP_SIZE);
-    if (!contiguousP2p) {
-      __syncwarp();
-      if (uint32_t(batch.offsetBitset) & (1u<<lane)) {
-        int nWorksBelow = __popc(uint32_t(batch.offsetBitset) & ((1u<<lane)-1));
-        fnsOfBitset[nWorksBelow] = lane;
-      }
-      if (uint32_t(batch.offsetBitset>>32) & (1u<<lane)) {
-        int nWorksBelow = nWorksLow32;
-        nWorksBelow += __popc(uint32_t(batch.offsetBitset>>32) & ((1u<<lane)-1));
-        fnsOfBitset[nWorksBelow] = 32 + lane;
-      }
-      __syncwarp();
+    __syncwarp();
+    if (uint32_t(batch.offsetBitset) & (1u<<lane)) {
+      int nWorksBelow = __popc(uint32_t(batch.offsetBitset) & ((1u<<lane)-1));
+      fnsOfBitset[nWorksBelow] = lane;
     }
+    int nWorksLow32 = __popc(uint32_t(batch.offsetBitset)); // just of low 32 bits
+    if (uint32_t(batch.offsetBitset>>32) & (1u<<lane)) {
+      int nWorksBelow = nWorksLow32;
+      nWorksBelow += __popc(uint32_t(batch.offsetBitset>>32) & ((1u<<lane)-1));
+      fnsOfBitset[nWorksBelow] = 32 + lane;
+    }
+    int nWorks = nWorksLow32 + __popc(uint32_t(batch.offsetBitset>>32)); // add high 32 bits
+    __syncwarp();
 
     int workSize;
     int nPacks; // total number of packs loaded, each pack is 16 bytes
@@ -194,7 +190,7 @@ __device__ __forceinline__ void loadWorkBatchToShmem(
     // We can only assume we have 64 threads, which means we can read at most 1024 bytes
     // here which is the per batch maximum.
     if (tid < nPacks) {
-      int srcWork = contiguousP2p ? dstWork : fnsOfBitset[dstWork];
+      int srcWork = fnsOfBitset[dstWork]; // find n'th set bit in batch.offsetBitset
       ulong2 tmp;
       // The loads done in these two cases must be kept separate since we are
       // relying on the compiler to use "ld.param" in the first one. The parameter
