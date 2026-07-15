@@ -112,8 +112,7 @@ static ncclResult_t addProxyOpIfNeeded(struct ncclComm* comm, struct ncclKernelP
 static void addWorkBatchToPlan(
     struct ncclComm* comm, struct ncclKernelPlan* plan, int channelId,
     enum ncclDevWorkType workType, int devFuncId, uint32_t workOffset,
-    int p2pRound = -1, bool p2pAllowCrossEpoch = false,
-    int p2pBatchLimit = NCCL_MAX_DEV_WORK_P2P_PER_BATCH
+    int p2pRound = -1, bool p2pAllowCrossEpoch = false
   ) {
   ncclKernelPlanner::WipPlan::Channel* chan = &comm->planner.wipPlan.channels[channelId];
   size_t workSize = ncclDevWorkSize(workType);
@@ -131,8 +130,8 @@ static void addWorkBatchToPlan(
     // batch further down.
     newBatch |= NCCL_MAX_DEV_WORK_BATCH_BYTES < chan->wipBatch.workBytes + workSize;
     if (workType == ncclDevWorkTypeP2p) {
-      // Tiny dense exchanges use the legacy-equivalent four send/recv pairs per CTA.
-      newBatch |= chan->wipBatch.nP2ps >= p2pBatchLimit;
+      // We only allow NCCL_MAX_DEV_WORK_P2P_PER_BATCH ops per batch.
+      newBatch |= chan->wipBatch.nP2ps == NCCL_MAX_DEV_WORK_P2P_PER_BATCH;
       for (int i = 0; i < chan->wipBatch.nP2ps; i++) {
         // Do not allow the same round twice in the same batch.
         newBatch |= p2pRound == chan->wipBatch.p2pRounds[i];
@@ -815,7 +814,6 @@ static ncclResult_t addP2pToPlan(
   struct ncclProxyOp proxyOps[2] = {};
   int nProxyOps = selfSend ? 0 : 2;
   bool allowCrossEpochBatch = false;
-  int p2pBatchLimit = NCCL_MAX_DEV_WORK_P2P_PER_BATCH;
   if (!selfSend) {
     for (int part=0; part < nChannelsMax; part++) {
       int channelId = ncclP2pChannelForPart(comm->p2pnChannels, base, part);
@@ -975,13 +973,9 @@ static ncclResult_t addP2pToPlan(
   // Each channel runs up to NCCL_MAX_DEV_WORK_P2P_PER_BATCH tasks concurrently.
   int maxConcurrent;
   int concurrentTasks[2];
-  if (p2pTasks[0] != nullptr && p2pTasks[1] != nullptr &&
-      p2pTasks[0]->saiP2pBatchLimit != 0 &&
-      p2pTasks[0]->saiP2pBatchLimit == p2pTasks[1]->saiP2pBatchLimit) {
-    allowCrossEpochBatch = true;
-    p2pBatchLimit = p2pTasks[0]->saiP2pBatchLimit;
-  }
-  maxConcurrent = comm->p2pnChannels / nChannelsMax * p2pBatchLimit;
+  allowCrossEpochBatch = p2pTasks[0] != nullptr && p2pTasks[1] != nullptr &&
+      p2pTasks[0]->saiAllowCrossEpochBatch && p2pTasks[1]->saiAllowCrossEpochBatch;
+  maxConcurrent = comm->p2pnChannels / nChannelsMax * NCCL_MAX_DEV_WORK_P2P_PER_BATCH;
   concurrentTasks[0] = std::min(planTotalTasks[0], maxConcurrent);
   concurrentTasks[1] = std::min(planTotalTasks[1], maxConcurrent);
   for (int part=0; part < nChannelsMax; part++) {
@@ -990,7 +984,7 @@ static ncclResult_t addP2pToPlan(
     plan->channelMask |= uint64_t(1)<<channelId;
     // Add batch first.
     addWorkBatchToPlan(comm, plan, channelId, ncclDevWorkTypeP2p,
-        ncclDevFuncId_P2p(), workOffset, p2pRound, allowCrossEpochBatch, p2pBatchLimit);
+        ncclDevFuncId_P2p(), workOffset, p2pRound, allowCrossEpochBatch);
     for (int dir=0; dir < nProxyOps; dir++) {
       // Partition steps across channels.
       int nParts = dir ? work->nSendChannels : work->nRecvChannels;
@@ -1063,7 +1057,6 @@ static bool ncclSaiA2aOrdinaryTaskAllowed(
 }
 
 static bool ncclSaiMarkDenseP2pExchange(struct ncclComm* comm) {
-  constexpr size_t TinyPeerBytes = 4 << 10;
   struct ncclKernelPlanner* planner = &comm->planner;
   if (comm->nRanks <= 1 || planner->nTasksP2pSend != comm->nRanks ||
       planner->nTasksP2pRecv != comm->nRanks ||
@@ -1099,11 +1092,9 @@ static bool ncclSaiMarkDenseP2pExchange(struct ncclComm* comm) {
     }
   }
 
-  uint8_t batchLimit = sendRef->bytes <= TinyPeerBytes ?
-      NCCL_MAX_DEV_WORK_P2P_PER_BATCH / 2 : NCCL_MAX_DEV_WORK_P2P_PER_BATCH;
   for (int peer = 0; peer < comm->nRanks; peer++) {
-    ncclIntruQueueHead(&planner->peers[peer].sendQueue)->saiP2pBatchLimit = batchLimit;
-    ncclIntruQueueHead(&planner->peers[peer].recvQueue)->saiP2pBatchLimit = batchLimit;
+    ncclIntruQueueHead(&planner->peers[peer].sendQueue)->saiAllowCrossEpochBatch = true;
+    ncclIntruQueueHead(&planner->peers[peer].recvQueue)->saiAllowCrossEpochBatch = true;
   }
   if (comm->rank == 0) {
     INFO(NCCL_TUNING, "NCCL-SAI dense P2P exchange enables cross-epoch work batching");
@@ -2611,7 +2602,7 @@ static ncclResult_t p2pTaskAppend(
   p2p->saiA2aSeq = saiA2aSeq;
   p2p->saiA2aOrdinaryOrdinal = saiA2aOrdinaryOrdinal;
   p2p->saiA2aChannelRound = saiA2aChannelRound;
-  p2p->saiP2pBatchLimit = 0;
+  p2p->saiAllowCrossEpochBatch = false;
   p2p->eActivationMask = ncclProfilerApiState.eActivationMask;
   p2p->groupApiEventHandle = ncclProfilerApiState.groupApiEventHandle;
   p2p->p2pApiEventHandle = ncclProfilerApiState.p2pApiEventHandle;
