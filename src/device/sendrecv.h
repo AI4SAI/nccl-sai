@@ -61,35 +61,46 @@ struct RunWorkBatch<ncclFuncSendRecv, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_SIMPL
 
     struct ncclDevWorkP2p* works = (ncclDevWorkP2p*)ncclShmem.workStorage;
     int nWorks = ncclShmem.nWorks;
+    bool denseTiny = works[0].saiDenseTiny;
+    uint32_t workSendMask;
+    uint32_t workRecvMask;
 
-    if (wid == 0) {
-      // Modify the memory range of each work[] to reflect this channel's
-      // partition of the work. Since integer divides are very heavy it's
-      // best to do them all in one warp.
-      int workIx = lane%16;
-      int isSend = lane < 16 ? 0 : 1;
-      bool hasWork = false;
-      if (workIx < nWorks) {
-        struct ncclDevWorkP2p* work = &works[workIx];
-        size_t bytes = isSend ? work->sendBytes : work->recvBytes;
-        int nParts = isSend ? work->nSendChannels : work->nRecvChannels;
-        int part = ncclP2pChannelToPart(work->nP2pChannels, work->channelBase, ncclShmem.channelId);
-        hasWork = (part < nParts);
-        if (nParts != 0) {
-          size_t partBeg, partEnd;
-          ncclP2pPartBounds(nParts, part, bytes, &partBeg, &partEnd);
-          (isSend ? work->sendAddr : work->recvAddr) = (char*)(isSend ? work->sendAddr : work->recvAddr) + partBeg;
-          (isSend ? work->sendBytes : work->recvBytes) = partEnd - partBeg;
+    if (denseTiny) {
+      workSendMask = workRecvMask = (1u << nWorks) - 1;
+    } else {
+      if (wid == 0) {
+        // Modify the memory range of each work[] to reflect this channel's
+        // partition of the work. Since integer divides are very heavy it's
+        // best to do them all in one warp.
+        int workIx = lane%16;
+        int isSend = lane < 16 ? 0 : 1;
+        bool hasWork = false;
+        if (workIx < nWorks) {
+          struct ncclDevWorkP2p* work = &works[workIx];
+          size_t bytes = isSend ? work->sendBytes : work->recvBytes;
+          int nParts = isSend ? work->nSendChannels : work->nRecvChannels;
+          int part = ncclP2pChannelToPart(work->nP2pChannels, work->channelBase, ncclShmem.channelId);
+          hasWork = (part < nParts);
+          if (nParts != 0) {
+            size_t partBeg, partEnd;
+            ncclP2pPartBounds(nParts, part, bytes, &partBeg, &partEnd);
+            (isSend ? work->sendAddr : work->recvAddr) = (char*)(isSend ? work->sendAddr : work->recvAddr) + partBeg;
+            (isSend ? work->sendBytes : work->recvBytes) = partEnd - partBeg;
+          }
+        }
+        // Coverity reports a possible thread divergence due to not all threads participating in the collective.
+        // However, the code ensures that the participation is on a per-warp basis.
+        // coverity[device_thread_diverged:FALSE]
+        uint32_t mask = __ballot_sync(~0u, hasWork);
+        if (lane == 0) {
+          shared->workSendMask = mask>>16;
+          shared->workRecvMask = mask & 0xffff;
         }
       }
-      // Coverity reports a possible thread divergence due to not all threads participating in the collective.
-      // However, the code ensures that the participation is on a per-warp basis.
-      // coverity[device_thread_diverged:FALSE]
-      uint32_t mask = __ballot_sync(~0u, hasWork);
-      if (lane == 0) {
-        shared->workSendMask = mask>>16;
-        shared->workRecvMask = mask & 0xffff;
-      }
+      __syncthreads(); // Wait for works[] and shared->* to be updated by warp=0
+      workSendMask = shared->workSendMask;
+      workRecvMask = shared->workRecvMask;
+      __syncthreads(); // release scratch space used by shared->*
     }
 
     // The fastest way to compute a warp uniform division x/y in [0,32) is to
@@ -111,12 +122,6 @@ struct RunWorkBatch<ncclFuncSendRecv, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_SIMPL
     // The work index this warp belongs to: workIx = wid/nWarpPerWork
     int workIx = __popc(__ballot_sync(~0u, (lane+1)*nWarpPerWork <= wid));
 
-    __syncthreads(); // Wait for works[] and shared->* to be updated by warp=0
-
-    uint32_t workSendMask = shared->workSendMask;
-    uint32_t workRecvMask = shared->workRecvMask;
-
-    __syncthreads(); // release scratch space used by shared->*
     if (nWorks <= workIx) return;
 
     // Thread range for whole work (send & recv combined)
