@@ -186,6 +186,13 @@ static inline bool ncclSaiA2aPlannerCanRun(
   return configConsistent && enabled && (plannerEnabled || islandEnabled);
 }
 
+static inline bool ncclSaiDenseP2pCrossEpochAllowed(
+    int nRanks, int maxLocalRanks) {
+  // Cross-epoch compaction targets multi-host connection and proxy pressure.
+  // Single-host exchanges retain upstream epoch partitioning.
+  return nRanks > 0 && maxLocalRanks > 0 && nRanks > maxLocalRanks;
+}
+
 // Profiles are expert-only labels for grouped AlltoAll/P2P experiments. They
 // are never consulted by automatic rail or local-P2P capability detection.
 // Keep the one implemented expert layout fail-closed.

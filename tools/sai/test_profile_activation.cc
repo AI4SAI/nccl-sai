@@ -206,6 +206,14 @@ int main() {
     fprintf(stderr, "AlltoAll planner fast-path predicate failed\n");
     return 1;
   }
+  if (ncclSaiDenseP2pCrossEpochAllowed(0, 0) ||
+      ncclSaiDenseP2pCrossEpochAllowed(16, 16) ||
+      ncclSaiDenseP2pCrossEpochAllowed(16, 0) ||
+      !ncclSaiDenseP2pCrossEpochAllowed(32, 16) ||
+      !ncclSaiDenseP2pCrossEpochAllowed(1024, 16)) {
+    fprintf(stderr, "dense P2P cross-epoch scope failed\n");
+    return 1;
+  }
   if (ncclSaiResolveLocalP2pConsensus(false, true, true) !=
           ncclSaiLocalP2pConsensusReject ||
       ncclSaiResolveLocalP2pConsensus(true, false, true) !=

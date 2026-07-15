@@ -1058,7 +1058,9 @@ static bool ncclSaiA2aOrdinaryTaskAllowed(
 
 static bool ncclSaiMarkDenseP2pExchange(struct ncclComm* comm) {
   struct ncclKernelPlanner* planner = &comm->planner;
-  if (comm->nRanks <= 1 || planner->nTasksP2pSend != comm->nRanks ||
+  if (!ncclSaiDenseP2pCrossEpochAllowed(comm->nRanks, comm->maxLocalRanks) ||
+      comm->nRanks <= 1 ||
+      planner->nTasksP2pSend != comm->nRanks ||
       planner->nTasksP2pRecv != comm->nRanks ||
       planner->nTasksP2p != planner->nTasksP2pSend + planner->nTasksP2pRecv) {
     return false;
