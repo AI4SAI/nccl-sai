@@ -244,7 +244,7 @@ struct ncclTaskP2p {
   uint64_t saiA2aSeq;
   uint64_t saiA2aOrdinaryOrdinal;
   int saiA2aChannelRound;
-  bool saiAllowCrossEpochBatch;
+  uint8_t saiP2pBatchLimit;
 
   // Profiler plugin
   int eActivationMask;
