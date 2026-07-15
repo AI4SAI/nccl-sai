@@ -975,6 +975,8 @@ static ncclResult_t addP2pToPlan(
   int concurrentTasks[2];
   allowCrossEpochBatch = p2pTasks[0] != nullptr && p2pTasks[1] != nullptr &&
       p2pTasks[0]->saiAllowCrossEpochBatch && p2pTasks[1]->saiAllowCrossEpochBatch;
+  work->saiDenseTiny = allowCrossEpochBatch && work->sendBytes <= (4 << 10) &&
+      work->recvBytes <= (4 << 10) && work->nSendChannels == 1 && work->nRecvChannels == 1;
   maxConcurrent = comm->p2pnChannels / nChannelsMax * NCCL_MAX_DEV_WORK_P2P_PER_BATCH;
   concurrentTasks[0] = std::min(planTotalTasks[0], maxConcurrent);
   concurrentTasks[1] = std::min(planTotalTasks[1], maxConcurrent);
