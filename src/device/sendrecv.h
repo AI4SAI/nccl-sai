@@ -67,10 +67,10 @@ struct RunWorkBatch<ncclFuncSendRecv, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_SIMPL
       if (nWorks <= workIx) return;
 
       struct ncclDevWorkP2p* work = &works[workIx];
+      int subtid = tid - workIx*2*WARP_SIZE;
       if (work->sendRank == ncclShmem.comm.rank) {
-        if ((wid & 1) != 0) return;
         reduceCopy<COLL_UNROLL, RedOp, T, 0,1,1, 0,1,1, /*PreOpSrcs=*/0>
-          (lane, WARP_SIZE, 0, nullptr, false, 1, &work->sendAddr, 1,
+          (subtid, 2*WARP_SIZE, 0, nullptr, false, 1, &work->sendAddr, 1,
            &work->recvAddr, (ssize_t)work->sendBytes);
         return;
       }
