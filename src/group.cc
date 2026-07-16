@@ -217,6 +217,9 @@ static void groupCleanup(struct ncclComm** groupCommHeadPtr, struct ncclComm** g
     // Reset comm->tasks to empty.
     comm->tasks.nTasksColl = 0;
     comm->tasks.nTasksP2p = 0;
+    comm->tasks.saiDenseP2pPhaseActive = false;
+    comm->tasks.saiDenseP2pPhase = 0;
+    comm->tasks.saiDenseP2pLanes = 0;
     comm->tasks.streams = nullptr;
     ncclIntruQueueConstruct(&comm->tasks.collQueue);
     comm->tasks.collBytesTotal = 0;

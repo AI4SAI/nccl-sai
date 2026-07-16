@@ -106,6 +106,9 @@ struct ncclTasks {
   int *p2pSendOrder, *p2pRecvOrder;
   int p2pOrderSteps;
   int nTasksColl, nTasksP2p;
+  bool saiDenseP2pPhaseActive;
+  int saiDenseP2pPhase;
+  int saiDenseP2pLanes;
 
   // The list of user streams aggregated over all tasks present.
   struct ncclCudaStreamList* streams;

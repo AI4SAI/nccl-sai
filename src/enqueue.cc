@@ -608,6 +608,56 @@ static size_t calcP2pChunkSize(size_t totalSize, int minChannels, int maxChannel
   return alignUp(size, minSize);
 }
 
+static bool ncclSaiDenseP2pPhaseEligible(struct ncclComm* comm, size_t* peerBytesOut) {
+  constexpr int minRanks = 16;
+  constexpr size_t minPeerBytes = 128 * 1024;
+  constexpr int lanes = NCCL_MAX_WORK_ELEMENTS_P2P/2;
+  struct ncclTasks* tasks = &comm->tasks;
+
+  if (comm->nRanks < minRanks || comm->localRanks < lanes ||
+      comm->localRanks % lanes != 0 || tasks->nTasksP2p != 2*comm->nRanks ||
+      comm->peerInfo == nullptr || comm->rankToNode == nullptr ||
+      comm->rankToLocalRank == nullptr || comm->nodeRanks == nullptr) return false;
+
+  for (int node = 0; node < comm->nNodes; node++) {
+    if (comm->nodeRanks[node].localRanks != comm->localRanks ||
+        comm->nodeRanks[node].localRankToRank == nullptr) return false;
+    int firstRank = comm->nodeRanks[node].localRankToRank[0];
+    if (firstRank < 0 || firstRank >= comm->nRanks) return false;
+    for (int other = 0; other < node; other++) {
+      int otherFirstRank = comm->nodeRanks[other].localRankToRank[0];
+      if (comm->peerInfo[firstRank].hostHash ==
+          comm->peerInfo[otherFirstRank].hostHash) return false;
+    }
+  }
+
+  size_t peerBytes = 0;
+  for (int peer = 0; peer < comm->nRanks; peer++) {
+    struct ncclTaskP2p* send = ncclIntruQueueHead(&tasks->peers[peer].sendQueue);
+    struct ncclTaskP2p* recv = ncclIntruQueueHead(&tasks->peers[peer].recvQueue);
+    if (send == nullptr || recv == nullptr || send->next != nullptr || recv->next != nullptr ||
+        send->chunk != 0 || recv->chunk != 0 || send->bytes < minPeerBytes ||
+        send->bytes != recv->bytes || comm->rankToNode[peer] < 0 ||
+        comm->rankToNode[peer] >= comm->nNodes || comm->rankToLocalRank[peer] < 0 ||
+        comm->rankToLocalRank[peer] >= comm->localRanks) return false;
+    int nodeFirstRank =
+        comm->nodeRanks[comm->rankToNode[peer]].localRankToRank[0];
+    if (comm->peerInfo[peer].hostHash !=
+        comm->peerInfo[nodeFirstRank].hostHash) return false;
+    if (peer == 0) peerBytes = send->bytes;
+    else if (send->bytes != peerBytes) return false;
+  }
+
+  if (peerBytesOut != nullptr) *peerBytesOut = peerBytes;
+  return true;
+}
+
+static bool ncclSaiDenseP2pPeerInPhase(
+    struct ncclComm* comm, int peer, int phase, int lanes) {
+  return peer >= 0 &&
+      (comm->localRank + comm->rankToLocalRank[peer]) % lanes == phase;
+}
+
 static ncclResult_t scheduleP2pTasksToPlan(
     struct ncclComm* comm, struct ncclKernelPlan* plan, int* nWorkBudget
   ) {
@@ -616,6 +666,22 @@ static ncclResult_t scheduleP2pTasksToPlan(
   struct ncclTasks::Peer* peers = tasks->peers;
   int const *sendOrder = tasks->p2pSendOrder;
   int const *recvOrder = tasks->p2pRecvOrder;
+  if (!tasks->saiDenseP2pPhaseActive) {
+    size_t peerBytes = 0;
+    if (ncclSaiDenseP2pPhaseEligible(comm, &peerBytes)) {
+      tasks->saiDenseP2pPhaseActive = true;
+      tasks->saiDenseP2pPhase = 0;
+      tasks->saiDenseP2pLanes = NCCL_MAX_WORK_ELEMENTS_P2P/2;
+      if (comm->rank == 0) {
+        INFO(NCCL_TUNING,
+            "NCCL-SAI dense P2P exchange uses %d host-local phases for %zu-byte peers across %d physical hosts",
+            tasks->saiDenseP2pLanes, peerBytes, comm->nNodes);
+      }
+    }
+  }
+  bool saiDensePhase = tasks->saiDenseP2pPhaseActive;
+  int saiPhase = tasks->saiDenseP2pPhase;
+  int saiLanes = tasks->saiDenseP2pLanes;
 
   plan->threadPerBlock = std::max(plan->threadPerBlock, NCCL_MAX_NTHREADS);
   if (!plan->kernelSpecialized) {
@@ -645,6 +711,12 @@ static ncclResult_t scheduleP2pTasksToPlan(
       if ((i % (NCCL_MAX_WORK_ELEMENTS_P2P/2)) == 0) fuseOk = false;
       struct ncclTaskP2p* send = sendPeer != -1 ? ncclIntruQueueHead(&peers[sendPeer].sendQueue) : NULL;
       struct ncclTaskP2p* recv = recvPeer != -1 ? ncclIntruQueueHead(&peers[recvPeer].recvQueue) : NULL;
+      if (saiDensePhase) {
+        if (send != nullptr && !ncclSaiDenseP2pPeerInPhase(
+              comm, sendPeer, saiPhase, saiLanes)) send = nullptr;
+        if (recv != nullptr && !ncclSaiDenseP2pPeerInPhase(
+              comm, recvPeer, saiPhase, saiLanes)) recv = nullptr;
+      }
       if (sendPeer == comm->rank) {
         if (recvPeer != comm->rank) {
           WARN("Sendrecv plan not aligned for self");
@@ -710,6 +782,19 @@ static ncclResult_t scheduleP2pTasksToPlan(
           }
         } while (sendBytes != 0 || recvBytes != 0);
       }
+    }
+    if (saiDensePhase) {
+      tasks->saiDenseP2pPhase += 1;
+      if (tasks->nTasksP2p == 0) {
+        tasks->saiDenseP2pPhaseActive = false;
+        tasks->saiDenseP2pPhase = 0;
+        tasks->saiDenseP2pLanes = 0;
+      } else if (tasks->saiDenseP2pPhase >= saiLanes) {
+        WARN("NCCL-SAI dense P2P phase schedule left %d tasks after %d phases",
+            tasks->nTasksP2p, saiLanes);
+        return ncclInternalError;
+      }
+      return ncclSuccess;
     }
   }
   return ncclSuccess;
