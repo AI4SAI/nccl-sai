@@ -232,6 +232,11 @@ struct ncclComm {
   int* localRankToRank;
   // localRanks and localRanktoRank for all nodes
   struct ncclNodeRanks* nodeRanks;
+  int saiPhysicalHostCount;
+  int saiPhysicalLocalRank;
+  int saiPhysicalLocalRanks;
+  int* saiRankToPhysicalHost;
+  int* saiRankToPhysicalLocalRank;
 
   bool checkPointers;
   bool dmaBufSupport;

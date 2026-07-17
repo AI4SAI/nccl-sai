@@ -194,6 +194,8 @@ static ncclResult_t commFree(ncclComm_t comm) {
   }
   free(comm->rankToNode);
   free(comm->rankToLocalRank);
+  free(comm->saiRankToPhysicalHost);
+  free(comm->saiRankToPhysicalLocalRank);
   free(comm->collNetHeads);
 
   if (comm->bootstrap)
@@ -784,11 +786,45 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   int* pxnPeers = NULL;
   int *topParentLocalRanks = NULL;
   int tpProxyRank;
+  int *saiPhysicalFirstRanks = NULL, *saiPhysicalHostCounts = NULL;
 
   // AllGather1 - begin
   NCCLCHECKGOTO(ncclCalloc(&comm->peerInfo, nranks+1), ret, fail); // Extra rank to represent CollNet root
   NCCLCHECKGOTO(fillInfo(comm, comm->peerInfo+rank, comm->commHash), ret, fail);
   NCCLCHECKGOTO(bootstrapAllGather(comm->bootstrap, comm->peerInfo, sizeof(struct ncclPeerInfo)), ret, fail);
+
+  NCCLCHECKGOTO(ncclCalloc(&comm->saiRankToPhysicalHost, nranks), ret, fail);
+  NCCLCHECKGOTO(ncclCalloc(&comm->saiRankToPhysicalLocalRank, nranks), ret, fail);
+  NCCLCHECKGOTO(ncclCalloc(&saiPhysicalFirstRanks, nranks), ret, fail);
+  NCCLCHECKGOTO(ncclCalloc(&saiPhysicalHostCounts, nranks), ret, fail);
+  comm->saiPhysicalHostCount = 0;
+  for (int r = 0; r < nranks; r++) {
+    int physicalHost = 0;
+    while (physicalHost < comm->saiPhysicalHostCount &&
+        comm->peerInfo[saiPhysicalFirstRanks[physicalHost]].hostHash !=
+        comm->peerInfo[r].hostHash) physicalHost++;
+    if (physicalHost == comm->saiPhysicalHostCount) {
+      saiPhysicalFirstRanks[physicalHost] = r;
+      comm->saiPhysicalHostCount++;
+    }
+    comm->saiRankToPhysicalHost[r] = physicalHost;
+    comm->saiRankToPhysicalLocalRank[r] = saiPhysicalHostCounts[physicalHost]++;
+  }
+  comm->saiPhysicalLocalRank = comm->saiRankToPhysicalLocalRank[rank];
+  comm->saiPhysicalLocalRanks = saiPhysicalHostCounts[0];
+  for (int physicalHost = 1; physicalHost < comm->saiPhysicalHostCount; physicalHost++) {
+    if (saiPhysicalHostCounts[physicalHost] != comm->saiPhysicalLocalRanks) {
+      comm->saiPhysicalLocalRanks = 0;
+      break;
+    }
+  }
+  if (rank == 0) {
+    INFO(NCCL_INIT,
+        "NCCL-SAI physical host map: hosts %d uniformRanksPerHost %d",
+        comm->saiPhysicalHostCount, comm->saiPhysicalLocalRanks);
+  }
+  free(saiPhysicalFirstRanks); saiPhysicalFirstRanks = NULL;
+  free(saiPhysicalHostCounts); saiPhysicalHostCounts = NULL;
 
   for (int i = 0; i < nranks; i++) {
     if ((i != rank) && (comm->peerInfo[i].hostHash == comm->peerInfo[rank].hostHash) && (comm->peerInfo[i].busId == comm->peerInfo[rank].busId)) {
@@ -1236,6 +1272,8 @@ exit:
   free(rings);
   free(nvbPeers);
   free(pxnPeers);
+  free(saiPhysicalFirstRanks);
+  free(saiPhysicalHostCounts);
   return ret;
 fail:
   goto exit;
