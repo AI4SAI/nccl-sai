@@ -64,6 +64,8 @@ struct ncclSocket {
   int salen;
   uint64_t magic;
   enum ncclSocketType type;
+  int finalizeCounter; // Bytes retained across asynchronous accept progress.
+  char finalizeBuffer[sizeof(uint64_t)];
 };
 
 const char *ncclSocketToString(union ncclSocketAddress *addr, char *buf, const int numericHostForm = 1);

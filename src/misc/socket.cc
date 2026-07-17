@@ -417,35 +417,68 @@ static ncclResult_t socketTryAccept(struct ncclSocket* sock) {
   return ncclSuccess;
 }
 
+static void socketResetAccept(struct ncclSocket* sock) {
+  char line[SOCKET_NAME_MAXLEN+1];
+  INFO(NCCL_NET|NCCL_INIT,
+       "socketFinalizeAccept: didn't receive a valid magic from %s",
+       ncclSocketToString(&sock->addr, line));
+  (void)close(sock->fd);
+  sock->fd = -1;
+  sock->state = ncclSocketStateAccepting;
+  sock->finalizeCounter = 0;
+}
+
 static ncclResult_t socketFinalizeAccept(struct ncclSocket* sock) {
   uint64_t magic;
   enum ncclSocketType type;
-  int received = 0;
+  int received;
   const int one = 1;
   SYSCHECK(setsockopt(sock->fd, IPPROTO_TCP, TCP_NODELAY, (char*)&one, sizeof(int)), "setsockopt");
 
-  NCCLCHECK(ncclSocketProgress(NCCL_SOCKET_RECV, sock, &magic, sizeof(magic), &received));
-  if (received == 0) return ncclSuccess;
-  NCCLCHECK(socketWait(NCCL_SOCKET_RECV, sock, &magic, sizeof(magic), &received));
-  if (magic != sock->magic) {
-    WARN("socketFinalizeAccept: wrong magic %lx != %lx", magic, sock->magic);
-    close(sock->fd);
-    sock->fd = -1;
-    // Ignore spurious connection and accept again
-    sock->state = ncclSocketStateAccepting;
-    return ncclSuccess;
-  } else {
+  // An async socket must not block the progress thread when only part of the
+  // initial handshake is available. Retain partial bytes across progress calls.
+  if (sock->asyncFlag == 0 || sock->finalizeCounter < sizeof(magic)) {
+    if (sock->asyncFlag == 0) {
+      received = 0;
+      if (socketWait(NCCL_SOCKET_RECV, sock, &magic, sizeof(magic), &received) != ncclSuccess) {
+        socketResetAccept(sock);
+        return ncclSuccess;
+      }
+    } else {
+      int closed = 0;
+      received = sock->finalizeCounter;
+      NCCLCHECK(socketProgressOpt(NCCL_SOCKET_RECV, sock, sock->finalizeBuffer,
+                                  sizeof(magic), &received, 0, &closed));
+      sock->finalizeCounter = received;
+      if (received < sizeof(magic)) {
+        if (closed) socketResetAccept(sock);
+        return ncclSuccess;
+      }
+      memcpy(&magic, sock->finalizeBuffer, sizeof(magic));
+    }
+    if (magic != sock->magic) {
+      socketResetAccept(sock);
+      return ncclSuccess;
+    }
+  }
+  if (sock->asyncFlag == 0) {
     received = 0;
     NCCLCHECK(socketWait(NCCL_SOCKET_RECV, sock, &type, sizeof(type), &received));
-    if (type != sock->type) {
-      WARN("socketFinalizeAccept: wrong type %d != %d", type, sock->type);
-      sock->state = ncclSocketStateError;
-      close(sock->fd);
-      sock->fd = -1;
-      return ncclInternalError;
-    } else {
-      sock->state = ncclSocketStateReady;
-    }
+  } else {
+    received = sock->finalizeCounter - sizeof(magic);
+    NCCLCHECK(ncclSocketProgress(NCCL_SOCKET_RECV, sock, sock->finalizeBuffer, sizeof(type), &received));
+    sock->finalizeCounter = received + sizeof(magic);
+    if (received < sizeof(type)) return ncclSuccess;
+    memcpy(&type, sock->finalizeBuffer, sizeof(type));
+  }
+  if (type != sock->type) {
+    WARN("socketFinalizeAccept: wrong type %d != %d", type, sock->type);
+    sock->state = ncclSocketStateError;
+    close(sock->fd);
+    sock->fd = -1;
+    return ncclInternalError;
+  } else {
+    sock->state = ncclSocketStateReady;
   }
   return ncclSuccess;
 }
@@ -659,6 +692,7 @@ ncclResult_t ncclSocketAccept(struct ncclSocket* sock, struct ncclSocket* listen
     memcpy(sock, listenSock, sizeof(struct ncclSocket));
     sock->acceptFd = listenSock->fd;
     sock->state = ncclSocketStateAccepting;
+    sock->finalizeCounter = 0;
   }
 
   do {
@@ -702,6 +736,7 @@ ncclResult_t ncclSocketInit(struct ncclSocket* sock, union ncclSocketAddress* ad
   sock->type = type;
   sock->fd = -1;
   sock->acceptFd = -1;
+  sock->finalizeCounter = 0;
 
   if (addr) {
     /* IPv4/IPv6 support */
