@@ -1380,6 +1380,8 @@ static ncclResult_t proxyServiceInitOp(int type, struct ncclProxyLocalPeer* peer
 
 #include <poll.h>
 
+enum { proxyPeerHandshake = -2, proxyPeerUnknown = -1 };
+
 static bool proxyMatchOpType(int type) {
   switch (type) {
     case ncclProxyMsgInit:
@@ -1440,27 +1442,43 @@ void* ncclProxyService(void* _args) {
       WARN("[Proxy Service] Poll failed: %s", strerror(errno));
       return NULL;
     }
-    if (pollfds[NCCL_MAX_LOCAL_RANKS].revents) {
+    if (stop == 0 && pollfds[NCCL_MAX_LOCAL_RANKS].revents) {
       int s = 0;
       while (s < NCCL_MAX_LOCAL_RANKS && pollfds[s].fd >= 0) s++;
       if (s == NCCL_MAX_LOCAL_RANKS) {
         WARN("[Proxy service] Too many connections (%d max)", NCCL_MAX_LOCAL_RANKS);
         return NULL;
       }
-      if (maxnpeers < s+1) maxnpeers = s+1;
       if (ncclSocketInit(&peers[s].sock) != ncclSuccess) {
         WARN("[Service thread] Initialize peers[%d].sock fails", s);
         return NULL;
       }
       if (ncclSocketAccept(&peers[s].sock, proxyState->listenSock) != ncclSuccess) {
         WARN("[Service thread] Accept failed %s", strerror(errno));
-      } else {
+      } else if (peers[s].sock.state == ncclSocketStateReady ||
+                 peers[s].sock.state == ncclSocketStateAccepted) {
         if (ncclSocketGetFd(&peers[s].sock, &pollfds[s].fd) != ncclSuccess) {
           WARN("[Service thread] Get peers[%d].sock fd fails", s);
           return NULL;
         }
+        if (pollfds[s].fd < 0) {
+          WARN("[Service thread] Accepted peers[%d].sock has invalid fd", s);
+          return NULL;
+        }
+        if (maxnpeers < s+1) maxnpeers = s+1;
         npeers++;
-        peers[s].tpLocalRank = -1;
+        peers[s].tpLocalRank = peers[s].sock.state == ncclSocketStateReady ?
+          proxyPeerUnknown : proxyPeerHandshake;
+      } else if (peers[s].sock.state == ncclSocketStateAccepting) {
+        // A non-NCCL connection was rejected. Return to poll so established
+        // proxy clients continue making progress.
+        if (ncclSocketClose(&peers[s].sock) != ncclSuccess) {
+          WARN("[Service thread] Could not close rejected peers[%d].sock", s);
+          return NULL;
+        }
+      } else {
+        WARN("[Service thread] Unexpected accept state %d", peers[s].sock.state);
+        return NULL;
       }
     }
     for (int s=0; s<maxnpeers; s++) {
@@ -1473,6 +1491,34 @@ void* ncclProxyService(void* _args) {
 
       // Progress all ops for this ncclProxyLocalPeer
       ncclProxyAsyncOp* op = peer->asyncOps;
+      if (peer->tpLocalRank == proxyPeerHandshake) {
+        if (stop || (pollfds[s].revents & (POLLHUP|POLLERR|POLLNVAL))) {
+          closeConn = 1;
+        } else if (pollfds[s].revents & POLLIN) {
+          res = ncclSocketAccept(sock, proxyState->listenSock);
+          if (res != ncclSuccess) {
+            closeConn = 1;
+          } else if (sock->state == ncclSocketStateReady) {
+            peer->tpLocalRank = proxyPeerUnknown;
+          } else if (sock->state == ncclSocketStateAccepting) {
+            closeConn = 1;
+          } else if (sock->state != ncclSocketStateAccepted) {
+            WARN("[Service thread] Unexpected handshake state %d", sock->state);
+            closeConn = 1;
+          }
+        }
+        if (closeConn) {
+          if (ncclSocketClose(sock) != ncclSuccess) {
+            WARN("[Service thread] Could not close pending peers[%d].sock", s);
+            return NULL;
+          }
+          pollfds[s].fd = -1;
+          npeers--;
+          continue;
+        }
+        if (peer->tpLocalRank == proxyPeerHandshake) continue;
+      }
+
       while (op != nullptr) {
         ncclProxyAsyncOp* opnext = op->next; /* in case op is freed in proxyProgressAsync */
         type = op->type;

@@ -294,7 +294,7 @@ ncclResult_t bootstrapInit(struct ncclBootstrapHandle* handle, struct ncclComm* 
 
   // proxy is aborted through a message; don't set abortFlag
   NCCLCHECK(ncclCalloc(&proxySocket, 1));
-  NCCLCHECK(ncclSocketInit(proxySocket, &bootstrapNetIfAddr, comm->magic, ncclSocketTypeProxy, comm->abortFlag));
+  NCCLCHECK(ncclSocketInit(proxySocket, &bootstrapNetIfAddr, comm->magic, ncclSocketTypeProxy, comm->abortFlag, 1));
   NCCLCHECK(ncclSocketListen(proxySocket));
   NCCLCHECK(ncclSocketGetAddr(proxySocket, state->peerProxyAddresses+rank));
   NCCLCHECK(bootstrapAllGather(state, state->peerProxyAddresses, sizeof(union ncclSocketAddress)));
@@ -357,7 +357,7 @@ ncclResult_t bootstrapSplit(struct ncclBootstrapHandle* handle, struct ncclComm*
     // Create the service proxy
     NCCLCHECKGOTO(ncclCalloc(&state->peerProxyAddresses, nranks), ret, fail);
     NCCLCHECKGOTO(ncclCalloc(&proxySocket, 1), ret, fail);
-    NCCLCHECKGOTO(ncclSocketInit(proxySocket, &bootstrapNetIfAddr, comm->magic, ncclSocketTypeProxy, comm->abortFlag, 0), ret, fail);
+    NCCLCHECKGOTO(ncclSocketInit(proxySocket, &bootstrapNetIfAddr, comm->magic, ncclSocketTypeProxy, comm->abortFlag, 1), ret, fail);
     NCCLCHECKGOTO(ncclSocketListen(proxySocket), ret, fail);
     NCCLCHECKGOTO(ncclSocketGetAddr(proxySocket, &tmpAddr), ret, fail);
     memcpy(state->peerProxyAddresses + rank, &tmpAddr, sizeof(union ncclSocketAddress));
