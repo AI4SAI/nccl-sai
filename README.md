@@ -5,19 +5,22 @@ Optimized primitives for inter-GPU communication.
 ## NCCL-SAI 2.18 Branch
 
 This branch carries a small AI4SAI change set derived from NVIDIA NCCL
-`v2.18.5-1`. It keeps the NCCL 2.18 public API and SONAME and focuses on three
+`v2.18.5-1`. It keeps the NCCL 2.18 public API and SONAME and focuses on four
 bounded behaviors:
 
 - an operator-managed, opt-in rail-by-channel policy for graphless NET
   selection when exactly two topology-local NET endpoints are available;
 - automatic host-local phasing for an exact, sufficiently large, dense grouped
   Send/Recv exchange; and
+- message-size-aware P2P preconnection which opens only channel offsets the
+  existing NCCL 2.18 scheduler can use; and
 - nonblocking proxy-listener handshake progress so a partial or non-NCCL
   client cannot monopolize the proxy service thread.
 
-Dense scheduling and listener hardening require no application environment
-variables. A deployment which uses the dual-rail policy may set
-`NCCL_SAI_RAIL_BY_CHANNEL=1` through site-managed runtime configuration.
+Dense scheduling, size-aware preconnection, and listener hardening require no
+application environment variables. A deployment which uses the dual-rail
+policy may set `NCCL_SAI_RAIL_BY_CHANNEL=1` through site-managed runtime
+configuration.
 The implementation does not inspect scheduler metadata, hostnames, partition
 names, or deployment paths.
 

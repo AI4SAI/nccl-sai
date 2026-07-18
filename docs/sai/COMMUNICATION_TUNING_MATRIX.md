@@ -8,6 +8,7 @@ private cluster names, scheduler records, node lists, and raw benchmark logs.
 | Path | Required checks |
 | --- | --- |
 | Dense grouped Send/Recv | Small-message fallback, large-message activation, correctness, single-host performance, and representative multi-host scale |
+| P2P preconnection | Small-message connector cardinality, later larger-message expansion, correctness, and adjacent latency/bandwidth non-regression |
 | Sparse or asymmetric Send/Recv | Correctness and proof that dense phases remain inactive |
 | AllReduce | Small-message latency and large-message bandwidth non-regression |
 | Graphless NET rail policy | Enabled and disabled behavior, exact two-endpoint activation, endpoint parity, and unsupported-shape fallback |

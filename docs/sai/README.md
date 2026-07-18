@@ -2,7 +2,8 @@
 
 NCCL-SAI 2.18.5 is derived from NVIDIA NCCL `v2.18.5-1`. It preserves the
 upstream public API and SONAME while adding a narrow dual-rail policy, exact
-dense peer scheduling, and defensive proxy-listener progress.
+dense peer scheduling, size-aware P2P preconnection, and defensive
+proxy-listener progress.
 
 Applications do not need an `NCCL_SAI_*` variable bundle. A site may enable the
 rail policy through managed runtime configuration. The source does not identify
@@ -27,6 +28,19 @@ Eligible peers are admitted in eight host-local phases. Sparse, asymmetric,
 mixed-size, small, partially queued, or otherwise inexact traffic keeps the
 upstream schedule. This implementation does not import a later NCCL work-batch
 executor or an experimental AlltoAll planner.
+
+## Size-aware P2P preconnection
+
+NCCL 2.18 schedules each P2P operation over a message-dependent number of
+channel offsets. NCCL-SAI applies the same calculation when marking connectors
+for preconnection. Small messages therefore do not open channel offsets that
+the existing scheduler will not use, while large messages retain the upstream
+multi-channel selection.
+
+This behavior is automatic. It does not lower the communicator channel count,
+change channel-to-rail mapping, replace the P2P executor, or add a tuning
+variable. If a later operation for the same peer needs more channel offsets,
+the additional connectors are marked at that time.
 
 ## Graphless dual-rail-by-channel selection
 
@@ -59,6 +73,7 @@ This release does not add or automatically enable:
 - a later NCCL work-batch executor;
 - topology-group or GPU-island planners;
 - local-P2P or PXN policy changes;
+- P2P channel-count or executor changes;
 - collective graph rail rewriting;
 - collective channel expansion; or
 - collective algorithm or protocol overrides.
