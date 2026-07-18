@@ -608,6 +608,30 @@ static size_t calcP2pChunkSize(size_t totalSize, int minChannels, int maxChannel
   return alignUp(size, minSize);
 }
 
+static void calcP2pChannelBounds(struct ncclComm* comm, int* minChannels, int* maxChannels) {
+  int nChannelsMax = comm->p2pnChannelsPerPeer;
+  int nChannelsMin = nChannelsMax;
+  if (comm->nNodes == 1) {
+    // Try to use all channels, but one channel per operation.
+    while (nChannelsMin*comm->nRanks > comm->p2pnChannels && nChannelsMin > 1) nChannelsMin /= 2;
+    // Avoid overloading channels with 8+ operations as we lose the sync warp, hence a bit of bandwidth.
+    while (nChannelsMax*comm->nRanks > comm->p2pnChannels*4 && nChannelsMax > 1) nChannelsMax /= 2;
+  }
+  *minChannels = nChannelsMin;
+  *maxChannels = nChannelsMax;
+}
+
+static int calcP2pChannelsForBytes(struct ncclComm* comm, ssize_t bytes) {
+  if (bytes <= 0) return 1; // Zero-byte P2P operations are synchronization operations.
+  int minChannels, maxChannels;
+  calcP2pChannelBounds(comm, &minChannels, &maxChannels);
+  size_t stepSize = comm->p2pChunkSize;
+  size_t minSize = stepSize/8;
+  size_t maxSize = comm->nNodes > 1 ? stepSize : stepSize*32;
+  size_t chunkSize = calcP2pChunkSize(bytes, minChannels, maxChannels, minSize, maxSize);
+  return std::min(maxChannels, (int)divUp((size_t)bytes, chunkSize));
+}
+
 static bool ncclSaiDenseP2pPhaseEligible(struct ncclComm* comm, size_t* peerBytesOut) {
   constexpr int minRanks = 16;
   constexpr size_t minPeerBytes = 128 * 1024;
@@ -678,15 +702,8 @@ static ncclResult_t scheduleP2pTasksToPlan(
   // Compute how much to split operations
   // Natural step size matching buffer steps.
   ssize_t stepSize = comm->p2pChunkSize;
-  // Try to use all channels
-  int nChannelsMax = comm->p2pnChannelsPerPeer;
-  int nChannelsMin = nChannelsMax;
-  if (comm->nNodes == 1) {
-    // Try to use all channels, but one channel per operation.
-    while (nChannelsMin*nRanks > comm->p2pnChannels && nChannelsMin > 1) nChannelsMin /= 2;
-    // Avoid overloading channels with 8+ operations as we loose the sync warp, hence a bit of bandwidth.
-    while (nChannelsMax*nRanks > comm->p2pnChannels*4 && nChannelsMax > 1) nChannelsMax /= 2;
-  }
+  int nChannelsMin, nChannelsMax;
+  calcP2pChannelBounds(comm, &nChannelsMin, &nChannelsMax);
 
   bool fuseOk;
   // We can perform 8 send/recv per round per CTA. Make sure we jump between fused blocks at node boundaries.
@@ -1559,21 +1576,22 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo const* inf
     if (comm->rank != peer) {
       int channelBaseId;
       NCCLCHECK(ncclChannelComputeBase(comm, peer, info->coll, &channelBaseId));
-      if (!(isSendNotRecv ? tasks->peers[peer].sendSeen : tasks->peers[peer].recvSeen)) {
-        (isSendNotRecv ? tasks->peers[peer].sendSeen : tasks->peers[peer].recvSeen) = true;
-        for (int c=0; c < comm->p2pnChannelsPerPeer; c++) {
-          int channelId;
-          NCCLCHECK(ncclChannelComputeFromBase(comm, channelBaseId, c, &channelId));
-          if (isSendNotRecv) {
-            if (comm->channels[channelId].peers[peer]->send[1].connected == 0) { // P2P uses only 1 connector
-              comm->connectSend[peer] |= (1UL<<channelId);
-              ncclGroupCommPreconnect(comm);
-            }
-          } else {
-            if (comm->channels[channelId].peers[peer]->recv[1].connected == 0) { // P2P uses only 1 connector
-              comm->connectRecv[peer] |= (1UL<<channelId);
-              ncclGroupCommPreconnect(comm);
-            }
+      (isSendNotRecv ? tasks->peers[peer].sendSeen : tasks->peers[peer].recvSeen) = true;
+      // IB keeps its setup socket for the connector lifetime. Preconnecting channel
+      // offsets this message will never schedule wastes ports at large peer counts.
+      int nChannels = calcP2pChannelsForBytes(comm, nBytes);
+      for (int c=0; c < nChannels; c++) {
+        int channelId;
+        NCCLCHECK(ncclChannelComputeFromBase(comm, channelBaseId, c, &channelId));
+        if (isSendNotRecv) {
+          if (comm->channels[channelId].peers[peer]->send[1].connected == 0) { // P2P uses only 1 connector
+            comm->connectSend[peer] |= (1UL<<channelId);
+            ncclGroupCommPreconnect(comm);
+          }
+        } else {
+          if (comm->channels[channelId].peers[peer]->recv[1].connected == 0) { // P2P uses only 1 connector
+            comm->connectRecv[peer] |= (1UL<<channelId);
+            ncclGroupCommPreconnect(comm);
           }
         }
       }
