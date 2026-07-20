@@ -24,6 +24,8 @@ struct ncclSaiRailInfo {
   int internalIb;
   int crossNic;
   int topologyEligible;
+  int physicalEndpoints;
+  uint64_t subnetPrefix[2];
 };
 
 // Build the topology
@@ -83,7 +85,7 @@ ncclResult_t ncclTopoCpuType(struct ncclTopoSystem* system, int* arch, int* vend
 ncclResult_t ncclTopoGetGpuCount(struct ncclTopoSystem* system, int* count);
 ncclResult_t ncclTopoGetNetCount(struct ncclTopoSystem* system, int* count);
 ncclResult_t ncclTopoGetNvsCount(struct ncclTopoSystem* system, int* count);
-ncclResult_t ncclTopoGetSaiRailInfo(struct ncclTopoSystem* system, int rank, struct ncclSaiRailInfo* info);
+ncclResult_t ncclTopoGetSaiRailInfo(struct ncclTopoSystem* system, int rank, struct ncclSaiRailInfo* info, int* port1Dev, int* port2Dev);
 void ncclTopoSetSaiRailByChannel(struct ncclTopoSystem* system, bool enabled);
 bool ncclTopoSaiRailByChannelEnabled(struct ncclTopoSystem* system);
 ncclResult_t ncclTopoGetLocalNet(struct ncclTopoSystem* system, int rank, int channelId, int64_t* id, int* dev);

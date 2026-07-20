@@ -26,6 +26,7 @@ ncclResult_t ncclCollNetSetVirtDevCount(int netPluginIndex, int nVirtDev);
 
 // Test whether the current GPU support GPU Direct RDMA.
 ncclResult_t ncclGpuGdrSupport(struct ncclComm* comm, int* gdrSupport);
+ncclResult_t ncclIbGetSaiRailFingerprint(int dev, int* physical, uint64_t* subnetPrefix);
 
 extern ncclNet_t ncclNetIb;
 extern ncclNet_t ncclNetSocket;

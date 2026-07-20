@@ -1728,12 +1728,18 @@ static bool ncclTopoGetLocalRailPair(
   return false;
 }
 
-ncclResult_t ncclTopoGetSaiRailInfo(struct ncclTopoSystem* system, int rank, struct ncclSaiRailInfo* info) {
-  if (info == NULL) return ncclInvalidArgument;
+ncclResult_t ncclTopoGetSaiRailInfo(struct ncclTopoSystem* system, int rank, struct ncclSaiRailInfo* info, int* port1Dev, int* port2Dev) {
+  if (info == NULL || port1Dev == NULL || port2Dev == NULL) return ncclInvalidArgument;
+  *port1Dev = -1;
+  *port2Dev = -1;
   int port1Net = -1;
   int port2Net = -1;
   info->topologyEligible = ncclTopoGetLocalRailPair(
       system, rank, &port1Net, &port2Net) ? 1 : 0;
+  if (info->topologyEligible) {
+    *port1Dev = system->nodes[NET].nodes[port1Net].net.dev;
+    *port2Dev = system->nodes[NET].nodes[port2Net].net.dev;
+  }
   return ncclSuccess;
 }
 

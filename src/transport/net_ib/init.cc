@@ -424,6 +424,29 @@ ncclResult_t ncclIbGetProperties(int dev, ncclNetProperties_t* props) {
   return ncclSuccess;
 }
 
+ncclResult_t ncclIbGetSaiRailFingerprint(int dev, int* physical, uint64_t* subnetPrefix) {
+  if (physical == NULL || subnetPrefix == NULL) return ncclInvalidArgument;
+  *physical = 0;
+  *subnetPrefix = 0;
+  if (dev < 0 || dev >= ncclNMergedIbDevs) return ncclSuccess;
+
+  struct ncclIbMergedDev* mergedDev = ncclIbMergedDevs + dev;
+  if (mergedDev->vProps.ndevs != 1) return ncclSuccess;
+  int physDev = mergedDev->vProps.devs[0];
+  if (physDev < 0 || physDev >= ncclNIbDevs) return ncclSuccess;
+
+  struct ncclIbDev* ibDev = ncclIbDevs + physDev;
+  int gidIndex = 0;
+  union ibv_gid gid;
+  if (ncclIbGetGidIndex(ibDev->context, ibDev->portNum, &ibDev->portAttr, &gidIndex) != ncclSuccess ||
+      wrap_ibv_query_gid(ibDev->context, ibDev->portNum, gidIndex, &gid) != ncclSuccess) {
+    return ncclSuccess;
+  }
+  *subnetPrefix = be64toh(gid.global.subnet_prefix);
+  *physical = *subnetPrefix != 0;
+  return ncclSuccess;
+}
+
 ncclResult_t ncclIbFinalize(void* ctx) {
   free(ctx);
   return ncclIbFinalizeDevices();
