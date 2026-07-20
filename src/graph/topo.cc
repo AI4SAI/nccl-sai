@@ -1614,6 +1614,8 @@ ncclResult_t getLocalNetCountByBw(struct ncclTopoSystem* system, int gpu, int *c
 
 static int netDevsPolicyNum = -1;
 static enum netDevsPolicy netDevsPolicy = NETDEVS_POLICY_UNDEF;
+NCCL_PARAM(SaiRailByChannel, "SAI_RAIL_BY_CHANNEL", 0);
+
 static void getNetDevsPolicyOnce() {
   const char* envStr = ncclGetEnv("NCCL_NETDEVS_POLICY");
   if (envStr) {
@@ -1648,6 +1650,9 @@ ncclResult_t ncclTopoGetNetDevsPolicy(enum netDevsPolicy* policy, int* policyNum
   return ncclSuccess;
 }
 
+static bool ncclTopoGetLocalRailPair(
+    struct ncclTopoSystem* system, int rank, int* port1Net, int* port2Net);
+
 ncclResult_t ncclTopoGetLocalNet(struct ncclTopoSystem* system, int rank, int channelId, int64_t* id, int* dev) {
   int gpu;
   NCCLCHECK(ncclTopoRankToIndex(system, rank, &gpu, /*showWarn=*/true));
@@ -1681,8 +1686,77 @@ ncclResult_t ncclTopoGetLocalNet(struct ncclTopoSystem* system, int rank, int ch
   int net = system->nodes[GPU].nodes[gpu].gpu.dev;
   if (isPow2(localNetCount)) net = mirrorBits(net, localNetCount);
   net += channelId%(netsPerGpu);
-  if (id) *id = system->nodes[NET].nodes[localNets[net%localNetCount]].id;
-  if (dev) *dev = system->nodes[NET].nodes[localNets[net%localNetCount]].net.dev;
+  int selected = localNets[net%localNetCount];
+  if (ncclTopoSaiRailByChannelEnabled(system)) {
+    int port1Net = -1;
+    int port2Net = -1;
+    if (!ncclTopoGetLocalRailPair(system, rank, &port1Net, &port2Net)) {
+      WARN("NCCL-SAI rail-by-channel topology changed after communicator agreement for rank %d", rank);
+      return ncclInvalidUsage;
+    }
+    selected = channelId % 2 == 0 ? port1Net : port2Net;
+  }
+  if (id) *id = system->nodes[NET].nodes[selected].id;
+  if (dev) *dev = system->nodes[NET].nodes[selected].net.dev;
+  return ncclSuccess;
+}
+
+static bool ncclTopoGetLocalRailPair(
+    struct ncclTopoSystem* system, int rank, int* port1Net, int* port2Net) {
+  if (system == NULL || port1Net == NULL || port2Net == NULL) return false;
+  int gpu;
+  if (ncclTopoRankToIndex(system, rank, &gpu, /*showWarn=*/false) != ncclSuccess) return false;
+
+  int localNets[NCCL_TOPO_MAX_NODES];
+  int localNetCount;
+  if (ncclTopoGetLocal(system, GPU, gpu, NET, localNets, &localNetCount, NULL) != ncclSuccess ||
+      localNetCount != 2) return false;
+
+  struct ncclTopoNode* first = system->nodes[NET].nodes + localNets[0];
+  struct ncclTopoNode* second = system->nodes[NET].nodes + localNets[1];
+  if (first->net.asic != second->net.asic) return false;
+  if (first->net.port == 1 && second->net.port == 2) {
+    *port1Net = localNets[0];
+    *port2Net = localNets[1];
+    return true;
+  }
+  if (first->net.port == 2 && second->net.port == 1) {
+    *port1Net = localNets[1];
+    *port2Net = localNets[0];
+    return true;
+  }
+  return false;
+}
+
+ncclResult_t ncclTopoGetSaiRailInfo(struct ncclTopoSystem* system, int rank, struct ncclSaiRailInfo* info) {
+  if (info == NULL) return ncclInvalidArgument;
+  int port1Net = -1;
+  int port2Net = -1;
+  info->topologyEligible = ncclTopoGetLocalRailPair(
+      system, rank, &port1Net, &port2Net) ? 1 : 0;
+  return ncclSuccess;
+}
+
+void ncclTopoSetSaiRailByChannel(struct ncclTopoSystem* system, bool enabled) {
+  if (system != NULL) system->saiRailByChannel = enabled;
+}
+
+bool ncclTopoSaiRailByChannelEnabled(struct ncclTopoSystem* system) {
+  return system != NULL && system->saiRailByChannel;
+}
+
+ncclResult_t ncclTopoGetLocalRailNet(struct ncclTopoSystem* system, int rank, int channelId, int64_t* id, int* dev) {
+  if (!ncclTopoSaiRailByChannelEnabled(system)) return ncclInvalidUsage;
+  int port1Net = -1;
+  int port2Net = -1;
+  if (!ncclTopoGetLocalRailPair(system, rank, &port1Net, &port2Net)) {
+    WARN("NCCL-SAI rail-by-channel topology changed after communicator agreement for rank %d", rank);
+    return ncclInvalidUsage;
+  }
+
+  int selected = channelId % 2 == 0 ? port1Net : port2Net;
+  if (id) *id = system->nodes[NET].nodes[selected].id;
+  if (dev) *dev = system->nodes[NET].nodes[selected].net.dev;
   return ncclSuccess;
 }
 

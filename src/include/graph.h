@@ -19,6 +19,13 @@
 ncclResult_t ncclTopoCudaPath(int cudaDev, char** path);
 
 struct ncclTopoSystem;
+struct ncclSaiRailInfo {
+  int requested;
+  int internalIb;
+  int crossNic;
+  int topologyEligible;
+};
+
 // Build the topology
 ncclResult_t ncclTopoGetSystem(struct ncclComm* comm, struct ncclTopoSystem** system, const char* dumpXmlFile=NULL);
 ncclResult_t ncclTopoSortSystem(struct ncclTopoSystem* system);
@@ -76,10 +83,16 @@ ncclResult_t ncclTopoCpuType(struct ncclTopoSystem* system, int* arch, int* vend
 ncclResult_t ncclTopoGetGpuCount(struct ncclTopoSystem* system, int* count);
 ncclResult_t ncclTopoGetNetCount(struct ncclTopoSystem* system, int* count);
 ncclResult_t ncclTopoGetNvsCount(struct ncclTopoSystem* system, int* count);
+ncclResult_t ncclTopoGetSaiRailInfo(struct ncclTopoSystem* system, int rank, struct ncclSaiRailInfo* info);
+void ncclTopoSetSaiRailByChannel(struct ncclTopoSystem* system, bool enabled);
+bool ncclTopoSaiRailByChannelEnabled(struct ncclTopoSystem* system);
 ncclResult_t ncclTopoGetLocalNet(struct ncclTopoSystem* system, int rank, int channelId, int64_t* id, int* dev);
+ncclResult_t ncclTopoGetLocalRailNet(struct ncclTopoSystem* system, int rank, int channelId, int64_t* id, int* dev);
 ncclResult_t ncclTopoGetLocalNets(struct ncclTopoSystem* system, int rank, int64_t* localNets, int* localNetCount);
 ncclResult_t ncclTopoGetLocalGpu(struct ncclTopoSystem* system, int64_t netId, int* gpuIndex);
 ncclResult_t getLocalNetCountByBw(struct ncclTopoSystem* system, int gpu, int *count, float* bw);
+int64_t ncclParamSaiRailByChannel();
+int64_t ncclParamCrossNic();
 
 enum netDevsPolicy {
   NETDEVS_POLICY_AUTO = 0x0,

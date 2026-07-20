@@ -1324,10 +1324,20 @@ ncclResult_t ncclTopoGetNetDev(struct ncclComm* comm, int rank, struct ncclTopoG
     int index = graph->intra[channel*ngpus] == rank ? 0 : 1;
     if (graph->pattern != NCCL_TOPO_PATTERN_NVLS) {
       netId = graph->inter[channel*2+index];
+      if (ncclTopoSaiRailByChannelEnabled(comm->topo) && !graph->collNet) {
+        int64_t graphNetId = netId;
+        NCCLCHECK(ncclTopoGetLocalRailNet(
+            comm->topo, rank, channelId, &netId, &netDev));
+        INFO(NCCL_GRAPH|NCCL_NET,
+            "NCCL-SAI graph rail selection rank=%d channel=%d graph=%d pattern=%d endpoint=%d graphNet=%lx selectedNet=%lx selectedDev=%d override=%d",
+            rank, channelId, graph->id, graph->pattern, index,
+            (unsigned long)graphNetId, (unsigned long)netId, netDev,
+            graphNetId != netId);
+      }
     } else {
       NCCLCHECK(getNvlsNetDev(comm, graph, channelId, &netId));
     }
-    NCCLCHECK(ncclTopoIdToNetDev(comm->topo, netId, &netDev));
+    if (netDev == -1) NCCLCHECK(ncclTopoIdToNetDev(comm->topo, netId, &netDev));
     if (dev) *dev = netDev;
     if (id) *id = netId;
     NCCLCHECK(ncclTopoGetIntermediateRank(comm->topo, rank, netId, proxyRank));

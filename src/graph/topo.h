@@ -180,6 +180,7 @@ struct ncclTopoSystem {
   float maxBw;
   float totalBw;
   int inter;
+  bool saiRailByChannel;
 };
 
 ncclResult_t ncclTopoGetNode(struct ncclTopoSystem* system, struct ncclTopoNode** node, int type, uint64_t id);

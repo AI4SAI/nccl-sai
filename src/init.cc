@@ -924,6 +924,9 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   int *topParentLocalRanks = NULL;
   int p2pLevel = -1;
   bool globalNicFused = false;
+  struct ncclSaiRailInfo* saiRailInfo = NULL;
+  bool saiRailConfigConsistent = true;
+  bool saiRailEnabled = false;
 
   timers[TIMER_INIT_ALLGATHER] = clockNano();
   // AllGather1 - begin
@@ -1028,6 +1031,49 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   NCCLCHECKGOTO(ncclTopoTrimSystem(comm->topo, comm), ret, fail);
   // Recompute paths after trimming
   NCCLCHECKGOTO(ncclTopoComputePaths(comm->topo, comm), ret, fail);
+  NCCLCHECKGOTO(ncclCalloc(&saiRailInfo, nranks), ret, fail);
+  saiRailInfo[rank].requested = ncclParamSaiRailByChannel();
+  saiRailInfo[rank].internalIb = comm->ncclNet == &ncclNetIb ? 1 : 0;
+  saiRailInfo[rank].crossNic = ncclParamCrossNic();
+  NCCLCHECKGOTO(ncclTopoGetSaiRailInfo(
+      comm->topo, rank, saiRailInfo + rank), ret, fail);
+  NCCLCHECKGOTO(bootstrapAllGather(
+      comm->bootstrap, saiRailInfo, sizeof(*saiRailInfo)), ret, fail);
+
+  saiRailConfigConsistent = true;
+  for (int r = 1; r < nranks; r++) {
+    if (saiRailInfo[r].requested != saiRailInfo[0].requested) {
+      saiRailConfigConsistent = false;
+      break;
+    }
+  }
+  if (!saiRailConfigConsistent ||
+      (saiRailInfo[0].requested != 0 && saiRailInfo[0].requested != 1)) {
+    WARN("NCCL-SAI rail-by-channel policy is invalid or differs across ranks");
+    ret = ncclInvalidUsage;
+    goto fail;
+  }
+
+  saiRailEnabled = saiRailInfo[0].requested == 1;
+  if (saiRailEnabled) {
+    for (int r = 0; r < nranks; r++) {
+      if (saiRailInfo[r].internalIb != 1 || saiRailInfo[r].crossNic != 0 ||
+          saiRailInfo[r].topologyEligible != 1) {
+        saiRailEnabled = false;
+        break;
+      }
+    }
+    if (!saiRailEnabled) {
+      WARN("NCCL-SAI rail-by-channel requires internal IB, CROSS_NIC=0, and one dual-port NET pair per rank");
+      ret = ncclInvalidUsage;
+      goto fail;
+    }
+  }
+  ncclTopoSetSaiRailByChannel(comm->topo, saiRailEnabled);
+  if (rank == 0 && saiRailInfo[0].requested == 1) {
+    INFO(NCCL_INIT|NCCL_NET,
+        "NCCL-SAI rail-by-channel communicator agreement enabled for %d ranks", nranks);
+  }
   // Init search
   NCCLCHECKGOTO(ncclTopoSearchInit(comm->topo), ret, fail);
   // Decide on comm's CPU architecture.
@@ -1474,6 +1520,7 @@ exit:
   free(rings);
   free(nvbPeers);
   free(pxnPeers);
+  free(saiRailInfo);
   return ret;
 fail:
   goto exit;
