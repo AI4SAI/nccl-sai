@@ -2,6 +2,29 @@
 
 Optimized primitives for inter-GPU communication.
 
+## NCCL-SAI Branch
+
+This branch derives from NVIDIA NCCL `v2.29.3-1` and carries a narrowly
+guarded dual-rail endpoint-selection change for SAI GPU fabric products.
+When operator-managed site policy requests rail-by-channel selection, every
+rank must agree on the policy and use NCCL's internal IB transport with
+`NCCL_CROSS_NIC=0`. Each participating GPU must also expose one topology-local
+dual-port NET pair. Physical port 1 serves even channels and physical port 2
+serves odd channels for both collective graphs and graphless P2P traffic.
+
+The policy fails during communicator initialization when configuration,
+transport, or topology differs across ranks. With the policy unset, upstream
+NCCL behavior is unchanged. Applications and users do not need to set an
+NCCL-SAI environment variable; activation is a site-operator responsibility.
+External network plugins are intentionally rejected while this policy is
+active because the generic plugin interface does not provide the rail identity
+needed by this implementation.
+
+NCCL-SAI modifications are maintained by AI4SAI contributors. This project is
+derived from NVIDIA NCCL and is not endorsed by NVIDIA. Original NVIDIA
+copyright and license notices are retained; see `LICENSE.txt` and
+`docs/sai/NOTICE.md`.
+
 ## Introduction
 
 NCCL (pronounced "Nickel") is a stand-alone library of standard communication routines for GPUs, implementing all-reduce, all-gather, reduce, broadcast, reduce-scatter, as well as any send/receive based communication pattern. It has been optimized to achieve high bandwidth on platforms using PCIe, NVLink, NVswitch, as well as networking using InfiniBand Verbs or TCP/IP sockets. NCCL supports an arbitrary number of GPUs installed in a single node or across multiple nodes, and can be used in either single- or multi-process (e.g., MPI) applications.
