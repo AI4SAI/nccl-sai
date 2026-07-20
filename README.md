@@ -9,16 +9,24 @@ guarded dual-rail endpoint-selection change for SAI GPU fabric products.
 When operator-managed site policy requests rail-by-channel selection, every
 rank must agree on the policy and use NCCL's internal IB transport with
 `NCCL_CROSS_NIC=0`. Each participating GPU must also expose one topology-local
-dual-port NET pair. Physical port 1 serves even channels and physical port 2
-serves odd channels for both collective graphs and graphless P2P traffic.
+dual-port NET pair backed by two unmerged physical endpoints. The two logical
+rails must have distinct GID subnet prefixes, and every rank must report them
+in the same port order. Physical port 1 serves even channels and physical port
+2 serves odd channels for ring/tree graph endpoints and graphless P2P traffic.
+NVLS and CollNet endpoints retain their upstream selection behavior.
 
 The policy fails during communicator initialization when configuration,
-transport, or topology differs across ranks. With the policy unset, upstream
-NCCL behavior is unchanged. Applications and users do not need to set an
-NCCL-SAI environment variable; activation is a site-operator responsibility.
-External network plugins are intentionally rejected while this policy is
-active because the generic plugin interface does not provide the rail identity
-needed by this implementation.
+transport, physical-endpoint eligibility, or logical rail identity differs
+across ranks. The fork also carries an initialization wire identifier so that
+mixing NCCL-SAI and an ABI-compatible upstream runtime in one communicator
+fails before the SAI-specific agreement step. With the policy unset, ring/tree
+and graphless P2P endpoint selection retain upstream behavior; the wire check
+and one SAI agreement exchange still run during initialization. Applications
+and users do not need to set an NCCL-SAI environment variable; activation and
+unmerged-NIC policy are site-operator responsibilities. External network
+plugins are intentionally rejected while this policy is active because the
+generic plugin interface does not provide the rail identity needed by this
+implementation.
 
 NCCL-SAI modifications are maintained by AI4SAI contributors. This project is
 derived from NVIDIA NCCL and is not endorsed by NVIDIA. Original NVIDIA
@@ -96,4 +104,6 @@ $ ./build/all_reduce_perf -b 8 -e 256M -f 2 -g <ngpus>
 
 ## Copyright
 
-All source code and accompanying documentation is copyright (c) 2015-2020, NVIDIA CORPORATION. All rights reserved.
+Original NVIDIA source code and documentation retain their existing NVIDIA
+copyright notices. NCCL-SAI modifications are copyright (c) 2026, AI4SAI
+contributors. See `LICENSE.txt` and `docs/sai/NOTICE.md`.

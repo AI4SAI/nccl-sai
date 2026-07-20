@@ -10,15 +10,25 @@ network rails exposed as the two physical ports of each local adapter.
 - Every rank must use NCCL's internal IB transport and effective
   `NCCL_CROSS_NIC=0`.
 - Every participating GPU must expose exactly one topology-local dual-port NET
-  pair whose physical ports are identified as 1 and 2.
+  pair whose physical ports are identified as 1 and 2. Each endpoint must map
+  to one physical device; merged virtual NICs are rejected.
+- Port 1 and port 2 must expose distinct GID subnet prefixes, and every rank
+  must report the same ordered pair. This is the communicator-wide logical
+  rail identity check.
 - Port 1 serves even channels and port 2 serves odd channels for collective
-  graph endpoints and graphless P2P traffic.
+  ring/tree graph endpoints and graphless P2P traffic. NVLS and CollNet retain
+  upstream endpoint selection.
 - The selected graph endpoint, network device, and proxy rank are recomputed
   together.
 - Policy, transport, and topology eligibility are agreed across the entire
   communicator before graph construction. A mismatch is an initialization
   error rather than a rank-local fallback.
-- When the operator policy is unset, upstream NCCL behavior is unchanged.
+- An initialization wire identifier rejects a communicator that mixes this
+  fork with an ABI-compatible upstream NCCL runtime before the SAI-specific
+  agreement exchange.
+- When the operator policy is unset, ring/tree and graphless P2P endpoint
+  selection retain upstream behavior. The wire check and SAI agreement
+  exchange still run during communicator initialization.
 
 External network plugins are not supported while rail-by-channel policy is
 active. The generic plugin interface does not expose sufficient rail identity
