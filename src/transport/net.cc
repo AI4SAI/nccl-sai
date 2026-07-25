@@ -171,6 +171,11 @@ static ncclResult_t sendSetup(struct ncclComm* comm, struct ncclTopoGraph* graph
 
   int proxyRank;
   NCCLCHECK(ncclTopoGetNetDev(comm, myInfo->rank, graph, channelId, peerInfo->rank, &req.netDev, &proxyRank));
+  if (graph == NULL && ncclTopoSaiRailByChannelEnabled(comm->topo)) {
+    INFO(NCCL_INIT|NCCL_NET,
+        "NCCL-SAI graphless rail transport selection rank=%d peer=%d channel=%d direction=send selectedDev=%d",
+        myInfo->rank, peerInfo->rank, channelId, req.netDev);
+  }
   NCCLCHECK(ncclTopoCheckGdr(comm->topo, myInfo->busId, req.netDev, 1, &req.useGdr));
   send->conn.flags |= req.useGdr ? NCCL_DIRECT_NIC : 0;
 
@@ -210,6 +215,11 @@ static ncclResult_t recvSetup(struct ncclComm* comm, struct ncclTopoGraph* graph
   // Use myInfo->rank as the receiver uses its own NIC
   int proxyRank, tpProxyRank;
   NCCLCHECK(ncclTopoGetNetDev(comm, myInfo->rank, graph, channelId, myInfo->rank, &req.netDev, &proxyRank));
+  if (graph == NULL && ncclTopoSaiRailByChannelEnabled(comm->topo)) {
+    INFO(NCCL_INIT|NCCL_NET,
+        "NCCL-SAI graphless rail transport selection rank=%d peer=%d channel=%d direction=recv selectedDev=%d",
+        myInfo->rank, peerInfo->rank, channelId, req.netDev);
+  }
   NCCLCHECK(ncclTopoCheckGdr(comm->topo, myInfo->busId, req.netDev, 0, &req.useGdr));
 
   // Determine whether we need to flush the GDR buffer on recv or not

@@ -13,6 +13,7 @@
 #include "param.h"
 
 #include <assert.h>
+#include <endian.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -333,6 +334,23 @@ ncclResult_t ncclIbGetProperties(int dev, ncclNetProperties_t* props) {
   props->port = ncclIbDevs[dev].port + ncclIbDevs[dev].realPort;
   props->maxComms = ncclIbDevs[dev].maxQp;
   props->maxRecvs = NCCL_NET_IB_MAX_RECVS;
+  return ncclSuccess;
+}
+
+ncclResult_t ncclIbGetSaiRailFingerprint(int dev, int* valid, uint64_t* subnetPrefix) {
+  if (valid == NULL || subnetPrefix == NULL) return ncclInvalidArgument;
+  *valid = 0;
+  *subnetPrefix = 0;
+  if (dev < 0 || dev >= ncclNIbDevs) return ncclSuccess;
+
+  struct ncclIbDev* ibDev = ncclIbDevs + dev;
+  union ibv_gid gid;
+  if (wrap_ibv_query_gid(
+          ibDev->context, ibDev->port, ncclParamIbGidIndex(), &gid) != ncclSuccess) {
+    return ncclSuccess;
+  }
+  *subnetPrefix = be64toh(gid.global.subnet_prefix);
+  *valid = *subnetPrefix != 0;
   return ncclSuccess;
 }
 
@@ -1382,4 +1400,3 @@ ncclNet_t ncclNetIb = {
   ncclIbCloseRecv,
   ncclIbCloseListen
 };
-

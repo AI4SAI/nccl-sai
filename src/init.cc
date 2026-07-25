@@ -27,6 +27,7 @@
 
 #define STR2(v) #v
 #define STR(v) STR2(v)
+#define NCCL_SAI_WIRE_VERSION 0x53414901U
 
 #if CUDART_VERSION >= 9020
 #define NCCL_GROUP_CUDA_STREAM 0 // CGMD: CUDA 9.2,10.X Don't need to use an internal CUDA stream
@@ -478,6 +479,7 @@ static ncclResult_t fillInfo(struct ncclComm* comm, struct ncclPeerInfo* info, u
   NCCLCHECK(ncclGpuGdrSupport(comm, &info->gdrSupport));
   info->comm = comm;
   info->cudaCompCap = comm->minCompCap = comm->maxCompCap = comm->compCap;
+  info->saiWireVersion = NCCL_SAI_WIRE_VERSION;
   return ncclSuccess;
 }
 
@@ -787,11 +789,33 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   int *topParentLocalRanks = NULL;
   int tpProxyRank;
   int *saiPhysicalFirstRanks = NULL, *saiPhysicalHostCounts = NULL;
+  struct ncclSaiRailInfo* saiRailInfo = NULL;
+  bool saiRailConfigConsistent = true;
+  bool saiRailEnabled = false;
+  bool saiRailAnyNetworkless = false;
+  bool saiRailAllNetworkless = true;
+  int saiRailDevs[2] = {-1, -1};
 
   // AllGather1 - begin
   NCCLCHECKGOTO(ncclCalloc(&comm->peerInfo, nranks+1), ret, fail); // Extra rank to represent CollNet root
   NCCLCHECKGOTO(fillInfo(comm, comm->peerInfo+rank, comm->commHash), ret, fail);
   NCCLCHECKGOTO(bootstrapAllGather(comm->bootstrap, comm->peerInfo, sizeof(struct ncclPeerInfo)), ret, fail);
+
+  for (int r = 0; r < nranks; r++) {
+    if (comm->peerInfo[r].saiWireVersion != NCCL_SAI_WIRE_VERSION) {
+      WARN("Mismatched NCCL-SAI initialization wire version: rank %d has 0x%x, rank %d requires 0x%x",
+          r, comm->peerInfo[r].saiWireVersion, rank, NCCL_SAI_WIRE_VERSION);
+      __atomic_store_n(comm->abortFlag, 1, __ATOMIC_RELEASE);
+      ncclResult_t closeResult = bootstrapClose(comm->bootstrap);
+      if (closeResult == ncclSuccess) {
+        comm->bootstrap = NULL;
+      } else {
+        WARN("Failed to close bootstrap after NCCL-SAI wire mismatch: %d", closeResult);
+      }
+      ret = ncclInvalidUsage;
+      goto fail;
+    }
+  }
 
   NCCLCHECKGOTO(ncclCalloc(&comm->saiRankToPhysicalHost, nranks), ret, fail);
   NCCLCHECKGOTO(ncclCalloc(&comm->saiRankToPhysicalLocalRank, nranks), ret, fail);
@@ -880,6 +904,83 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   NCCLCHECKGOTO(ncclTopoTrimSystem(comm->topo, comm), ret, fail);
   // Recompute paths after trimming
   NCCLCHECKGOTO(ncclTopoComputePaths(comm->topo, comm), ret, fail);
+  NCCLCHECKGOTO(ncclCalloc(&saiRailInfo, nranks), ret, fail);
+  saiRailInfo[rank].requested = ncclParamSaiRailByChannel();
+  saiRailInfo[rank].internalIb = comm->ncclNet == &ncclNetIb ? 1 : 0;
+  saiRailInfo[rank].crossNic = ncclParamCrossNic();
+  NCCLCHECKGOTO(ncclTopoGetSaiRailInfo(
+      comm->topo, rank, saiRailInfo + rank, saiRailDevs, saiRailDevs + 1), ret, fail);
+  if (saiRailInfo[rank].requested == 1 && saiRailInfo[rank].internalIb == 1 &&
+      saiRailInfo[rank].topologyEligible == 1 && saiRailDevs[0] != saiRailDevs[1]) {
+    int valid[2] = {0, 0};
+    NCCLCHECKGOTO(ncclIbGetSaiRailFingerprint(
+        saiRailDevs[0], valid, saiRailInfo[rank].subnetPrefix), ret, fail);
+    NCCLCHECKGOTO(ncclIbGetSaiRailFingerprint(
+        saiRailDevs[1], valid + 1, saiRailInfo[rank].subnetPrefix + 1), ret, fail);
+    saiRailInfo[rank].validIbEndpoints = valid[0] == 1 && valid[1] == 1;
+  }
+  NCCLCHECKGOTO(bootstrapAllGather(
+      comm->bootstrap, saiRailInfo, sizeof(*saiRailInfo)), ret, fail);
+
+  for (int r = 1; r < nranks; r++) {
+    if (saiRailInfo[r].requested != saiRailInfo[0].requested) {
+      saiRailConfigConsistent = false;
+      break;
+    }
+  }
+  if (!saiRailConfigConsistent ||
+      (saiRailInfo[0].requested != 0 && saiRailInfo[0].requested != 1)) {
+    WARN("NCCL-SAI rail-by-channel policy is invalid or differs across ranks");
+    ret = ncclInvalidUsage;
+    goto fail;
+  }
+
+  saiRailEnabled = saiRailInfo[0].requested == 1;
+  if (saiRailEnabled) {
+    for (int r = 0; r < nranks; r++) {
+      saiRailAnyNetworkless |= saiRailInfo[r].networkless == 1;
+      saiRailAllNetworkless &= saiRailInfo[r].networkless == 1;
+    }
+    if (saiRailAllNetworkless) {
+      saiRailEnabled = false;
+      if (rank == 0) {
+        INFO(NCCL_INIT|NCCL_NET,
+            "NCCL-SAI rail-by-channel communicator agreement accepted a networkless no-op for %d ranks",
+            nranks);
+      }
+    } else if (saiRailAnyNetworkless) {
+      WARN("NCCL-SAI rail-by-channel cannot mix networkless and networked ranks");
+      ret = ncclInvalidUsage;
+      goto fail;
+    }
+  }
+  if (saiRailEnabled) {
+    uint64_t subnet0 = saiRailInfo[0].subnetPrefix[0];
+    uint64_t subnet1 = saiRailInfo[0].subnetPrefix[1];
+    for (int r = 0; r < nranks; r++) {
+      if (saiRailInfo[r].internalIb != 1 || saiRailInfo[r].crossNic != 0 ||
+          saiRailInfo[r].topologyEligible != 1 ||
+          saiRailInfo[r].validIbEndpoints != 1 ||
+          subnet0 == 0 || subnet1 == 0 || subnet0 == subnet1 ||
+          saiRailInfo[r].subnetPrefix[0] != subnet0 ||
+          saiRailInfo[r].subnetPrefix[1] != subnet1) {
+        saiRailEnabled = false;
+        break;
+      }
+    }
+    if (!saiRailEnabled) {
+      WARN("NCCL-SAI rail-by-channel requires internal IB, CROSS_NIC=0, two distinct valid IB endpoints, and consistent distinct rail subnet prefixes across ranks");
+      ret = ncclInvalidUsage;
+      goto fail;
+    }
+  }
+  ncclTopoSetSaiRailByChannel(comm->topo, saiRailEnabled);
+  if (rank == 0 && saiRailEnabled) {
+    INFO(NCCL_INIT|NCCL_NET,
+        "NCCL-SAI rail-by-channel communicator agreement enabled for %d ranks with rail subnets %lx/%lx",
+        nranks, (unsigned long)saiRailInfo[0].subnetPrefix[0],
+        (unsigned long)saiRailInfo[0].subnetPrefix[1]);
+  }
   // Init search
   NCCLCHECKGOTO(ncclTopoSearchInit(comm->topo), ret, fail);
   // Print final topology
@@ -1274,6 +1375,7 @@ exit:
   free(pxnPeers);
   free(saiPhysicalFirstRanks);
   free(saiPhysicalHostCounts);
+  free(saiRailInfo);
   return ret;
 fail:
   goto exit;

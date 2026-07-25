@@ -43,7 +43,10 @@ struct ncclPeerInfo {
   int64_t busId;
   struct ncclComm* comm;
   int cudaCompCap;
+  uint32_t saiWireVersion;
 };
+static_assert(offsetof(struct ncclPeerInfo, saiWireVersion) == 60, "ncclPeerInfo wire version must use the former tail padding");
+static_assert(sizeof(struct ncclPeerInfo) == 64, "ncclPeerInfo wire size must remain stable");
 
 #define CONNECT_SIZE 128
 struct ncclConnect {

@@ -10,6 +10,8 @@
 #include "nccl.h"
 #include "devcomm.h"
 #include <limits.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <ctype.h>
 #include <stdio.h>
@@ -18,6 +20,18 @@
 ncclResult_t ncclTopoCudaPath(int cudaDev, char** path);
 
 struct ncclTopoSystem;
+struct ncclSaiRailInfo {
+  uint32_t requested;
+  uint32_t internalIb;
+  uint32_t crossNic;
+  uint32_t topologyEligible;
+  uint32_t validIbEndpoints;
+  uint32_t networkless;
+  uint64_t subnetPrefix[2];
+};
+static_assert(offsetof(struct ncclSaiRailInfo, subnetPrefix) == 24, "ncclSaiRailInfo wire layout must remain stable");
+static_assert(sizeof(struct ncclSaiRailInfo) == 40, "ncclSaiRailInfo wire size must remain stable");
+
 // Build the topology
 ncclResult_t ncclTopoGetSystem(struct ncclComm* comm, struct ncclTopoSystem** system);
 ncclResult_t ncclTopoSortSystem(struct ncclTopoSystem* system);
@@ -56,9 +70,14 @@ ncclResult_t ncclTopoCpuType(struct ncclTopoSystem* system, int* arch, int* vend
 ncclResult_t ncclTopoGetGpuCount(struct ncclTopoSystem* system, int* count);
 ncclResult_t ncclTopoGetNvsCount(struct ncclTopoSystem* system, int* count);
 ncclResult_t ncclTopoGetNvsCount(struct ncclTopoSystem* system, int* count);
+ncclResult_t ncclTopoGetSaiRailInfo(struct ncclTopoSystem* system, int rank, struct ncclSaiRailInfo* info, int* port1Dev, int* port2Dev);
+void ncclTopoSetSaiRailByChannel(struct ncclTopoSystem* system, bool enabled);
+bool ncclTopoSaiRailByChannelEnabled(struct ncclTopoSystem* system);
 ncclResult_t ncclTopoGetLocalNet(struct ncclTopoSystem* system, int rank, int channelId, int* id);
+ncclResult_t ncclTopoGetLocalRailNet(struct ncclTopoSystem* system, int rank, int channelId, int* id);
 ncclResult_t ncclTopoGetLocalGpu(struct ncclTopoSystem* system, int net, int* gpuIndex);
 int64_t ncclParamSaiRailByChannel();
+int64_t ncclParamCrossNic();
 
 #define NCCL_TOPO_MAX_NODES 256
 

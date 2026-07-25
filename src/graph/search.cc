@@ -1060,6 +1060,14 @@ ncclResult_t ncclTopoGetNetDev(struct ncclComm* comm, int rank, struct ncclTopoG
     int index = graph->intra[channel*ngpus] == rank ? 0 : 1;
     if (graph->pattern != NCCL_TOPO_PATTERN_NVLS) {
       *dev = graph->inter[channel*2+index];
+      if (ncclTopoSaiRailByChannelEnabled(comm->topo) && !graph->collNet) {
+        int graphDev = *dev;
+        NCCLCHECK(ncclTopoGetLocalRailNet(comm->topo, rank, channelId, dev));
+        INFO(NCCL_GRAPH|NCCL_NET,
+            "NCCL-SAI graph rail selection rank=%d channel=%d graph=%d pattern=%d endpoint=%d graphDev=%d selectedDev=%d override=%d",
+            rank, channelId, graph->id, graph->pattern, index, graphDev, *dev,
+            graphDev != *dev);
+      }
     } else {
       NCCLCHECK(getNvlsNetDev(comm, graph, dev));
     }

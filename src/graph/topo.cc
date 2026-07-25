@@ -700,27 +700,89 @@ ncclResult_t ncclTopoGetLocal(struct ncclTopoSystem* system, int type, int index
 
 NCCL_PARAM(SaiRailByChannel, "SAI_RAIL_BY_CHANNEL", 0);
 
+static bool ncclTopoSaiOrderLocalRailNets(
+    struct ncclTopoSystem* system, int* localNets, int localNetCount) {
+  if (system == NULL || localNets == NULL || localNetCount != 2) return false;
+
+  struct ncclTopoNode* net0 = system->nodes[NET].nodes + localNets[0];
+  struct ncclTopoNode* net1 = system->nodes[NET].nodes + localNets[1];
+  if (net0->net.asic == 0 || net0->net.asic != net1->net.asic ||
+      !((net0->net.port == 1 && net1->net.port == 2) ||
+        (net0->net.port == 2 && net1->net.port == 1))) return false;
+
+  if (net0->net.port == 2) {
+    int swap = localNets[0];
+    localNets[0] = localNets[1];
+    localNets[1] = swap;
+  }
+  return true;
+}
+
+ncclResult_t ncclTopoGetSaiRailInfo(
+    struct ncclTopoSystem* system, int rank, struct ncclSaiRailInfo* info,
+    int* port1Dev, int* port2Dev) {
+  if (system == NULL || info == NULL || port1Dev == NULL || port2Dev == NULL) return ncclInvalidArgument;
+  info->topologyEligible = 0;
+  info->networkless = system->nodes[NET].count == 0;
+  *port1Dev = -1;
+  *port2Dev = -1;
+
+  int gpu;
+  if (ncclTopoRankToIndex(system, rank, &gpu) != ncclSuccess) return ncclSuccess;
+  int* localNets = NULL;
+  int localNetCount = 0;
+  if (ncclTopoGetLocal(system, GPU, gpu, NET, &localNets, &localNetCount, NULL) != ncclSuccess) {
+    free(localNets);
+    return ncclSuccess;
+  }
+  if (ncclTopoSaiOrderLocalRailNets(system, localNets, localNetCount)) {
+    info->topologyEligible = 1;
+    *port1Dev = (int)system->nodes[NET].nodes[localNets[0]].id;
+    *port2Dev = (int)system->nodes[NET].nodes[localNets[1]].id;
+  }
+  free(localNets);
+  return ncclSuccess;
+}
+
+void ncclTopoSetSaiRailByChannel(struct ncclTopoSystem* system, bool enabled) {
+  if (system != NULL) system->saiRailByChannel = enabled;
+}
+
+bool ncclTopoSaiRailByChannelEnabled(struct ncclTopoSystem* system) {
+  return system != NULL && system->saiRailByChannel;
+}
+
 ncclResult_t ncclTopoGetLocalNet(struct ncclTopoSystem* system, int rank, int channelId, int* id) {
   int gpu;
   NCCLCHECK(ncclTopoRankToIndex(system, rank, &gpu));
   int* localNets;
   int localNetCount;
   NCCLCHECK(ncclTopoGetLocal(system, GPU, gpu, NET, &localNets, &localNetCount, NULL));
+  if (ncclTopoSaiRailByChannelEnabled(system)) {
+    if (!ncclTopoSaiOrderLocalRailNets(system, localNets, localNetCount)) {
+      WARN("NCCL-SAI rail topology changed after communicator agreement for rank %d", rank);
+      free(localNets);
+      return ncclInvalidUsage;
+    }
+    *id = system->nodes[NET].nodes[localNets[channelId % 2]].id;
+    free(localNets);
+    return ncclSuccess;
+  }
   int* localGpus;
   int localGpuCount;
   NCCLCHECK(ncclTopoGetLocal(system, NET, localNets[0], GPU, &localGpus, &localGpuCount, NULL));
-  int net;
-  if (ncclParamSaiRailByChannel() && localNetCount == 2) {
-    net = channelId;
-  } else {
-    net = system->nodes[GPU].nodes[gpu].gpu.dev;
-    if (isPow2(localNetCount)) net = mirrorBits(net, localNetCount);
-    net += channelId%(DIVUP(localNetCount,localGpuCount));
-  }
+  int net = system->nodes[GPU].nodes[gpu].gpu.dev;
+  if (isPow2(localNetCount)) net = mirrorBits(net, localNetCount);
+  net += channelId%(DIVUP(localNetCount,localGpuCount));
   *id = system->nodes[NET].nodes[localNets[net%localNetCount]].id;
   free(localNets);
   free(localGpus);
   return ncclSuccess;
+}
+
+ncclResult_t ncclTopoGetLocalRailNet(struct ncclTopoSystem* system, int rank, int channelId, int* id) {
+  if (!ncclTopoSaiRailByChannelEnabled(system)) return ncclInvalidUsage;
+  return ncclTopoGetLocalNet(system, rank, channelId, id);
 }
 
 ncclResult_t ncclTopoGetLocalGpu(struct ncclTopoSystem* system, int net, int* gpuIndex) {
