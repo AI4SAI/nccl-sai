@@ -74,6 +74,18 @@ Public artifacts contain sanitized summaries only. Private application inputs,
 scheduler records, hostnames, raw logs, and deployment paths are not release
 assets.
 
+## Assets
+
+- `nccl-sai-2.18.5-1-sai.2-source.tar.gz` is the reproducible source archive
+  for the tagged commit.
+- `nccl-sai-2.18.5-1-sai.2-cuda12.4-linux-x86_64-v3-runtime.tar.xz` is the
+  CUDA 12.4 x86-64-v3 runtime. It contains `libnccl.so.2.18.5`, SONAME
+  symlinks, public headers, `LICENSE.txt`, `NOTICE.md`, release notes, public
+  guides, build identity, and internal checksums. It intentionally omits
+  `libnccl_static.a`; static-link users must build from the tagged source.
+- `SHA256SUMS` contains checksums for the source and runtime archives attached
+  to the release.
+
 ## Release boundary
 
 A successful package and benchmark result is not a universal default
