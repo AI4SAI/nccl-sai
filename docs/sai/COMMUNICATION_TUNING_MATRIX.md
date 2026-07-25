@@ -11,9 +11,11 @@ private cluster names, scheduler records, node lists, and raw benchmark logs.
 | P2P preconnection | Small-message connector cardinality, later larger-message expansion, correctness, and adjacent latency/bandwidth non-regression |
 | Sparse or asymmetric Send/Recv | Correctness and proof that dense phases remain inactive |
 | AllReduce | Small-message latency and large-message bandwidth non-regression |
-| Graphless NET rail policy | Enabled and disabled behavior, exact two-endpoint activation, endpoint parity, and unsupported-shape fallback |
+| Graph and graphless NET rail policy | Enabled and disabled behavior, ring/tree endpoint parity, graphless endpoint parity, and networkless no-op |
+| Communicator rail agreement | Policy mismatch, external plugin, CROSS_NIC mismatch, port-shape mismatch, subnet mismatch, and mixed networkless/networked fail-closed behavior |
+| Initialization wire | Homogeneous runtime success, sai.2-side mixed-runtime detection, and an explicit prohibition on inferring communicator-wide graceful failure |
 | Proxy listener | Partial-magic progress, invalid-client rejection, established-client progress, delayed first use, and scale |
-| Unsupported topology | Upstream fallback when an automatic predicate does not match |
+| Unsupported topology | Upstream fallback for automatic non-rail predicates; explicit initialization failure when active rail policy is ambiguous |
 
 ## Message sizes
 
@@ -29,9 +31,16 @@ A site integration may manage the optional rail-by-channel policy. Qualification
 must prove that source and runtime behavior do not depend on scheduler
 variables, hostnames, partitions, device-name strings, or deployment paths.
 
-Upstream channel, algorithm, protocol, P2P, cross-NIC, and NIC-merge controls
-retain their upstream meaning. Performance claims require the same payload,
-rank layout, test binary, runtime policy, and topology class.
+Active rail-policy qualification must prove one canonical port-1/port-2 subnet
+pair across all ranks before connection creation. A fully networkless
+communicator must preserve upstream behavior as an agreed no-op. Policy-disabled
+qualification must prove that graph and graphless NET selection remain
+upstream, while the internal wire check and agreement AllGather still complete.
+
+Upstream channel, algorithm, protocol, and P2P controls retain their upstream
+meaning. Active policy on a networked communicator requires CROSS_NIC=0.
+Performance claims require the same payload, rank layout, test binary, runtime
+policy, and topology class.
 
 ## Reporting boundary
 

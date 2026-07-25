@@ -42,17 +42,42 @@ change channel-to-rail mapping, replace the P2P executor, or add a tuning
 variable. If a later operation for the same peer needs more channel offsets,
 the additional connectors are marked at that time.
 
-## Graphless dual-rail-by-channel selection
+## Communicator-agreed dual-rail selection
 
-A site may set `NCCL_SAI_RAIL_BY_CHANNEL=1` as managed runtime policy. When a
-GPU has exactly two topology-local NET endpoints, graphless local NET selection
-uses channel parity to alternate between those endpoints. Endpoint ordering is
-therefore part of the site policy and must represent the intended two rails.
+A site may set `NCCL_SAI_RAIL_BY_CHANNEL=1` as managed runtime policy. Each
+networked rank must then expose exactly two topology-local physical NET
+endpoints on one nonzero ASIC, with topology port numbers 1 and 2. Port order,
+not provider enumeration or a device-name string, defines channel parity:
+even channels use port 1 and odd channels use port 2.
 
-When the policy is unset, or when the local shape does not expose exactly two
-NET endpoints, the upstream local-NET selection remains active. This change
-does not rewrite ring/tree graph endpoints, CollNet or NVLS selection, NIC
-merge policy, PXN policy, or collective channel counts.
+Before graph search or transport connection, every rank exchanges one fixed
+rail record. Active policy requires all of the following:
+
+- every rank requests the policy;
+- every rank in a networked communicator uses NCCL's internal IB transport and
+  sets `NCCL_CROSS_NIC=0`;
+- the port-1 and port-2 endpoints have distinct flat NCCL 2.18 IB device
+  indices and nonzero, distinct GID subnet prefixes; and
+- every rank reports the same ordered port-1/port-2 subnet pair.
+
+The agreed mapping applies to ring/tree graph endpoints and graphless local NET
+selection. CollNet and NVLS remain outside the override. A communicator whose
+trimmed topology is networkless on every rank accepts the policy as a no-op;
+this preserves NCCL 2.18 single-host and node-local split behavior. Mixing
+networkless and networked ranks fails communicator initialization. A fully
+networkless communicator does not inspect transport, CROSS_NIC, endpoint, or
+subnet fields. For a networked communicator, using an external NET plugin or
+reporting an incomplete or inconsistent rail shape fails before graph or QP
+creation.
+
+When the policy is unset consistently, upstream local-NET and graph selection
+remain active. The homogeneous sai.2 runtime still performs its internal wire
+revision check and one small agreement AllGather. A mixed sai.1/sai.2
+communicator is unsupported: a sai.2 rank detects the mismatch, closes its
+bootstrap ring, and returns an initialization error. Because sai.1 has no
+communicator-wide wire check, this does not guarantee that every old rank exits
+cleanly. Deployments must drain active jobs and switch the shared runtime
+atomically; the code-level check is not a rolling-upgrade protocol.
 
 ## Proxy listener progress
 
@@ -74,10 +99,9 @@ This release does not add or automatically enable:
 - topology-group or GPU-island planners;
 - local-P2P or PXN policy changes;
 - P2P channel-count or executor changes;
-- collective graph rail rewriting;
 - collective channel expansion; or
 - collective algorithm or protocol overrides.
 
 Upstream NCCL controls retain their normal meaning. Operational rollback uses
-the previous versioned runtime; sites using the optional rail policy may also
-unset it to restore upstream graphless local-NET selection.
+the previous versioned runtime; sites using the optional rail policy may unset
+it to restore upstream graph and graphless local-NET selection.

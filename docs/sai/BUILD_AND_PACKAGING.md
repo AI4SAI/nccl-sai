@@ -13,6 +13,35 @@ Release builds should start from a clean source archive and a fresh build
 directory. Record the source commit and tree, archive checksum, CUDA toolkit,
 compiler versions, complete build command, host flags, and `NVCC_GENCODE`.
 
+## Canonical source archive
+
+Create the public source asset directly from the final clean commit. Use the
+commit time as `SOURCE_DATE_EPOCH`, suppress gzip timestamps, build twice, and
+compare the byte streams:
+
+```bash
+commit=$(git rev-parse HEAD)
+tree=$(git rev-parse HEAD^{tree})
+SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$commit")
+export SOURCE_DATE_EPOCH
+
+git archive --format=tar --prefix=nccl-sai/ "$commit" | gzip -n \
+  > nccl-sai-2.18.5-1-sai.2-source.tar.gz.first
+git archive --format=tar --prefix=nccl-sai/ "$commit" | gzip -n \
+  > nccl-sai-2.18.5-1-sai.2-source.tar.gz.second
+cmp nccl-sai-2.18.5-1-sai.2-source.tar.gz.first \
+  nccl-sai-2.18.5-1-sai.2-source.tar.gz.second
+mv nccl-sai-2.18.5-1-sai.2-source.tar.gz.first \
+  nccl-sai-2.18.5-1-sai.2-source.tar.gz
+rm nccl-sai-2.18.5-1-sai.2-source.tar.gz.second
+git get-tar-commit-id \
+  < <(gzip -dc nccl-sai-2.18.5-1-sai.2-source.tar.gz)
+sha256sum nccl-sai-2.18.5-1-sai.2-source.tar.gz
+```
+
+Record `commit`, `tree`, `SOURCE_DATE_EPOCH`, the embedded commit ID, and the
+archive checksum together. The embedded commit ID must equal `commit`.
+
 ## Portable binary policy
 
 The broad CUDA 12.4 x86-64 package uses portable GNU host compilation with:

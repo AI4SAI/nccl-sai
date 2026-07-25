@@ -8,12 +8,13 @@ This branch carries a small AI4SAI change set derived from NVIDIA NCCL
 `v2.18.5-1`. It keeps the NCCL 2.18 public API and SONAME and focuses on four
 bounded behaviors:
 
-- an operator-managed, opt-in rail-by-channel policy for graphless NET
-  selection when exactly two topology-local NET endpoints are available;
+- an operator-managed, opt-in rail-by-channel policy which agrees one
+  port-ordered physical rail pair across the communicator and applies it to
+  ring/tree graph and graphless NET selection;
 - automatic host-local phasing for an exact, sufficiently large, dense grouped
-  Send/Recv exchange; and
-- message-size-aware P2P preconnection which opens only channel offsets the
-  existing NCCL 2.18 scheduler can use; and
+  Send/Recv exchange;
+- message-size-aware P2P preconnection which opens only channel offsets that
+  the existing NCCL 2.18 scheduler can use; and
 - nonblocking proxy-listener handshake progress so a partial or non-NCCL
   client cannot monopolize the proxy service thread.
 
@@ -23,6 +24,14 @@ policy may set `NCCL_SAI_RAIL_BY_CHANNEL=1` through site-managed runtime
 configuration.
 The implementation does not inspect scheduler metadata, hostnames, partition
 names, or deployment paths.
+
+When the rail policy is enabled for a networked communicator, all ranks must
+agree on an internal IB transport, `NCCL_CROSS_NIC=0`, a distinct flat
+port-1/port-2 endpoint pair, and the same ordered pair of distinct nonzero
+subnet prefixes. Fully networkless communicators accept the policy as a no-op
+without checking transport or rail shape. Other incomplete or inconsistent
+configurations fail before graph or QP creation instead of falling back to an
+ambiguous rail mapping.
 
 This branch does not add a native AlltoAll API, replace the NCCL 2.18 executor,
 change PXN policy, expand collective channels, or override collective
