@@ -28,6 +28,14 @@ plugins are intentionally rejected while this policy is active because the
 generic plugin interface does not provide the rail identity needed by this
 implementation.
 
+The sai.2 line also hardens incoming control connections. Proxy listeners
+accept asynchronously and keep incomplete handshakes as poll-driven peer state,
+so one stalled or unrelated connection cannot block established proxy clients.
+Connections with invalid protocol magic are rejected explicitly, and the RAS
+listener uses the same terminal rejection behavior. These changes add no user
+setting and do not change public NCCL APIs, collective algorithms, channel
+selection, or the inherited dual-rail contract.
+
 NCCL-SAI modifications are maintained by AI4SAI contributors. This project is
 derived from NVIDIA NCCL and is not endorsed by NVIDIA. Original NVIDIA
 copyright and license notices are retained; see `LICENSE.txt` and
