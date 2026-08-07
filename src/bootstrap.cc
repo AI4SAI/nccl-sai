@@ -539,6 +539,15 @@ static ncclResult_t createListenSocket(struct ncclComm* comm, uint64_t magic, st
   NCCLCHECK(ncclSocketGetAddr(socket, addr));
   return ncclSuccess;
 }
+static ncclResult_t createProxyListenSocket(
+    struct ncclComm* comm, struct ncclSocket* socket, union ncclSocketAddress* addr) {
+  NCCLCHECK(ncclSocketInit(
+      socket, &bootstrapNetIfAddr, comm->magic, ncclSocketTypeProxy,
+      comm->abortFlag, /*asyncFlag*/1));
+  NCCLCHECK(ncclSocketListen(socket));
+  NCCLCHECK(ncclSocketGetAddr(socket, addr));
+  return ncclSuccess;
+}
 static ncclResult_t getUDS(uint64_t* peerUDS) {
   uint64_t randId;
   NCCLCHECK(getRandomData(&randId, sizeof(randId)));
@@ -820,7 +829,7 @@ ncclResult_t bootstrapInit(int nHandles, void* handles, struct ncclComm* comm, s
   // in case of failure, those resources will be free'd when calling bootstrapDestroy, so we can return immediatly
   NCCLCHECK(ncclCalloc(&state->peerProxyAddresses, nranks));
   NCCLCHECK(ncclCalloc(&proxySocket, 1));
-  NCCLCHECKGOTO(createListenSocket(comm, comm->magic, proxySocket, state->peerProxyAddresses + rank, ncclSocketTypeProxy), result, fail);
+  NCCLCHECKGOTO(createProxyListenSocket(comm, proxySocket, state->peerProxyAddresses + rank), result, fail);
 
   NCCLCHECKGOTO(ncclCalloc(&state->peerProxyAddressesUDS, nranks), result, fail);
   NCCLCHECKGOTO(getUDS(state->peerProxyAddressesUDS + rank), result, fail);
@@ -943,7 +952,7 @@ ncclResult_t bootstrapSplit(uint64_t magic, struct ncclComm* comm, struct ncclCo
     // Create the service proxy and get the UDS
     NCCLCHECKGOTO(ncclCalloc(&proxySocket, 1), ret, fail);
     NCCLCHECKGOTO(getUDS(state->peerProxyAddressesUDS + rank), ret, fail);
-    NCCLCHECKGOTO(createListenSocket(comm, comm->magic, proxySocket, state->peerProxyAddresses + rank, ncclSocketTypeProxy), ret, fail);
+    NCCLCHECKGOTO(createProxyListenSocket(comm, proxySocket, state->peerProxyAddresses + rank), ret, fail);
     NCCLCHECKGOTO(ringAllInfo(comm, state, state->peerP2pAddresses, state->peerProxyAddresses, state->peerProxyAddressesUDS, NULL), ret, fail);
     NCCLCHECKGOTO(ncclProxyInit(comm, proxySocket, state->peerProxyAddresses, state->peerProxyAddressesUDS), ret, fail);
   }
