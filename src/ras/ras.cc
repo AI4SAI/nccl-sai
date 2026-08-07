@@ -639,6 +639,11 @@ static void* rasThreadMain(void*) {
     for (int pollIdx = 0; pollIdx < nRasPfds && nEvents > 0; pollIdx++) {
       if (rasPfds[pollIdx].revents) {
         nEvents--;
+        if (rasPfds[pollIdx].revents & POLLNVAL) {
+          INFO(NCCL_RAS, "RAS poll returned POLLNVAL on pollIdx %d (fd %d) -- internal error?",
+               pollIdx, rasPfds[pollIdx].fd);
+          rasPfds[pollIdx].fd = POLL_FD_IGNORE;
+        }
         if (rasPfds[pollIdx].fd == rasNotificationPipe[0]) {
           bool terminate = false;
           NCCLCHECKGOTO(rasLocalHandle(&terminate), ret, exit);

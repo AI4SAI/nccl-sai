@@ -1645,6 +1645,11 @@ void* ncclProxyService(void* _args) {
   };
   pollfds[NCCL_MAX_PROXY_CONNECTIONS].events = POLLIN;
 
+  {
+    char line[SOCKET_NAME_MAXLEN+1];
+    INFO(NCCL_INIT, "proxy listening socket at %s", ncclSocketToString(&proxyState->listenSock->addr, line));
+  }
+
   int maxnpeers = 0;
   int npeers = 0;
   int stop = PROXY_RUNNING;
@@ -1677,15 +1682,19 @@ void* ncclProxyService(void* _args) {
         WARN("[Service thread] Initialize peers[%d].sock fails", s);
         return NULL;
       }
-      if (ncclSocketAccept(&peers[s].sock, proxyState->listenSock) != ncclSuccess) {
+      if (ncclSocketAccept(&peers[s].sock, proxyState->listenSock, false) != ncclSuccess) {
         WARN("[Service thread] Accept failed %s", strerror(errno));
       } else {
         if (ncclSocketGetFd(&peers[s].sock, &pollfds[s].fd) != ncclSuccess) {
           WARN("[Service thread] Get peers[%d].sock fd fails", s);
           return NULL;
         }
-        npeers++;
-        peers[s].tpLocalRank = -1;
+        if (pollfds[s].fd == NCCL_INVALID_SOCKET) {
+          (void)ncclSocketClose(&peers[s].sock);
+        } else {
+          npeers++;
+          peers[s].tpLocalRank = -1;
+        }
       }
     }
     for (int s=0; s<maxnpeers; s++) {

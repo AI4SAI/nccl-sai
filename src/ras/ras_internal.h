@@ -180,6 +180,9 @@ static inline size_t rasMsgLength(rasMsgType type, rasCollectiveType collType = 
 // How much to enlarge any RAS array by if we run out of space.
 #define RAS_INCREMENT 4
 
+// File descriptor value used when an entry should be ignored by poll().
+#define POLL_FD_IGNORE -2
+
 // Our clock has nanosecond resolution.
 #define CLOCK_UNITS_PER_SEC 1000000000L
 
