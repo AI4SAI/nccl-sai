@@ -19,6 +19,13 @@ socket handshakes.
 - RAS listening sockets use the same explicit rejection behavior and remove
   invalid descriptors from their poll set.
 
+The bad-magic and RAS event-loop handling follows upstream NCCL fixes
+[`8fdd98c`](https://github.com/NVIDIA/nccl/commit/8fdd98c9b7157a3c64c1be4b92e68eb973f3d8c4)
+and
+[`7310803`](https://github.com/NVIDIA/nccl/commit/7310803b6670d4136cbdbc9e0a0ca1396de7a8d4).
+The proxy-listener wiring is adapted to make the same nonblocking accept
+behavior active in the NCCL 2.29.3 service loop.
+
 These changes add no user setting and do not identify a deployment from
 hostnames, scheduler metadata, network addresses, or filesystem paths.
 
